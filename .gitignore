@@ -1,0 +1,29 @@
+# dependencies
+node_modules/
+apps/*/node_modules/
+server/node_modules/
+shared/node_modules/
+
+# builds
+dist/
+apps/*/dist/
+server/dist/
+shared/dist/
+
+# logs
+*.log
+npm-debug.log*
+
+# env
+.env
+.env.local
+
+# OS / editor
+.DS_Store
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# vite
+*.local

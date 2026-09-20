@@ -20,8 +20,5 @@ Open-source Cowork-style web app. Thin-slice MVP, harness-agnostic, potato-frien
 - No copied proprietary assets. CSS-only marks.
 
 ## Files
-- `design-demos/k5-ui-spec.md` — original UI spec (warm era, superseded on theme by this file)
-- `design-demos/k5-t3clone.html` — current approved mockup (empty state, B&W)
-- `design-demos/direction-approved.md` — three-direction rejection + exact-reference decision record
+- `apps/web/` — current UI (copied verbatim from `~/Downloads/k5work.zip`)
 - `docs/` — implementation research v1 + v2 (ACP, sandbox, browser, office, integrations, plug framework)
-- `apps/ server/ shared/` — early scaffold stubs, untouched since discussion-only rule. No app code until UI sign-off + build plan approval.
