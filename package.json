@@ -1,0 +1,17 @@
+{
+  "name": "k5-work",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "workspaces": ["apps/web", "server", "shared"],
+  "scripts": {
+    "dev": "concurrently -n server,web \"npm run dev -w server\" \"npm run dev -w apps/web\"",
+    "build": "npm run build -w shared && npm run build -w server && npm run build -w apps/web",
+    "test": "npm run test -w shared && npm run test -w server",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.0",
+    "typescript": "^5.6.3"
+  }
+}
