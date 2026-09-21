@@ -97,6 +97,9 @@
 
   html {
     -webkit-text-size-adjust: 100%;
+    /* Scale the whole UI down a touch: Tailwind's rem-based spacing
+       follows this, so layout reads a bit more zoomed out. */
+    font-size: 87.5%;
   }
 
   body {
@@ -160,32 +163,6 @@
     box-shadow:
       0 26px 60px -18px rgba(0, 0, 0, 0.9),
       inset 0 1px 0 rgba(255, 255, 255, 0.05);
-  }
-
-  /* ── CRT-ish scanline texture over the artwork ────────────────────── */
-  .scanlines {
-    background-image: repeating-linear-gradient(
-      to bottom,
-      rgba(0, 0, 0, 0.5) 0px,
-      rgba(0, 0, 0, 0.5) 1px,
-      rgba(255, 255, 255, 0.02) 1px,
-      rgba(255, 255, 255, 0.02) 2px,
-      rgba(0, 0, 0, 0) 2px,
-      rgba(0, 0, 0, 0) 4px
-    );
-    opacity: 0.45;
-    mix-blend-mode: multiply;
-  }
-
-  .scanlines-soft {
-    background-image: repeating-linear-gradient(
-      to bottom,
-      rgba(255, 255, 255, 0.035) 0px,
-      rgba(255, 255, 255, 0.035) 1px,
-      rgba(0, 0, 0, 0) 1px,
-      rgba(0, 0, 0, 0) 4px
-    );
-    opacity: 0.35;
   }
 
   .grain {

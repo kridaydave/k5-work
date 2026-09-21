@@ -3,9 +3,12 @@ import wallpaper from "@/assets/wallpaper.jpg";
 
 /**
  * The painterly sunset artwork that sits behind the whole window, with a
- * gentle pointer parallax and the CRT-ish scanline / grain treatment.
+ * gentle pointer parallax and a soft grain treatment.
+ *
+ * When the thread is active the artwork glides up-left so the dark storm
+ * region sits behind the text instead of the bright sunset band.
  */
-export function Wallpaper() {
+export function Wallpaper({ active = false }: { active?: boolean }) {
   const [offset, setOffset] = useState({ x: 0, y: 0 });
 
   useEffect(() => {
@@ -31,9 +34,13 @@ export function Wallpaper() {
 
   return (
     <div className="pointer-events-none absolute inset-0 -z-10 overflow-hidden bg-ink-950" aria-hidden="true">
-      {/* artwork */}
+      {/* artwork — faded out toward the bottom-right so only the top-left stays visible */}
       <div
-        className="absolute -inset-[6%] bg-cover bg-center transition-transform duration-[1200ms] ease-out"
+        className={[
+          "absolute -inset-[6%] bg-cover transition-[background-position,transform] duration-700 ease-out",
+          "[mask-image:linear-gradient(to_bottom_right,black_25%,transparent_72%)]",
+          active ? "bg-left-top" : "bg-center",
+        ].join(" ")}
         style={{
           backgroundImage: `url(${wallpaper})`,
           transform: `translate3d(${offset.x * -22}px, ${offset.y * -18}px, 0)`,
@@ -48,8 +55,6 @@ export function Wallpaper() {
       <div className="absolute inset-0 bg-[radial-gradient(120%_90%_at_50%_18%,transparent_38%,rgba(4,6,10,0.55)_100%)]" />
 
       {/* texture */}
-      <div className="scanlines absolute inset-0" />
-      <div className="scanlines-soft absolute inset-0" />
       <div className="grain absolute inset-0" />
     </div>
   );

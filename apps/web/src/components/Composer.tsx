@@ -1,8 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { Menu, type MenuItem } from "@/components/Menu";
 import {
+  BranchIcon,
   CloseIcon,
   CubeIcon,
+  DisplayIcon,
   FolderIcon,
   PaperclipIcon,
   ArrowUpIcon,
@@ -23,22 +25,38 @@ const CONTEXTS: MenuItem[] = [
 ];
 
 const DIRECTORIES: MenuItem[] = [
-  { id: "current", label: "Current checkout", meta: "~/dev/cowork · branch main" },
+  { id: "current", label: "Local checkout", meta: "~/dev/cowork · branch main" },
   { id: "another", label: "Choose another folder…" },
+];
+
+const BRANCHES: MenuItem[] = [
+  { id: "main", label: "main", meta: "up to date with origin" },
+  { id: "feat/composer", label: "feat/composer", meta: "2 ahead · 1 behind" },
+  { id: "release/5.1", label: "release/5.1", meta: "protected" },
+];
+
+const DEVICES: MenuItem[] = [
+  { id: "laptop", label: "Nairine", meta: "Connected · This device" },
+  { id: "tablet", label: "Silvia", meta: "Available · Remote" },
+  { id: "add", label: "Add a computer…" },
 ];
 
 const SAMPLE_FILES = ["screenshot-2026-04-12.png", "quarterly-metrics.csv", "onboarding-flow.fig", "api-spec.yaml"];
 
 type ComposerProps = {
   onSend: (text: string) => void;
+  /** tighter paddings + smaller type for the bottom-docked thread state */
+  compact?: boolean;
 };
 
-export function Composer({ onSend }: ComposerProps) {
+export function Composer({ onSend, compact = false }: ComposerProps) {
   const [value, setValue] = useState("");
   const [focused, setFocused] = useState(false);
   const [model, setModel] = useState("sonnet");
   const [context, setContext] = useState("context");
   const [directory, setDirectory] = useState("current");
+  const [branch, setBranch] = useState("main");
+  const [device, setDevice] = useState("laptop");
   const [attachments, setAttachments] = useState<string[]>([]);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileCursor = useRef(0);
@@ -77,7 +95,7 @@ export function Composer({ onSend }: ComposerProps) {
           items={CONTEXTS}
           value={context}
           onSelect={setContext}
-          direction="down"
+          direction="up"
           className="flex items-center gap-2 rounded-full py-1.5 pl-1.5 pr-2 text-[14.5px] font-medium text-white/65 transition-colors duration-200 hover:bg-white/[0.07] hover:text-white"
         >
           <FolderIcon className="h-[17px] w-[17px] opacity-80" />
@@ -134,18 +152,26 @@ export function Composer({ onSend }: ComposerProps) {
               submit();
             }
           }}
-          className="thin-scroll block max-h-[220px] w-full resize-none bg-transparent px-6 pb-2 pt-[22px] font-serif text-[clamp(19px,2.35vw,26px)] font-normal leading-[1.34] tracking-[-0.013em] text-white/95 [caret-color:#ffb98a] placeholder:text-white/[0.38] focus:outline-none"
+          className={cn(
+            "thin-scroll block max-h-[220px] w-full resize-none bg-transparent font-serif font-normal leading-[1.34] tracking-[-0.013em] text-white/95 [caret-color:#ffb98a] placeholder:text-white/[0.38] focus:outline-none",
+            compact
+              ? "px-5 pb-1.5 pt-[14px] text-[clamp(15px,1.7vw,18px)]"
+              : "px-6 pb-2 pt-[22px] text-[clamp(17px,2vw,22px)]",
+          )}
         />
 
-        <div className="flex items-center gap-1.5 px-3.5 pb-3 pt-1.5">
+        <div className={cn("flex items-center gap-1.5", compact ? "px-3 pb-2.5 pt-1" : "px-3.5 pb-3 pt-1.5")}>
           <button
             type="button"
             aria-label="Attach a file"
             title="Attach a file"
             onClick={attachFile}
-            className="grid h-9 w-9 cursor-pointer place-items-center rounded-full text-white/55 transition duration-200 hover:bg-white/[0.09] hover:text-white active:scale-95"
+            className={cn(
+              "grid cursor-pointer place-items-center rounded-full text-white/55 transition duration-200 hover:bg-white/[0.09] hover:text-white active:scale-95",
+              compact ? "h-8 w-8" : "h-9 w-9",
+            )}
           >
-            <PaperclipIcon className="h-[19px] w-[19px]" />
+            <PaperclipIcon className={compact ? "h-[17px] w-[17px]" : "h-[19px] w-[19px]"} />
           </button>
 
           <div className="flex-1" />
@@ -157,7 +183,10 @@ export function Composer({ onSend }: ComposerProps) {
             onSelect={setModel}
             direction="up"
             align="right"
-            className="flex items-center gap-2 rounded-full py-1.5 pl-2 pr-1.5 text-[14.5px] font-medium text-white/85 transition-colors duration-200 hover:bg-white/[0.09] hover:text-white"
+            className={cn(
+              "flex items-center gap-2 rounded-full py-1.5 pl-2 pr-1.5 font-medium text-white/85 transition-colors duration-200 hover:bg-white/[0.09] hover:text-white",
+              compact ? "text-[13.5px]" : "text-[14.5px]",
+            )}
           >
             <CubeIcon className="h-[18px] w-[18px] text-white/80" />
             <span>{activeModel?.label.split(" ").slice(0, 2).join(" ") ?? "Claude"}</span>
@@ -169,20 +198,21 @@ export function Composer({ onSend }: ComposerProps) {
             title="Send"
             onClick={submit}
             className={cn(
-              "ml-0.5 grid h-10 w-10 cursor-pointer place-items-center rounded-full transition duration-300",
+              "ml-0.5 grid cursor-pointer place-items-center rounded-full transition duration-300",
               "bg-white text-[#141414] shadow-[0_8px_22px_-10px_rgba(255,255,255,0.55)]",
               "hover:scale-[1.07] hover:shadow-[0_12px_30px_-10px_rgba(255,255,255,0.6)] active:scale-95",
+              compact ? "h-9 w-9" : "h-10 w-10",
               !value.trim() && "shadow-none",
             )}
           >
-            <ArrowUpIcon className="h-[19px] w-[19px]" />
+            <ArrowUpIcon className={compact ? "h-[17px] w-[17px]" : "h-[19px] w-[19px]"} />
           </button>
         </div>
       </div>
 
-      {/* working directory row, under the card */}
+      {/* status strip, attached under the card */}
       <div
-        className="animate-fade-up mt-2.5 flex items-center justify-between gap-3 px-1.5"
+        className="animate-fade-up mx-3 flex items-center gap-0.5 rounded-b-[20px] border border-t-0 border-white/[0.06] bg-black/45 py-[5px] pl-2.5 pr-2 backdrop-blur-xl"
         style={{ animationDelay: "280ms" }}
       >
         <Menu
@@ -190,21 +220,45 @@ export function Composer({ onSend }: ComposerProps) {
           items={DIRECTORIES}
           value={directory}
           onSelect={setDirectory}
-          direction="down"
-          className="flex items-center gap-2 rounded-full py-1.5 pl-1.5 pr-2 text-[14.5px] font-medium text-white/65 transition-colors duration-200 hover:bg-white/[0.07] hover:text-white"
+          direction="up"
+          className="flex items-center gap-1.5 rounded-full px-1.5 py-1 text-[12.5px] font-medium text-white/55 transition-colors duration-200 hover:bg-white/[0.07] hover:text-white"
         >
-          <FolderIcon className="h-[17px] w-[17px] opacity-80" />
-          <span className="max-w-[52vw] truncate sm:max-w-none">
-            {DIRECTORIES.find((d) => d.id === directory)?.label ?? "Current checkout"}
+          <FolderIcon className="h-[14px] w-[14px] opacity-80" />
+          <span className="max-w-[30vw] truncate sm:max-w-[11rem]">
+            {DIRECTORIES.find((d) => d.id === directory)?.label ?? "Local checkout"}
           </span>
         </Menu>
 
-        <p className="hidden shrink-0 text-[12px] font-medium tracking-[0.01em] text-white/25 sm:block">
-          <kbd className="font-sans">⇧</kbd>
-          <span className="px-1">+</span>
-          <kbd className="font-sans">⏎</kbd>
-          <span className="pl-1.5">new line</span>
-        </p>
+        <div className="flex-1" />
+
+        <Menu
+          ariaLabel="Choose branch"
+          items={BRANCHES}
+          value={branch}
+          onSelect={setBranch}
+          direction="up"
+          className="flex items-center gap-1.5 rounded-full px-1.5 py-1 text-[12.5px] font-medium text-white/55 transition-colors duration-200 hover:bg-white/[0.07] hover:text-white"
+        >
+          <BranchIcon className="h-[13px] w-[13px] opacity-75" />
+          <span className="max-w-[24vw] truncate sm:max-w-[9rem]">
+            {BRANCHES.find((b) => b.id === branch)?.label ?? "main"}
+          </span>
+        </Menu>
+
+        <Menu
+          ariaLabel="Choose computer"
+          items={DEVICES}
+          value={device}
+          onSelect={setDevice}
+          direction="up"
+          align="right"
+          className="flex items-center gap-1.5 rounded-full px-1.5 py-1 text-[12.5px] font-medium text-white/55 transition-colors duration-200 hover:bg-white/[0.07] hover:text-white"
+        >
+          <DisplayIcon className="h-[14px] w-[14px] opacity-75" />
+          <span className="max-w-[24vw] truncate sm:max-w-[9rem]">
+            {DEVICES.find((d) => d.id === device)?.label ?? "Nairine"}
+          </span>
+        </Menu>
       </div>
     </div>
   );

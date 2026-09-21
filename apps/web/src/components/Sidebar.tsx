@@ -51,7 +51,7 @@ export function Sidebar({ open, onClose }: SidebarProps) {
         aria-label="Session history"
         aria-hidden={!open}
         className={cn(
-          "glass-panel absolute inset-y-0 left-0 z-40 flex w-[86vw] max-w-[320px] flex-col rounded-l-none transition-transform duration-[600ms] [transition-timing-function:cubic-bezier(0.16,0.84,0.28,1)] lg:rounded-l-[26px]",
+          "glass-panel absolute inset-y-0 left-0 z-40 flex w-[86vw] max-w-[300px] flex-col rounded-l-none transition-transform duration-[600ms] [transition-timing-function:cubic-bezier(0.16,0.84,0.28,1)] lg:rounded-l-[26px]",
           open ? "translate-x-0" : "-translate-x-full",
         )}
       >
