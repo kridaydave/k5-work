@@ -125,13 +125,35 @@ describe("ooxml-core content-types (D-2)", () => {
 
   it("escapes special chars in the emitted table", () => {
     const ct = new ContentTypes();
-    ct.addOverride("word/a&b.xml", "t&v");
+    ct.addOverride("word/a&b.xml", 'application/x-test;note="t&v"');
     assert.ok(
       ct
         .buildXml()
         .includes(
-          '<Override PartName="/word/a&amp;b.xml" ContentType="t&amp;v"/>',
+          '<Override PartName="/word/a&amp;b.xml" ContentType="application/x-test;note=&quot;t&amp;v&quot;"/>',
         ),
     );
+  });
+
+  it("rejects non-media-type content types", () => {
+    const ct = new ContentTypes();
+    for (const bad of [
+      "not-a-type",
+      " application/xml",
+      "application/xml ",
+      "text /xml",
+      "text/xml(comment)",
+      "text/xml; charset=utf-8",
+      "text/xml;",
+      "/xml",
+    ]) {
+      assert.throws(
+        () => ct.addDefault("xml", bad),
+        (e: unknown) =>
+          e instanceof OoxmlError && e.code === "E_CONTENTTYPE_BAD_TYPE",
+        bad,
+      );
+    }
+    assert.doesNotThrow(() => ct.addDefault("xml", "application/xml"));
   });
 });

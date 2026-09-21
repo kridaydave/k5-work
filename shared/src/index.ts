@@ -118,7 +118,13 @@ export const OoxmlPackageSpecSchema = z
   .object({
     parts: z.array(OoxmlPartSchema).min(1),
     packageRels: z.array(OoxmlRelSchema).default([]),
-    partRels: z.record(z.array(OoxmlRelSchema)).default({}),
+    partRels: z
+      .record(z.array(OoxmlRelSchema))
+      .default({})
+      .refine(
+        (r) => Object.keys(r).every((k) => k.trim().length > 0),
+        "part rel source must not be blank",
+      ),
   })
   .strict();
 export type OoxmlPackageSpec = z.infer<typeof OoxmlPackageSpecSchema>;

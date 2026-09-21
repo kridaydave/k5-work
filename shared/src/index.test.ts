@@ -153,4 +153,23 @@ describe("shared wire contracts", () => {
     });
     assert.equal(withRels.packageRels[0].mode, "internal");
   });
+
+  it("ooxml package spec rejects blank partRels sources", () => {
+    const parts = [{ name: "a", contentType: "t", xml: "x" }];
+    assert.throws(() =>
+      OoxmlPackageSpecSchema.parse({ parts, partRels: { "": [] } }),
+    );
+    assert.throws(() =>
+      OoxmlPackageSpecSchema.parse({
+        parts,
+        partRels: { "   ": [{ type: "t", target: "x" }] },
+      }),
+    );
+    assert.doesNotThrow(() =>
+      OoxmlPackageSpecSchema.parse({
+        parts,
+        partRels: { a: [{ type: "t", target: "x" }] },
+      }),
+    );
+  });
 });

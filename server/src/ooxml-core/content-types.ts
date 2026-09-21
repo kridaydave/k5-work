@@ -18,9 +18,22 @@ function normExt(extension: string): string {
   return ext.startsWith(".") ? ext.slice(1) : ext;
 }
 
+// RFC 2616 media-type shape (OPC M1.13/M1.14): token "/" token with
+// optional ";attr=value" params, no whitespace outside quoted param
+// values, no comments. OOXML types never need params; quoted values
+// stay supported so valid-but-unusual types are not refused.
+const TOKEN = `[!#$%&'*+\\-.^_\`|~0-9A-Za-z]+`;
+const QUOTED = `"(?:[^"\\\\]|\\\\.)*"`;
+const CONTENT_TYPE_RE = new RegExp(
+  `^${TOKEN}/${TOKEN}(?:;${TOKEN}=(?:${TOKEN}|${QUOTED}))*$`,
+);
+
 function assertContentType(contentType: string, what: string): void {
-  if (contentType.trim() === "") {
-    throw new OoxmlError("E_CONTENTTYPE_BAD_TYPE", `empty content type for ${what}`);
+  if (!CONTENT_TYPE_RE.test(contentType)) {
+    throw new OoxmlError(
+      "E_CONTENTTYPE_BAD_TYPE",
+      `invalid content type for ${what}: ${contentType}`,
+    );
   }
 }
 

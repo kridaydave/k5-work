@@ -28,4 +28,10 @@ describe("ooxml-core paths (review fix)", () => {
     assert.throws(() => toZipPath("a/b:c.xml"), isZipPath);
     assert.throws(() => toPartName("C:\\word\\doc.xml"), isZipPath);
   });
+
+  it("rejects surrounding whitespace instead of trimming it", () => {
+    assert.throws(() => toZipPath(" word/doc.xml"), isZipPath);
+    assert.throws(() => toZipPath("word/doc.xml "), isZipPath);
+    assert.throws(() => toPartName("  word/doc.xml  "), isZipPath);
+  });
 });

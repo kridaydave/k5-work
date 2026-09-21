@@ -131,6 +131,12 @@ function assertModeMatchesTarget(mode: RelTargetMode, target: string): void {
       `internal rel points outside the package: ${target}`,
     );
   }
+  if (mode === "external" && DRIVE.test(target.replace(/\\/g, "/"))) {
+    throw new OoxmlError(
+      "E_REL_BAD_TARGET",
+      `external rel has a drive-letter target: ${target}`,
+    );
+  }
 }
 
 // Write-time gate: duplicate Ids within one .rels scope, and internal

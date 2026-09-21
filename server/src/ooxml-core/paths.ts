@@ -23,7 +23,10 @@ function checkSegments(segs: string[], original: string): void {
 // Canonical ZIP form: forward slashes, no leading slash, no ".", no "..",
 // no empty segments, no drive letters, no colons.
 export function toZipPath(input: string): string {
-  const p = input.replace(/\\/g, "/").trim().replace(/^\/+/, "");
+  if (input !== input.trim()) {
+    throw new OoxmlError("E_ZIP_PATH", `surrounding whitespace in path ${input}`);
+  }
+  const p = input.replace(/\\/g, "/").replace(/^\/+/, "");
   if (!p) throw new OoxmlError("E_ZIP_PATH", "empty part path");
   checkSegments(p.split("/"), input);
   return p;

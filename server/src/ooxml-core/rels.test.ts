@@ -146,4 +146,20 @@ describe("ooxml-core rels (D-2)", () => {
     assert.equal(scope.entries.length, 2);
     assert.ok(scope.buildXml().includes('TargetMode="External"'));
   });
+
+  it("rejects drive-letter targets in external mode", () => {
+    const BS = String.fromCharCode(92);
+    const scope = new RelScope(PACKAGE_RELS_PATH);
+    assert.throws(
+      () => scope.add("t", "C:/x.xml", "external"),
+      (e: unknown) => isCode(e, "E_REL_BAD_TARGET"),
+    );
+    assert.throws(
+      () =>
+        buildRelsXml([
+          { rId: "rId1", type: "t", target: `C:${BS}x.xml`, mode: "external" },
+        ]),
+      (e: unknown) => isCode(e, "E_REL_BAD_TARGET"),
+    );
+  });
 });
