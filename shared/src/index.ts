@@ -78,3 +78,47 @@ export const EventSchema = z.object({
   payload: z.unknown(),
 });
 export type Event = z.infer<typeof EventSchema>;
+
+// --- ooxml-core JSON-in (D-1, extended D-2 review) ---
+// Engine owns ordering, rIds, content-types, Deflate. Callers submit parts
+// plus rel declarations only, always RAW unescaped text. Schemas are
+// strict: unknown keys fail loudly so drift is caught, never stripped.
+// Duplicate part names and bad paths are refused engine-side (E_PACKAGE_DUP_PART).
+const nonBlank = (label: string) =>
+  z
+    .string()
+    .min(1)
+    .refine((s) => s.trim().length > 0, `${label} must not be blank`);
+
+export const OoxmlPartSchema = z
+  .object({
+    name: nonBlank("part name"),
+    contentType: nonBlank("content type"),
+    xml: nonBlank("part xml"),
+  })
+  .strict();
+export type OoxmlPart = z.infer<typeof OoxmlPartSchema>;
+
+export const OoxmlRelModeSchema = z.enum(["internal", "external"]);
+export type OoxmlRelMode = z.infer<typeof OoxmlRelModeSchema>;
+
+// Rel declarations for D-3's PackageBuilder (reserved now so adding the
+// builder is not a breaking contract change). Targets follow the same
+// rules as RelScope: relative part refs internal, absolute IRIs external.
+export const OoxmlRelSchema = z
+  .object({
+    type: nonBlank("rel type"),
+    target: nonBlank("rel target"),
+    mode: OoxmlRelModeSchema.default("internal"),
+  })
+  .strict();
+export type OoxmlRel = z.infer<typeof OoxmlRelSchema>;
+
+export const OoxmlPackageSpecSchema = z
+  .object({
+    parts: z.array(OoxmlPartSchema).min(1),
+    packageRels: z.array(OoxmlRelSchema).default([]),
+    partRels: z.record(z.array(OoxmlRelSchema)).default({}),
+  })
+  .strict();
+export type OoxmlPackageSpec = z.infer<typeof OoxmlPackageSpecSchema>;

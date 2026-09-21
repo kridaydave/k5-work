@@ -6,10 +6,11 @@
   "scripts": {
     "dev": "node --watch dist/index.js",
     "build": "tsc -p tsconfig.json",
-    "test": "node --test dist/service.test.js dist/acp/plug.test.js"
+    "test": "node --test dist/service.test.js dist/acp/plug.test.js dist/ooxml-core/xml.test.js dist/ooxml-core/paths.test.js dist/ooxml-core/content-types.test.js dist/ooxml-core/rels.test.js"
   },
   "dependencies": {
     "@k5-work/shared": "0.1.0",
+    "fflate": "^0.8.3",
     "zod": "^3.23.8"
   },
   "devDependencies": {
