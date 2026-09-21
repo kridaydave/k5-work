@@ -5,6 +5,8 @@ import {
   AuditSchema,
   EventSchema,
   HarnessSchema,
+  OoxmlPackageSpecSchema,
+  OoxmlPartSchema,
   PermissionSchema,
   PromptSchema,
   SessionSchema,
@@ -106,5 +108,68 @@ describe("shared wire contracts", () => {
       payload: a,
     });
     assert.equal(e.kind, "audit");
+  });
+
+  it("ooxml package spec validates parts", () => {
+    const spec = OoxmlPackageSpecSchema.parse({
+      parts: [
+        {
+          name: "word/document.xml",
+          contentType:
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+          xml: "<w:document/>",
+        },
+      ],
+    });
+    assert.equal(spec.parts.length, 1);
+    assert.throws(() => OoxmlPackageSpecSchema.parse({ parts: [] }));
+    assert.throws(() =>
+      OoxmlPackageSpecSchema.parse({
+        parts: [{ name: "", contentType: "text/xml", xml: "<x/>" }],
+      }),
+    );
+  });
+
+  it("ooxml schemas reject blanks and unknown keys, default rels", () => {
+    assert.throws(() =>
+      OoxmlPartSchema.parse({ name: "   ", contentType: "t", xml: "x" }),
+    );
+    assert.throws(() =>
+      OoxmlPartSchema.parse({
+        name: "a",
+        contentType: "t",
+        xml: "x",
+        extra: 1,
+      }),
+    );
+    const spec = OoxmlPackageSpecSchema.parse({
+      parts: [{ name: "a", contentType: "t", xml: "x" }],
+    });
+    assert.deepEqual(spec.packageRels, []);
+    assert.deepEqual(spec.partRels, {});
+    const withRels = OoxmlPackageSpecSchema.parse({
+      parts: [{ name: "a", contentType: "t", xml: "x" }],
+      packageRels: [{ type: "t", target: "x" }],
+    });
+    assert.equal(withRels.packageRels[0].mode, "internal");
+  });
+
+  it("ooxml package spec rejects blank partRels sources", () => {
+    const parts = [{ name: "a", contentType: "t", xml: "x" }];
+    assert.throws(() =>
+      OoxmlPackageSpecSchema.parse({ parts, partRels: { "": [] } }),
+    );
+    assert.throws(() =>
+      OoxmlPackageSpecSchema.parse({
+        parts,
+        partRels: { "   ": [{ type: "t", target: "x" }] },
+      }),
+    );
+    assert.doesNotThrow(() =>
+      OoxmlPackageSpecSchema.parse({
+        parts,
+        partRels: { a: [{ type: "t", target: "x" }] },
+      }),
+    );
   });
 });
