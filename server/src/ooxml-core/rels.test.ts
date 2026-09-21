@@ -162,4 +162,19 @@ describe("ooxml-core rels (D-2)", () => {
       (e: unknown) => isCode(e, "E_REL_BAD_TARGET"),
     );
   });
+
+  it("rejects drive-letter targets in internal mode too", () => {
+    const scope = new RelScope(PACKAGE_RELS_PATH);
+    assert.throws(
+      () => scope.add("t", "C:/x.xml"),
+      (e: unknown) => isCode(e, "E_REL_BAD_TARGET"),
+    );
+    assert.throws(
+      () =>
+        buildRelsXml([
+          { rId: "rId1", type: "t", target: "C:/x.xml", mode: "internal" },
+        ]),
+      (e: unknown) => isCode(e, "E_REL_BAD_TARGET"),
+    );
+  });
 });

@@ -125,7 +125,10 @@ export class RelScope {
 }
 
 function assertModeMatchesTarget(mode: RelTargetMode, target: string): void {
-  if (mode === "internal" && isExternalTarget(target)) {
+  if (
+    mode === "internal" &&
+    (isExternalTarget(target) || DRIVE.test(target.replace(/\\/g, "/")))
+  ) {
     throw new OoxmlError(
       "E_REL_BAD_TARGET",
       `internal rel points outside the package: ${target}`,
@@ -139,8 +142,9 @@ function assertModeMatchesTarget(mode: RelTargetMode, target: string): void {
   }
 }
 
-// Write-time gate: duplicate Ids within one .rels scope, and internal
-// rels pointing outside the package, are refused here — never packed.
+// Write-time gate: duplicate Ids within one .rels scope and mode/target
+// mismatches are refused here — never packed. Escape-outside-package is
+// resolved against source context and refused by the validator.
 export function buildRelsXml(rels: ReadonlyArray<RelEntry>): string {
   const seen = new Set<string>();
   const children = rels
