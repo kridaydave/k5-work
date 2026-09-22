@@ -29,6 +29,16 @@ describe("ooxml-core paths (review fix)", () => {
     assert.throws(() => toPartName("C:\\word\\doc.xml"), isZipPath);
   });
 
+  it("refuses __proto__ segments (prototype-pollution guard)", () => {
+    for (const bad of ["__proto__", "__PROTO__", "word/__proto__/a.xml"]) {
+      assert.throws(() => toZipPath(bad), isZipPath, bad);
+      assert.throws(() => toPartName(bad), isZipPath, bad);
+    }
+    // Near-misses stay legal: only the exact segment is reserved.
+    assert.equal(toZipPath("word/constructor.xml"), "word/constructor.xml");
+    assert.equal(toZipPath("word/prototype.xml"), "word/prototype.xml");
+  });
+
   it("rejects surrounding whitespace instead of trimming it", () => {
     assert.throws(() => toZipPath(" word/doc.xml"), isZipPath);
     assert.throws(() => toZipPath("word/doc.xml "), isZipPath);

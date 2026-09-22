@@ -1,4 +1,4 @@
-// ooxml-core public surface (D-1 + D-2; D-3+ add zip/validator).
+// ooxml-core public surface (D-1 + D-2 + D-3; D-4+ adds validator).
 export { OoxmlError } from "./errors.js";
 export type { OoxmlErrorCode } from "./errors.js";
 export { XML_DECL, assertLegalXmlChars, doc, el, escAttr, escText } from "./xml.js";
@@ -14,6 +14,10 @@ export {
   RELS_NS,
   RelScope,
   relsPathForPart,
+  resolvePackageRelTarget,
   resolveRelTarget,
 } from "./rels.js";
 export type { RelEntry, RelTargetMode } from "./rels.js";
+export { ZipWriter, PINNED_MTIME, DEFAULT_LEVEL } from "./zip.js";
+export type { ZipAddOptions } from "./zip.js";
+export { PackageBuilder, CONTENT_TYPES_PATH } from "./package.js";

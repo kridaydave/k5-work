@@ -11,6 +11,6 @@
   - Research (cdres, GREEN): `CD_res/implementation/ooxml-core/ooxml-core-research.md` (consolidated) + `CD_res/implementation/ooxml-core/ooxml-zip-engine-research.md` (ZIP/XML engine deep-dive)
   - Location decided: `server/src/ooxml-core`. License: MIT core, permissive deps only (no GPL/AGPL in core).
   - [x] D-1 + D-2 (single PR): foundation + XmlBuilder + shared schemas (`fflate` dep, `xml.ts`/`errors.ts`, `OoxmlPart/PackageSpec` Zod in `shared`, `xml.test.ts`) + ContentTypes table + RelIds allocator (per-scope rIds, Default/Override ownership, target resolution)
-  - [ ] D-3: ZipWriter + PackageBuilder create-only (methods {0,8}, bit3=0, bit11=1, pinned mtime, deterministic order)
+  - [x] D-3: ZipWriter + PackageBuilder create-only (methods {0,8}, bit3=0, bit11=1, pinned mtime, deterministic order)
   - [ ] D-4: Validator write-time + post-hoc (coded spec/heuristic checks, corrupt-fixture tests)
   - [ ] D-5: minimal docx proof fixture + LibreOffice repair gate + mark D done

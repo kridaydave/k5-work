@@ -60,7 +60,10 @@ function normalizeSegments(path: string, original: string): string {
 }
 
 const ABS_IRI = /^[A-Za-z][A-Za-z0-9+.-]*:/;
-const DRIVE = /^[A-Za-z]:(\/|$)/;
+// Any single-letter-colon lead is a drive ("C:/…", "C:foo"), never an
+// external IRI: single-letter URI schemes are vanishingly rare and OPC
+// paths must not contain drive letters unconditionally.
+const DRIVE = /^[A-Za-z]:/;
 
 // Absolute-IRI test for rel targets. Drive letters ("C:/…") match the IRI
 // shape but are NOT external — they are rejected before this is consulted.
@@ -85,6 +88,19 @@ export function resolveRelTarget(sourcePart: string, target: string): string {
   const slash = src.lastIndexOf("/");
   const base = slash < 0 ? "" : src.slice(0, slash + 1);
   return requireNonEmpty(normalizeSegments(base + t, target), target);
+}
+
+// Package-level rels resolve against the package root (their .rels lives
+// at _rels/.rels); part rels resolve against their source part instead.
+export function resolvePackageRelTarget(target: string): string {
+  if (!target) throw new OoxmlError("E_REL_BAD_TARGET", "empty rel target");
+  const t = target.replace(/\\/g, "/");
+  if (DRIVE.test(t)) {
+    throw new OoxmlError("E_REL_BAD_TARGET", `drive-letter target: ${target}`);
+  }
+  if (isExternalTarget(target)) return target;
+  const stripped = t.startsWith("/") ? t.slice(1) : t;
+  return requireNonEmpty(normalizeSegments(stripped, target), target);
 }
 
 function requireNonEmpty(resolved: string, target: string): string {
