@@ -139,3 +139,34 @@ export class PackageBuilder {
     }
     return zip.build();
   }
+
+  // Canonical ZIP names keyed case-insensitively (OPC equivalence):
+  // first spelling wins, later variants are duplicates.
+  private canonicalParts(): Map<string, CanonicalPart> {
+    const parts = new Map<string, CanonicalPart>();
+    for (const raw of this.spec.parts) {
+      const name = toZipPath(raw.name);
+      const folded = name.toLowerCase();
+      if (parts.has(folded)) {
+        throw new OoxmlError("E_PACKAGE_DUP_PART", `duplicate part: ${name}`);
+      }
+      assertLegalXmlChars(raw.xml, `part ${name}`);
+      parts.set(folded, { name, contentType: raw.contentType, xml: raw.xml });
+    }
+    return parts;
+  }
+
+  private canonicalSource(
+    parts: Map<string, CanonicalPart>,
+    source: string,
+  ): string {
+    const name = toZipPath(source);
+    const hit = parts.get(name.toLowerCase());
+    if (hit === undefined) {
+      throw new OoxmlError(
+        "E_REL_BAD_TARGET",
+        `part rels for unknown part: ${source}`,
+      );
+    }
+    return hit.name;
+  }
