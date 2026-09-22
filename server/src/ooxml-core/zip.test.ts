@@ -249,10 +249,22 @@ describe("ooxml-core zip writer (D-3)", () => {
     w.add("r.bin", raw, { level: 0 });
     raw[0] = 1;
     assert.equal(unzipSync(w.build())["r.bin"][0], 9);
+
+    // Buffer.slice() is a VIEW, not a copy: the writer must copy through
+    // the prototype so caller mutations cannot leak into the build.
+    const buf = Buffer.from([7, 7, 7]);
+    const wb = new ZipWriter();
+    wb.add("s.bin", buf, { level: 0 });
+    buf[0] = 2;
+    assert.equal(unzipSync(wb.build())["s.bin"][0], 7);
   });
 
-  it("pins the DOS-epoch mtime by default", () => {
-    assert.equal(PINNED_MTIME.getTime(), Date.UTC(1980, 0, 1));
+  it("pins a timezone-proof mtime by default", () => {
+    // Mid-month noon UTC: local calendar stays in range 1980-2099 for
+    // every real timezone (fflate encodes local fields, not the instant).
+    assert.equal(PINNED_MTIME.getTime(), Date.UTC(2001, 5, 15, 12, 0, 0));
+    const y = PINNED_MTIME.getFullYear();
+    assert.ok(y === 2000 || y === 2001, `local year near pin: ${y}`);
   });
 
   it("refuses __proto__ names instead of corrupting the map", () => {

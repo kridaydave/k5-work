@@ -16,13 +16,13 @@ import { strToU8, zipSync } from "fflate";
 import { OoxmlError } from "./errors.js";
 import { toZipPath } from "./paths.js";
 
-// DOS time starts 1980-01-01; pin exactly there (UTC) so builds never
-// embed the wall clock. Callers may pass an explicit mtime per entry,
-// but the default keeps fixtures byte-identical across runs. Shared and
-// mutable by nature (Date) — ZipWriter copies it on entry, so mutating
-// this object (or any caller-supplied mtime) after the fact cannot shift
-// bytes of writers already constructed. Treat as read-only.
-export const PINNED_MTIME = new Date(Date.UTC(1980, 0, 1, 0, 0, 0));
+// Pinned default mtime. fflate encodes LOCAL calendar fields
+// (getFullYear/getMonth/..., refusing local years outside 1980-2099), so
+// the pin must be valid in every timezone (UTC-12…UTC+14): mid-month noon
+// UTC keeps the local date within the same month and year everywhere.
+// Note: bytes are deterministic per machine, not across timezones —
+// inherent to fflate's local-field encoding, out of scope for v1.
+export const PINNED_MTIME = new Date(Date.UTC(2001, 5, 15, 12, 0, 0));
 export const DEFAULT_LEVEL = 6;
 
 const LOCAL_SIG = 0x04034b50;
@@ -54,22 +54,19 @@ function assertLevel(level: number): asserts level is ZipLevel {
   }
 }
 
-// fflate throws an untyped numeric-coded error outside 1980-2099 and
-// packs month-0/day-0 bytes for NaN — both escape D-4 code triage, so
-// refuse non-Date/NaN/out-of-range mtimes here with a typed error.
+// fflate encodes LOCAL calendar fields and throws an untyped
+// numeric-coded error outside local 1980-2099 (NaN packs month-0/day-0
+// silently). Mirror its exact check with a typed error so D-4 triage
+// sees E_ZIP_FORMAT, never a bare code-10 or garbage timestamp.
 function assertMtime(mtime: Date, what: string): void {
   if (!(mtime instanceof Date)) {
     throw new OoxmlError("E_ZIP_FORMAT", `mtime is not a Date for ${what}`);
   }
-  const t = mtime.getTime();
-  if (
-    !Number.isFinite(t) ||
-    t < Date.UTC(1980, 0, 1) ||
-    t >= Date.UTC(2100, 0, 1)
-  ) {
+  const year = mtime.getFullYear();
+  if (!Number.isFinite(mtime.getTime()) || year < 1980 || year > 2099) {
     throw new OoxmlError(
       "E_ZIP_FORMAT",
-      `mtime out of range 1980-2099 for ${what}`,
+      `mtime outside local 1980-2099 for ${what}`,
     );
   }
 }
@@ -78,7 +75,9 @@ function assertBytes(data: Uint8Array, name: string): Uint8Array {
   if (!(data instanceof Uint8Array)) {
     throw new OoxmlError("E_ZIP_FORMAT", `bad data type for entry ${name}`);
   }
-  return data.slice();
+  // Slice via the prototype: Buffer overrides .slice() with a VIEW
+  // (subarray alias), which would leak caller mutations into the build.
+  return Uint8Array.prototype.slice.call(data);
 }
 
 // Byte-wise UTF-8 key: encoded once per name, compared by bytes —
