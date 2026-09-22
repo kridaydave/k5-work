@@ -18,3 +18,5 @@ export {
   resolveRelTarget,
 } from "./rels.js";
 export type { RelEntry, RelTargetMode } from "./rels.js";
+export { ZipWriter, PINNED_MTIME, DEFAULT_LEVEL } from "./zip.js";
+export type { ZipAddOptions } from "./zip.js";
