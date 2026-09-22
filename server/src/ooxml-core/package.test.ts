@@ -179,3 +179,40 @@ describe("ooxml-core package builder (D-3)", () => {
     );
   });
 
+  it("refuses dangling internal targets but allows external IRIs", () => {
+    assert.throws(
+      () =>
+        PackageBuilder.parse({
+          ...minimalSpec(),
+          packageRels: [
+            { type: OFFICE_DOC, target: "word/ghost.xml", mode: "internal" },
+          ],
+        }).build(),
+      (e: unknown) =>
+        e instanceof OoxmlError && e.code === "E_REL_DANGLING_REF",
+    );
+    assert.throws(
+      () =>
+        PackageBuilder.parse({
+          ...minimalSpec(),
+          partRels: {
+            "word/document.xml": [
+              { type: STYLES_REL, target: "../ghost.xml" },
+            ],
+          },
+        }).build(),
+      (e: unknown) =>
+        e instanceof OoxmlError && e.code === "E_REL_DANGLING_REF",
+    );
+    // External targets point outside the package by design: no LF check.
+    const bytes = PackageBuilder.parse({
+      ...minimalSpec(),
+      partRels: {
+        "word/document.xml": [
+          { type: HYPERLINK, target: "https://example.com", mode: "external" },
+        ],
+      },
+    }).build();
+    assert.ok("word/_rels/document.xml.rels" in unzipSync(bytes));
+  });
+
