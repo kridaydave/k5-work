@@ -203,3 +203,13 @@ describe("ooxml-core zip writer (D-3)", () => {
       );
     }
   });
+
+  it("is immune to caller-mutated mtimes after add()", () => {
+    const custom = new Date(Date.UTC(2021, 5, 15));
+    const w = new ZipWriter();
+    w.add("a.xml", "<a/>", { mtime: custom });
+    const before = Buffer.from(w.build());
+    custom.setTime(Date.UTC(2022, 1, 1));
+    assert.deepEqual(Buffer.from(w.build()), before);
+  });
+});
