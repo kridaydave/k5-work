@@ -135,3 +135,47 @@ describe("ooxml-core package builder (D-3)", () => {
     assert.equal(methods.get("word/document.xml"), 8);
   });
 
+  it("refuses duplicates, engine-path collisions, and unknown rel sources", () => {
+    assert.throws(
+      () =>
+        PackageBuilder.parse({
+          parts: [
+            { name: "word/document.xml", contentType: DOC_MAIN, xml: DOC_XML },
+            { name: "WORD/DOCUMENT.XML", contentType: DOC_MAIN, xml: DOC_XML },
+          ],
+          packageRels: [],
+          partRels: {},
+        }).build(),
+      (e: unknown) =>
+        e instanceof OoxmlError && e.code === "E_PACKAGE_DUP_PART",
+    );
+    assert.throws(
+      () =>
+        PackageBuilder.parse({
+          parts: [
+            {
+              name: "[Content_Types].xml",
+              contentType: "application/xml",
+              xml: DOC_XML,
+            },
+          ],
+          packageRels: [],
+          partRels: {},
+        }).build(),
+      (e: unknown) =>
+        e instanceof OoxmlError && e.code === "E_PACKAGE_DUP_PART",
+    );
+    assert.throws(
+      () =>
+        PackageBuilder.parse({
+          ...minimalSpec(),
+          partRels: {
+            "word/missing.xml": [
+              { type: STYLES_REL, target: "word/document.xml" },
+            ],
+          },
+        }).build(),
+      (e: unknown) => e instanceof OoxmlError && e.code === "E_REL_BAD_TARGET",
+    );
+  });
+
