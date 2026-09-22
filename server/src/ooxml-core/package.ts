@@ -38,3 +38,27 @@ function compressionLevel(partName: string): 0 | 6 {
   const ext = dot < 0 ? "" : seg.slice(dot + 1).toLowerCase();
   return STORED_EXTENSIONS.has(ext) ? 0 : 6;
 }
+
+interface CanonicalPart {
+  readonly name: string;
+  readonly contentType: string;
+  readonly xml: string;
+}
+
+// Zod records silently drop "__proto__" keys, so a declared partRels
+// source would vanish without error. Pre-scan the raw input and refuse
+// loudly instead (part *names* travel in an array and reach toZipPath,
+// which refuses the segment there).
+function assertNoProtoKeys(input: unknown): void {
+  if (typeof input !== "object" || input === null) return;
+  const rels = (input as { partRels?: unknown }).partRels;
+  if (typeof rels !== "object" || rels === null) return;
+  for (const key of Object.keys(rels)) {
+    if (key.toLowerCase() === "__proto__") {
+      throw new OoxmlError(
+        "E_REL_BAD_TARGET",
+        "reserved rel source: __proto__",
+      );
+    }
+  }
+}
