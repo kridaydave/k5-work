@@ -7,6 +7,7 @@ import {
   RELS_NS,
   RelScope,
   relsPathForPart,
+  resolvePackageRelTarget,
   resolveRelTarget,
 } from "./rels.js";
 import type { RelEntry } from "./rels.js";
