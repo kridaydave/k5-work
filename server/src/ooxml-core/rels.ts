@@ -90,6 +90,19 @@ export function resolveRelTarget(sourcePart: string, target: string): string {
   return requireNonEmpty(normalizeSegments(base + t, target), target);
 }
 
+// Package-level rels resolve against the package root (their .rels lives
+// at _rels/.rels); part rels resolve against their source part instead.
+export function resolvePackageRelTarget(target: string): string {
+  if (!target) throw new OoxmlError("E_REL_BAD_TARGET", "empty rel target");
+  const t = target.replace(/\\/g, "/");
+  if (DRIVE.test(t)) {
+    throw new OoxmlError("E_REL_BAD_TARGET", `drive-letter target: ${target}`);
+  }
+  if (isExternalTarget(target)) return target;
+  const stripped = t.startsWith("/") ? t.slice(1) : t;
+  return requireNonEmpty(normalizeSegments(stripped, target), target);
+}
+
 function requireNonEmpty(resolved: string, target: string): string {
   if (!resolved) {
     throw new OoxmlError("E_REL_BAD_TARGET", `empty resolved target for: ${target}`);
