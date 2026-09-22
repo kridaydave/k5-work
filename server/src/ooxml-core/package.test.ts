@@ -265,3 +265,16 @@ describe("ooxml-core package builder (D-3)", () => {
     assert.ok(!rels.includes("<Relationship "));
   });
 
+  it("refuses internal mode with an absolute-URL target", () => {
+    assert.throws(
+      () =>
+        PackageBuilder.parse({
+          ...minimalSpec(),
+          packageRels: [
+            { type: HYPERLINK, target: "https://example.com", mode: "internal" },
+          ],
+        }).build(),
+      (e: unknown) => e instanceof OoxmlError && e.code === "E_REL_BAD_TARGET",
+    );
+  });
+
