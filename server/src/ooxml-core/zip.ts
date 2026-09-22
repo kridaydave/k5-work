@@ -103,3 +103,28 @@ export class ZipWriter {
           : new Date(opts.mtime.getTime()),
     });
   }
+
+  build(): Uint8Array {
+    const keys: SortKey[] = [...this.files.keys()].map((name) => ({
+      name,
+      raw: strToU8(name),
+    }));
+    keys.sort((a, b) => byteCompare(a.raw, b.raw));
+    // fromEntries (not `{}` + assignment): CreateDataProperty semantics,
+    // so a "__proto__" name becomes a safe own property instead of
+    // re-pointing the container's prototype. toZipPath refuses the segment
+    // anyway — this is the second layer.
+    const tuples: Array<[string, [Uint8Array, { level: ZipLevel; mtime: Date }]]> =
+      [];
+    for (const { name } of keys) {
+      const f = this.files.get(name);
+      if (f === undefined) continue;
+      tuples.push([name, [f.data, { level: f.level, mtime: f.mtime }]]);
+    }
+    const zippable: Record<
+      string,
+      [Uint8Array, { level: ZipLevel; mtime: Date }]
+    > = Object.fromEntries(tuples);
+    return forceUtf8Flag(zipSync(zippable));
+  }
+}
