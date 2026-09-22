@@ -170,3 +170,20 @@ export class PackageBuilder {
     }
     return hit.name;
   }
+
+  // Internal targets must name a part in this package (orphaned r:id is
+  // the classic repair-dialog bug); external IRIs point outside by design.
+  private assertTargetLive(
+    parts: Map<string, CanonicalPart>,
+    resolved: string,
+    original: string,
+  ): void {
+    if (isExternalTarget(original)) return;
+    if (!parts.has(resolved.toLowerCase())) {
+      throw new OoxmlError(
+        "E_REL_DANGLING_REF",
+        `rel target not in package: ${original}`,
+      );
+    }
+  }
+}
