@@ -76,3 +76,34 @@ export class PackageBuilder {
     assertNoProtoKeys(input);
     return new PackageBuilder(OoxmlPackageSpecSchema.parse(input));
   }
+
+  // Runs every write-time gate, then packs. Deterministic: same spec in,
+  // same bytes out (sorted entries, pinned mtime, fixed levels).
+  build(): Uint8Array {
+    const parts = this.canonicalParts();
+    const table = new ContentTypes();
+    table.addDefault("rels", RELS_CONTENT_TYPE);
+    table.addDefault("xml", XML_CONTENT_TYPE);
+    for (const p of parts.values()) table.addOverride(p.name, p.contentType);
+
+    const packageScope = new RelScope(PACKAGE_RELS_PATH);
+    for (const r of this.spec.packageRels) {
+      this.assertTargetLive(parts, resolvePackageRelTarget(r.target), r.target);
+      packageScope.add(r.type, r.target, r.mode);
+    }
+
+    const partScopes = new Map<string, RelScope>();
+    for (const [source, rels] of Object.entries(this.spec.partRels)) {
+      const canonical = this.canonicalSource(parts, source);
+      const scope =
+        partScopes.get(canonical) ?? new RelScope(relsPathForPart(canonical));
+      for (const r of rels) {
+        this.assertTargetLive(
+          parts,
+          resolveRelTarget(canonical, r.target),
+          r.target,
+        );
+        scope.add(r.type, r.target, r.mode);
+      }
+      partScopes.set(canonical, scope);
+    }
