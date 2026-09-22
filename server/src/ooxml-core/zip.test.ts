@@ -174,3 +174,18 @@ describe("ooxml-core zip writer (D-3)", () => {
       );
     }
   });
+
+  it("honors an explicit mtime override and copies input bytes", () => {
+    const custom = new Date(Date.UTC(2021, 5, 15));
+    const a = new ZipWriter();
+    a.add("a.xml", "<a/>", { mtime: custom });
+    const b = new ZipWriter();
+    b.add("a.xml", "<a/>");
+    assert.notDeepEqual(Buffer.from(a.build()), Buffer.from(b.build()));
+
+    const raw = new Uint8Array([9, 9, 9]);
+    const w = new ZipWriter();
+    w.add("r.bin", raw, { level: 0 });
+    raw[0] = 1;
+    assert.equal(unzipSync(w.build())["r.bin"][0], 9);
+  });
