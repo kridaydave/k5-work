@@ -62,3 +62,17 @@ function assertNoProtoKeys(input: unknown): void {
     }
   }
 }
+
+export class PackageBuilder {
+  private readonly spec: OoxmlPackageSpec;
+
+  private constructor(spec: OoxmlPackageSpec) {
+    this.spec = spec;
+  }
+
+  // Sole entry point: validates the JSON-in payload (ZodError on drift,
+  // never a silent null write) and reserves the shape for D-4+.
+  static parse(input: unknown): PackageBuilder {
+    assertNoProtoKeys(input);
+    return new PackageBuilder(OoxmlPackageSpecSchema.parse(input));
+  }
