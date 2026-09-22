@@ -31,3 +31,29 @@ function localEntries(zip: Uint8Array): Map<string, EntryOpt> {
     o += 30 + nameLen + extraLen + compSize;
   }
 }
+
+function centralEntries(zip: Uint8Array): Map<string, EntryOpt> {
+  const dv = new DataView(zip.buffer, zip.byteOffset, zip.length);
+  let o = 0;
+  while (dv.getUint32(o, true) === 0x04034b50) {
+    o +=
+      30 +
+      dv.getUint16(o + 26, true) +
+      dv.getUint16(o + 28, true) +
+      dv.getUint32(o + 18, true);
+  }
+  const out = new Map<string, EntryOpt>();
+  for (;;) {
+    const sig = dv.getUint32(o, true);
+    if (sig === 0x06054b50) return out;
+    assert.equal(sig, 0x02014b50, `central sig at ${o}`);
+    const nameLen = dv.getUint16(o + 28, true);
+    const extraLen = dv.getUint16(o + 30, true);
+    const commentLen = dv.getUint16(o + 32, true);
+    const name = Buffer.from(zip.subarray(o + 46, o + 46 + nameLen)).toString(
+      "utf8",
+    );
+    out.set(name, { flag: dv.getUint16(o + 8, true), method: dv.getUint16(o + 10, true) });
+    o += 46 + nameLen + extraLen + commentLen;
+  }
+}
