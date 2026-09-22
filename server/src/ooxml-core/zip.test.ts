@@ -88,3 +88,38 @@ describe("ooxml-core zip writer (D-3)", () => {
     // Wall-clock must not leak either: rebuilding pins PINNED_MTIME.
     assert.deepEqual(Buffer.from(a.build()), Buffer.from(bytes));
   });
+
+  it("emits methods {0,8} with bit3=0 and bit11=1 everywhere", () => {
+    const w = new ZipWriter();
+    w.add("[Content_Types].xml", "<t/>");
+    w.add("word/document.xml", "<d/>");
+    w.add("word/media/img.png", new Uint8Array([1, 2, 3]), { level: 0 });
+    w.add("ünïcode/n.xml", "<u/>");
+    const bytes = w.build();
+
+    const locals = localEntries(bytes);
+    assert.equal(locals.get("word/document.xml")?.method, 8);
+    assert.equal(locals.get("word/media/img.png")?.method, 0);
+    for (const [name, e] of locals) {
+      assert.equal(e.flag & 0x0008, 0, `bit3 set on ${name}`);
+      assert.equal(e.flag & 0x0800, 0x0800, `bit11 clear on ${name}`);
+      assert.ok(e.method === 0 || e.method === 8, `method on ${name}`);
+    }
+    // Central copies carry the same UTF-8 declaration and methods.
+    const centrals = centralEntries(bytes);
+    for (const [name, e] of centrals) {
+      assert.equal(e.flag & 0x0800, 0x0800, `central bit11 clear on ${name}`);
+      assert.equal(
+        e.method,
+        locals.get(name)?.method,
+        `central/local method mismatch on ${name}`,
+      );
+    }
+    // Canonical order falls out of the sort: table, rels-ish, parts.
+    assert.deepEqual([...locals.keys()], [
+      "[Content_Types].xml",
+      "word/document.xml",
+      "word/media/img.png",
+      "ünïcode/n.xml",
+    ]);
+  });
