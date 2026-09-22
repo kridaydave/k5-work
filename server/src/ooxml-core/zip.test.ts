@@ -123,3 +123,12 @@ describe("ooxml-core zip writer (D-3)", () => {
       "ünïcode/n.xml",
     ]);
   });
+
+  it("never emits ZIP64 and always ends at a plain EOCD", () => {
+    const w = new ZipWriter();
+    w.add("a.xml", "<a/>");
+    const bytes = w.build();
+    assert.ok(hasSig(bytes, 0x06054b50), "EOCD present");
+    assert.ok(!hasSig(bytes, 0x06064b50), "no ZIP64 EOCD");
+    assert.ok(!hasSig(bytes, 0x07064b50), "no ZIP64 locator");
+  });
