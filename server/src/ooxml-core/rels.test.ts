@@ -178,4 +178,26 @@ describe("ooxml-core rels (D-2)", () => {
       (e: unknown) => isCode(e, "E_REL_BAD_TARGET"),
     );
   });
+
+  it("rejects drive-relative targets without a slash too", () => {
+    const BS = String.fromCharCode(92);
+    for (const bad of ["C:foo", "c:bar/baz.xml", `D:${BS}x.xml`]) {
+      assert.throws(
+        () => resolveRelTarget("word/document.xml", bad),
+        (e: unknown) => isCode(e, "E_REL_BAD_TARGET"),
+        bad,
+      );
+      assert.throws(
+        () => resolvePackageRelTarget(bad),
+        (e: unknown) => isCode(e, "E_REL_BAD_TARGET"),
+        bad,
+      );
+      assert.throws(
+        () => new RelScope(PACKAGE_RELS_PATH).add("t", bad, "external"),
+        (e: unknown) => isCode(e, "E_REL_BAD_TARGET"),
+        bad,
+      );
+    }
+  });
+
 });
