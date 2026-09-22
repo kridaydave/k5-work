@@ -1,4 +1,4 @@
-// ooxml-core public surface (D-1 + D-2; D-3+ add zip/validator).
+// ooxml-core public surface (D-1 + D-2 + D-3; D-4+ adds validator).
 export { OoxmlError } from "./errors.js";
 export type { OoxmlErrorCode } from "./errors.js";
 export { XML_DECL, assertLegalXmlChars, doc, el, escAttr, escText } from "./xml.js";
