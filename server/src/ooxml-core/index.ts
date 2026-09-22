@@ -14,6 +14,7 @@ export {
   RELS_NS,
   RelScope,
   relsPathForPart,
+  resolvePackageRelTarget,
   resolveRelTarget,
 } from "./rels.js";
 export type { RelEntry, RelTargetMode } from "./rels.js";
