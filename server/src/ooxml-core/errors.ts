@@ -15,6 +15,7 @@ export type OoxmlErrorCode =
   | "E_ZIP_METHOD"
   | "E_ZIP_GPBIT"
   | "E_ZIP_ZIP64"
+  | "E_ZIP_FORMAT"
   | "E_ZIP_CRC"
   | "E_ZIP_PATH"
   | "E_PACKAGE_MISSING_PART"
