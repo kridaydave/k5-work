@@ -104,3 +104,34 @@ describe("ooxml-core package builder (D-3)", () => {
     assert.ok(strFromU8(back["_rels/.rels"]).includes('Id="rId1"'));
   });
 
+  it("stores precompressed extensions instead of deflating them", () => {
+    const bytes = PackageBuilder.parse({
+      parts: [
+        { name: "word/document.xml", contentType: DOC_MAIN, xml: DOC_XML },
+        {
+          name: "word/media/a.png",
+          contentType: "image/png",
+          xml: "<x/>",
+        },
+      ],
+      packageRels: [
+        { type: OFFICE_DOC, target: "word/document.xml", mode: "internal" },
+      ],
+      partRels: {},
+    }).build();
+    const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.length);
+    const methods = new Map<string, number>();
+    let o = 0;
+    while (dv.getUint32(o, true) === 0x04034b50) {
+      const nameLen = dv.getUint16(o + 26, true);
+      const extraLen = dv.getUint16(o + 28, true);
+      const name = Buffer.from(
+        bytes.subarray(o + 30, o + 30 + nameLen),
+      ).toString("utf8");
+      methods.set(name, dv.getUint16(o + 8, true));
+      o += 30 + nameLen + extraLen + dv.getUint32(o + 18, true);
+    }
+    assert.equal(methods.get("word/media/a.png"), 0);
+    assert.equal(methods.get("word/document.xml"), 8);
+  });
+
