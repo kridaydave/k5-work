@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "node --watch dist/index.js",
     "build": "tsc -p tsconfig.json",
-    "test": "node --test dist/service.test.js dist/acp/plug.test.js dist/ooxml-core/xml.test.js dist/ooxml-core/paths.test.js dist/ooxml-core/content-types.test.js dist/ooxml-core/rels.test.js"
+    "test": "node --test dist/service.test.js dist/acp/plug.test.js dist/ooxml-core/xml.test.js dist/ooxml-core/paths.test.js dist/ooxml-core/content-types.test.js dist/ooxml-core/rels.test.js dist/ooxml-core/zip.test.js dist/ooxml-core/package.test.js"
   },
   "dependencies": {
     "@k5-work/shared": "0.1.0",
