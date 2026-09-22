@@ -20,3 +20,4 @@ export {
 export type { RelEntry, RelTargetMode } from "./rels.js";
 export { ZipWriter, PINNED_MTIME, DEFAULT_LEVEL } from "./zip.js";
 export type { ZipAddOptions } from "./zip.js";
+export { PackageBuilder, CONTENT_TYPES_PATH } from "./package.js";
