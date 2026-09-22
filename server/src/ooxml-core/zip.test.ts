@@ -132,3 +132,28 @@ describe("ooxml-core zip writer (D-3)", () => {
     assert.ok(!hasSig(bytes, 0x06064b50), "no ZIP64 EOCD");
     assert.ok(!hasSig(bytes, 0x07064b50), "no ZIP64 locator");
   });
+
+  it("normalizes paths and refuses escapes, drives, and dirs", () => {
+    const w = new ZipWriter();
+    w.add("/leading/slash.xml", "<a/>");
+    w.add("back\\slash.xml", "<b/>");
+    const back = unzipSync(w.build());
+    assert.ok("leading/slash.xml" in back);
+    assert.ok("back/slash.xml" in back);
+
+    for (const bad of [
+      "../evil.xml",
+      "a/../../evil.xml",
+      "C:/evil.xml",
+      "C:\\evil.xml",
+      "",
+      "a//b.xml",
+      "word/",
+    ]) {
+      assert.throws(
+        () => new ZipWriter().add(bad, "<x/>"),
+        (e: unknown) => e instanceof OoxmlError,
+        bad,
+      );
+    }
+  });
