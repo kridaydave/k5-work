@@ -60,7 +60,10 @@ function normalizeSegments(path: string, original: string): string {
 }
 
 const ABS_IRI = /^[A-Za-z][A-Za-z0-9+.-]*:/;
-const DRIVE = /^[A-Za-z]:(\/|$)/;
+// Any single-letter-colon lead is a drive ("C:/…", "C:foo"), never an
+// external IRI: single-letter URI schemes are vanishingly rare and OPC
+// paths must not contain drive letters unconditionally.
+const DRIVE = /^[A-Za-z]:/;
 
 // Absolute-IRI test for rel targets. Drive letters ("C:/…") match the IRI
 // shape but are NOT external — they are rejected before this is consulted.
