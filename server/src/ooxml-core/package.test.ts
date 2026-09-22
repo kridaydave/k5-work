@@ -252,3 +252,16 @@ describe("ooxml-core package builder (D-3)", () => {
     );
   });
 
+  it("emits a valid empty package rels file when no rels are declared", () => {
+    const bytes = PackageBuilder.parse({
+      parts: [{ name: "word/document.xml", contentType: DOC_MAIN, xml: DOC_XML }],
+      packageRels: [],
+      partRels: {},
+    }).build();
+    const back = unzipSync(bytes);
+    assert.ok("_rels/.rels" in back);
+    const rels = strFromU8(back["_rels/.rels"]);
+    assert.ok(rels.includes("<Relationships"));
+    assert.ok(!rels.includes("<Relationship "));
+  });
+
