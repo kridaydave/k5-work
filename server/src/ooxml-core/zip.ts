@@ -53,3 +53,18 @@ function assertLevel(level: number): asserts level is ZipLevel {
     throw new OoxmlError("E_ZIP_METHOD", `bad compression level: ${level}`);
   }
 }
+
+// Byte-wise UTF-8 key: encoded once per name, compared by bytes —
+// deterministic on every platform (not locale, not UTF-16 code units).
+interface SortKey {
+  readonly name: string;
+  readonly raw: Uint8Array;
+}
+
+function byteCompare(a: Uint8Array, b: Uint8Array): number {
+  const n = Math.min(a.length, b.length);
+  for (let i = 0; i < n; i++) {
+    if (a[i] !== b[i]) return a[i] < b[i] ? -1 : 1;
+  }
+  return a.length - b.length;
+}
