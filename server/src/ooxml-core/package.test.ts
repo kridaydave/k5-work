@@ -33,3 +33,36 @@ function entryNames(zip: Uint8Array): string[] {
 }
 
 describe("ooxml-core package builder (D-3)", () => {
+  it("packs a minimal create-only package with engine-owned tables", () => {
+    const bytes = PackageBuilder.parse(minimalSpec()).build();
+    assert.deepEqual(entryNames(bytes), [
+      "[Content_Types].xml",
+      "_rels/.rels",
+      "word/document.xml",
+    ]);
+
+    const back = unzipSync(bytes);
+    assert.equal(strFromU8(back["word/document.xml"]), DOC_XML);
+
+    const ct = strFromU8(back[CONTENT_TYPES_PATH]);
+    assert.ok(
+      ct.includes(
+        `<Override PartName="/word/document.xml" ContentType="${DOC_MAIN}"/>`,
+      ),
+    );
+    assert.ok(ct.includes('Extension="rels"'));
+    assert.ok(ct.includes('Extension="xml"'));
+
+    const rels = strFromU8(back["_rels/.rels"]);
+    assert.ok(rels.includes('Id="rId1"'));
+    assert.ok(rels.includes(`Type="${OFFICE_DOC}"`));
+    assert.ok(rels.includes('Target="word/document.xml"'));
+    assert.ok(!rels.includes("TargetMode"), "internal omits TargetMode");
+
+    // Same spec in, same bytes out.
+    assert.deepEqual(
+      Buffer.from(PackageBuilder.parse(minimalSpec()).build()),
+      Buffer.from(bytes),
+    );
+  });
+
