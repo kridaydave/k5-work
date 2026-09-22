@@ -144,3 +144,32 @@ function unexpectedSig(sig: number, where: string): OoxmlError {
     `unexpected ZIP signature 0x${sig.toString(16)} in ${where} (refused)`,
   );
 }
+
+// fflate sets bit 11 only when the name is non-ASCII. OPC practice is
+// UTF-8-always, so set the bit on every entry (local + central copies).
+// Walks the structure instead of trusting offsets; anything unexpected
+// (data descriptors, ZIP64 markers, unknown signatures) fails closed.
+function forceUtf8Flag(zip: Uint8Array): Uint8Array {
+  const out = zip.slice();
+  const dv = new DataView(out.buffer, out.byteOffset, out.length);
+  let o = 0;
+  for (;;) {
+    if (o + 4 > out.length) {
+      throw new OoxmlError("E_ZIP_GPBIT", "truncated ZIP while setting bit 11");
+    }
+    const sig = dv.getUint32(o, true);
+    if (sig === EOCD_SIG) return out;
+    if (sig === CENTRAL_SIG) break;
+    if (sig !== LOCAL_SIG) {
+      throw unexpectedSig(sig, "local headers");
+    }
+    const flag = dv.getUint16(o + 6, true);
+    if ((flag & DATA_DESCRIPTOR_FLAG) !== 0) {
+      throw new OoxmlError("E_ZIP_GPBIT", "data descriptor refused (bit 3)");
+    }
+    dv.setUint16(o + 6, flag | UTF8_FLAG, true);
+    const compSize = dv.getUint32(o + 18, true);
+    const nameLen = dv.getUint16(o + 26, true);
+    const extraLen = dv.getUint16(o + 28, true);
+    o += 30 + nameLen + extraLen + compSize;
+  }
