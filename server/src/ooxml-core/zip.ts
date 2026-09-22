@@ -54,6 +54,33 @@ function assertLevel(level: number): asserts level is ZipLevel {
   }
 }
 
+// fflate throws an untyped numeric-coded error outside 1980-2099 and
+// packs month-0/day-0 bytes for NaN — both escape D-4 code triage, so
+// refuse non-Date/NaN/out-of-range mtimes here with a typed error.
+function assertMtime(mtime: Date, what: string): void {
+  if (!(mtime instanceof Date)) {
+    throw new OoxmlError("E_ZIP_FORMAT", `mtime is not a Date for ${what}`);
+  }
+  const t = mtime.getTime();
+  if (
+    !Number.isFinite(t) ||
+    t < Date.UTC(1980, 0, 1) ||
+    t >= Date.UTC(2100, 0, 1)
+  ) {
+    throw new OoxmlError(
+      "E_ZIP_FORMAT",
+      `mtime out of range 1980-2099 for ${what}`,
+    );
+  }
+}
+
+function assertBytes(data: Uint8Array, name: string): Uint8Array {
+  if (!(data instanceof Uint8Array)) {
+    throw new OoxmlError("E_ZIP_FORMAT", `bad data type for entry ${name}`);
+  }
+  return data.slice();
+}
+
 // Byte-wise UTF-8 key: encoded once per name, compared by bytes —
 // deterministic on every platform (not locale, not UTF-16 code units).
 interface SortKey {
@@ -77,6 +104,7 @@ export class ZipWriter {
   private readonly defaultMtime: Date;
 
   constructor(defaultMtime: Date = PINNED_MTIME) {
+    assertMtime(defaultMtime, "default");
     // Copy: a caller-mutated Date must never shift later builds.
     this.defaultMtime = new Date(defaultMtime.getTime());
   }
@@ -92,7 +120,8 @@ export class ZipWriter {
     }
     const level = opts.level ?? DEFAULT_LEVEL;
     assertLevel(level);
-    const bytes = typeof data === "string" ? strToU8(data) : data.slice();
+    if (opts.mtime !== undefined) assertMtime(opts.mtime, `entry ${name}`);
+    const bytes = typeof data === "string" ? strToU8(data) : assertBytes(data, name);
     this.known.add(folded);
     this.files.set(name, {
       data: bytes,
@@ -105,6 +134,10 @@ export class ZipWriter {
   }
 
   build(): Uint8Array {
+    // A 22-byte EOCD-only zip is valid ZIP but never valid OPC.
+    if (this.files.size === 0) {
+      throw new OoxmlError("E_ZIP_FORMAT", "empty package refused");
+    }
     const keys: SortKey[] = [...this.files.keys()].map((name) => ({
       name,
       raw: strToU8(name),
@@ -118,14 +151,26 @@ export class ZipWriter {
       [];
     for (const { name } of keys) {
       const f = this.files.get(name);
-      if (f === undefined) continue;
+      if (f === undefined) {
+        // Unreachable without concurrent mutation; dropping an entry
+        // silently would violate fail-closed, so throw instead.
+        throw new OoxmlError("E_ZIP_FORMAT", "internal entry invariant");
+      }
       tuples.push([name, [f.data, { level: f.level, mtime: f.mtime }]]);
     }
     const zippable: Record<
       string,
       [Uint8Array, { level: ZipLevel; mtime: Date }]
     > = Object.fromEntries(tuples);
-    return forceUtf8Flag(zipSync(zippable));
+    try {
+      return forceUtf8Flag(zipSync(zippable));
+    } catch (e) {
+      if (e instanceof OoxmlError) throw e;
+      throw new OoxmlError(
+        "E_ZIP_FORMAT",
+        `pack failed: ${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
   }
 }
 

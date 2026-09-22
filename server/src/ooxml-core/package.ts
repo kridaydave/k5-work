@@ -6,7 +6,7 @@
 // content types — so illegal-OPC bytes are never packed.
 
 import { OoxmlPackageSpecSchema } from "@k5-work/shared";
-import type { OoxmlPackageSpec } from "@k5-work/shared";
+import type { OoxmlPackageSpec, OoxmlRel } from "@k5-work/shared";
 import { ContentTypes } from "./content-types.js";
 import { OoxmlError } from "./errors.js";
 import { toZipPath } from "./paths.js";
@@ -55,10 +55,7 @@ function assertNoProtoKeys(input: unknown): void {
   if (typeof rels !== "object" || rels === null) return;
   for (const key of Object.keys(rels)) {
     if (key.toLowerCase() === "__proto__") {
-      throw new OoxmlError(
-        "E_REL_BAD_TARGET",
-        "reserved rel source: __proto__",
-      );
+      throw new OoxmlError("E_ZIP_PATH", "reserved rel source: __proto__");
     }
   }
 }
@@ -88,7 +85,7 @@ export class PackageBuilder {
 
     const packageScope = new RelScope(PACKAGE_RELS_PATH);
     for (const r of this.spec.packageRels) {
-      this.assertTargetLive(parts, resolvePackageRelTarget(r.target), r.target);
+      this.assertTargetLive(parts, resolvePackageRelTarget(r.target), r);
       packageScope.add(r.type, r.target, r.mode);
     }
 
@@ -98,11 +95,7 @@ export class PackageBuilder {
       const scope =
         partScopes.get(canonical) ?? new RelScope(relsPathForPart(canonical));
       for (const r of rels) {
-        this.assertTargetLive(
-          parts,
-          resolveRelTarget(canonical, r.target),
-          r.target,
-        );
+        this.assertTargetLive(parts, resolveRelTarget(canonical, r.target), r);
         scope.add(r.type, r.target, r.mode);
       }
       partScopes.set(canonical, scope);
@@ -172,17 +165,25 @@ export class PackageBuilder {
   }
 
   // Internal targets must name a part in this package (orphaned r:id is
-  // the classic repair-dialog bug); external IRIs point outside by design.
+  // the classic repair-dialog bug). External rels never name package
+  // parts — relative or absolute alike — and internal mode pointing at an
+  // absolute IRI is malformed (not dangling).
   private assertTargetLive(
     parts: Map<string, CanonicalPart>,
     resolved: string,
-    original: string,
+    rel: OoxmlRel,
   ): void {
-    if (isExternalTarget(original)) return;
+    if (rel.mode === "external") return;
+    if (isExternalTarget(rel.target)) {
+      throw new OoxmlError(
+        "E_REL_BAD_TARGET",
+        `internal rel points outside the package: ${rel.target}`,
+      );
+    }
     if (!parts.has(resolved.toLowerCase())) {
       throw new OoxmlError(
         "E_REL_DANGLING_REF",
-        `rel target not in package: ${original}`,
+        `rel target not in package: ${rel.target}`,
       );
     }
   }
