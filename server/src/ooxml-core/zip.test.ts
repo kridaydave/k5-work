@@ -189,3 +189,7 @@ describe("ooxml-core zip writer (D-3)", () => {
     raw[0] = 1;
     assert.equal(unzipSync(w.build())["r.bin"][0], 9);
   });
+
+  it("pins the DOS-epoch mtime by default", () => {
+    assert.equal(PINNED_MTIME.getTime(), Date.UTC(1980, 0, 1));
+  });
