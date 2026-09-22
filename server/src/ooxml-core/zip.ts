@@ -15,3 +15,20 @@
 import { strToU8, zipSync } from "fflate";
 import { OoxmlError } from "./errors.js";
 import { toZipPath } from "./paths.js";
+
+// DOS time starts 1980-01-01; pin exactly there (UTC) so builds never
+// embed the wall clock. Callers may pass an explicit mtime per entry,
+// but the default keeps fixtures byte-identical across runs. Shared and
+// mutable by nature (Date) — ZipWriter copies it on entry, so mutating
+// this object (or any caller-supplied mtime) after the fact cannot shift
+// bytes of writers already constructed. Treat as read-only.
+export const PINNED_MTIME = new Date(Date.UTC(1980, 0, 1, 0, 0, 0));
+export const DEFAULT_LEVEL = 6;
+
+const LOCAL_SIG = 0x04034b50;
+const CENTRAL_SIG = 0x02014b50;
+const EOCD_SIG = 0x06054b50;
+const ZIP64_EOCD_SIG = 0x06064b50;
+const ZIP64_LOCATOR_SIG = 0x07064b50;
+const UTF8_FLAG = 0x0800;
+const DATA_DESCRIPTOR_FLAG = 0x0008;
