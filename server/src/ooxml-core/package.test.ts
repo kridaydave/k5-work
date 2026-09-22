@@ -66,3 +66,41 @@ describe("ooxml-core package builder (D-3)", () => {
     );
   });
 
+  it("allocates rIds per scope and keeps authored relative targets", () => {
+    const bytes = PackageBuilder.parse({
+      parts: [
+        { name: "word/document.xml", contentType: DOC_MAIN, xml: DOC_XML },
+        { name: "word/styles.xml", contentType: STYLES, xml: DOC_XML },
+      ],
+      packageRels: [
+        { type: OFFICE_DOC, target: "word/document.xml", mode: "internal" },
+      ],
+      partRels: {
+        "word/document.xml": [
+          { type: STYLES_REL, target: "styles.xml", mode: "internal" },
+          {
+            type: HYPERLINK,
+            target: "https://example.com/x",
+            mode: "external",
+          },
+        ],
+      },
+    }).build();
+
+    assert.deepEqual(entryNames(bytes), [
+      "[Content_Types].xml",
+      "_rels/.rels",
+      "word/_rels/document.xml.rels",
+      "word/document.xml",
+      "word/styles.xml",
+    ]);
+    const back = unzipSync(bytes);
+    const partRels = strFromU8(back["word/_rels/document.xml.rels"]);
+    assert.ok(partRels.includes('Id="rId1"'));
+    assert.ok(partRels.includes('Id="rId2"'));
+    assert.ok(partRels.includes('Target="styles.xml"'));
+    assert.ok(partRels.includes('TargetMode="External"'));
+    // Package scope restarts at rId1: per-scope, never global.
+    assert.ok(strFromU8(back["_rels/.rels"]).includes('Id="rId1"'));
+  });
+
