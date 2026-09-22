@@ -68,3 +68,38 @@ function byteCompare(a: Uint8Array, b: Uint8Array): number {
   }
   return a.length - b.length;
 }
+
+export class ZipWriter {
+  private readonly files = new Map<string, StoredFile>();
+  // Lowercased names guard the OPC case-insensitive equivalence rule:
+  // "a.xml" + "A.XML" would be one part to a reader, so refuse it here.
+  private readonly known = new Set<string>();
+  private readonly defaultMtime: Date;
+
+  constructor(defaultMtime: Date = PINNED_MTIME) {
+    // Copy: a caller-mutated Date must never shift later builds.
+    this.defaultMtime = new Date(defaultMtime.getTime());
+  }
+
+  add(path: string, data: Uint8Array | string, opts: ZipAddOptions = {}): void {
+    const name = toZipPath(path);
+    if (name.endsWith("/")) {
+      throw new OoxmlError("E_ZIP_PATH", `directory entries refused: ${path}`);
+    }
+    const folded = name.toLowerCase();
+    if (this.known.has(folded)) {
+      throw new OoxmlError("E_PACKAGE_DUP_PART", `duplicate entry: ${name}`);
+    }
+    const level = opts.level ?? DEFAULT_LEVEL;
+    assertLevel(level);
+    const bytes = typeof data === "string" ? strToU8(data) : data.slice();
+    this.known.add(folded);
+    this.files.set(name, {
+      data: bytes,
+      level,
+      mtime:
+        opts.mtime === undefined
+          ? this.defaultMtime
+          : new Date(opts.mtime.getTime()),
+    });
+  }
