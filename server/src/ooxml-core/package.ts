@@ -107,3 +107,35 @@ export class PackageBuilder {
       }
       partScopes.set(canonical, scope);
     }
+
+    // Engine-owned paths collide with caller parts: refuse, never merge.
+    const reserved = new Set<string>([
+      CONTENT_TYPES_PATH.toLowerCase(),
+      PACKAGE_RELS_PATH.toLowerCase(),
+    ]);
+    for (const scope of partScopes.values()) {
+      reserved.add(scope.relsPath.toLowerCase());
+    }
+    for (const p of parts.values()) {
+      if (reserved.has(p.name.toLowerCase())) {
+        throw new OoxmlError(
+          "E_PACKAGE_DUP_PART",
+          `part collides with an engine path: ${p.name}`,
+        );
+      }
+    }
+    table.assertNoOrphans([...parts.values()].map((p) => p.name));
+
+    const zip = new ZipWriter();
+    zip.add(CONTENT_TYPES_PATH, table.buildXml());
+    zip.add(PACKAGE_RELS_PATH, packageScope.buildXml());
+    // No sort here: ZipWriter.build() sorts by UTF-8 bytes, which already
+    // yields the canonical table → rels → parts order.
+    for (const scope of partScopes.values()) {
+      zip.add(scope.relsPath, scope.buildXml());
+    }
+    for (const p of parts.values()) {
+      zip.add(p.name, p.xml, { level: compressionLevel(p.name) });
+    }
+    return zip.build();
+  }
