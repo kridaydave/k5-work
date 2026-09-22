@@ -10,3 +10,24 @@ interface EntryOpt {
   readonly flag: number;
   readonly method: number;
 }
+
+function localEntries(zip: Uint8Array): Map<string, EntryOpt> {
+  const dv = new DataView(zip.buffer, zip.byteOffset, zip.length);
+  const out = new Map<string, EntryOpt>();
+  let o = 0;
+  for (;;) {
+    const sig = dv.getUint32(o, true);
+    if (sig === 0x06054b50 || sig === 0x02014b50) return out;
+    assert.equal(sig, 0x04034b50, `local sig at ${o}`);
+    const flag = dv.getUint16(o + 6, true);
+    const method = dv.getUint16(o + 8, true);
+    const compSize = dv.getUint32(o + 18, true);
+    const nameLen = dv.getUint16(o + 26, true);
+    const extraLen = dv.getUint16(o + 28, true);
+    const name = Buffer.from(zip.subarray(o + 30, o + 30 + nameLen)).toString(
+      "utf8",
+    );
+    out.set(name, { flag, method });
+    o += 30 + nameLen + extraLen + compSize;
+  }
+}
