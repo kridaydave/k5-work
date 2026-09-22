@@ -200,4 +200,33 @@ describe("ooxml-core rels (D-2)", () => {
     }
   });
 
+  it("resolves package-level targets against the package root", () => {
+    assert.equal(
+      resolvePackageRelTarget("word/document.xml"),
+      "word/document.xml",
+    );
+    assert.equal(
+      resolvePackageRelTarget("/word/document.xml"),
+      "word/document.xml",
+    );
+    assert.equal(
+      resolvePackageRelTarget("word\\media\\img.png"),
+      "word/media/img.png",
+    );
+    assert.equal(
+      resolvePackageRelTarget("xl/worksheets/../sharedStrings.xml"),
+      "xl/sharedStrings.xml",
+    );
+    assert.equal(
+      resolvePackageRelTarget("https://example.com/x"),
+      "https://example.com/x",
+    );
+    for (const bad of ["", "/", "../evil.xml", "a/../../evil.xml"]) {
+      assert.throws(
+        () => resolvePackageRelTarget(bad),
+        (e: unknown) => isCode(e, "E_REL_BAD_TARGET"),
+        JSON.stringify(bad),
+      );
+    }
+  });
 });
