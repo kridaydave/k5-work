@@ -173,3 +173,19 @@ function forceUtf8Flag(zip: Uint8Array): Uint8Array {
     const extraLen = dv.getUint16(o + 28, true);
     o += 30 + nameLen + extraLen + compSize;
   }
+  for (;;) {
+    if (o + 4 > out.length) {
+      throw new OoxmlError("E_ZIP_GPBIT", "truncated central dir");
+    }
+    const sig = dv.getUint32(o, true);
+    if (sig === EOCD_SIG) return out;
+    if (sig !== CENTRAL_SIG) {
+      throw unexpectedSig(sig, "central directory");
+    }
+    dv.setUint16(o + 8, dv.getUint16(o + 8, true) | UTF8_FLAG, true);
+    const nameLen = dv.getUint16(o + 28, true);
+    const extraLen = dv.getUint16(o + 30, true);
+    const commentLen = dv.getUint16(o + 32, true);
+    o += 46 + nameLen + extraLen + commentLen;
+  }
+}
