@@ -128,3 +128,19 @@ export class ZipWriter {
     return forceUtf8Flag(zipSync(zippable));
   }
 }
+
+// ZIP64 markers get their own code; anything else structural (spanning
+// markers, digital-signature headers, …) is E_ZIP_FORMAT — valid ZIP the
+// OPC-only writer refuses, not ZIP64.
+function unexpectedSig(sig: number, where: string): OoxmlError {
+  if (sig === ZIP64_EOCD_SIG || sig === ZIP64_LOCATOR_SIG) {
+    return new OoxmlError(
+      "E_ZIP_ZIP64",
+      `ZIP64 ${where} refused: 0x${sig.toString(16)}`,
+    );
+  }
+  return new OoxmlError(
+    "E_ZIP_FORMAT",
+    `unexpected ZIP signature 0x${sig.toString(16)} in ${where} (refused)`,
+  );
+}
