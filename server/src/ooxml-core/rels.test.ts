@@ -123,7 +123,9 @@ describe("ooxml-core rels (D-2)", () => {
       { rId: "rId1", type: "t", target: "a.xml", mode: "internal" },
       { rId: "RID1", type: "t", target: "b.xml", mode: "internal" },
     ];
-    assert.ok(buildRelsXml(both).includes('Id="RID1"'));
+    const xml = buildRelsXml(both);
+    assert.ok(xml.includes('Id="rId1"'), "lowercase rId present");
+    assert.ok(xml.includes('Id="RID1"'), "uppercase rId distinct");
   });
 
   it("rejects bad part paths and escapes targets in xml", () => {

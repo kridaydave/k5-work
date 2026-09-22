@@ -108,11 +108,12 @@ describe("ooxml-core package builder (D-3)", () => {
     const bytes = PackageBuilder.parse({
       parts: [
         { name: "word/document.xml", contentType: DOC_MAIN, xml: DOC_XML },
-        {
-          name: "word/media/a.png",
-          contentType: "image/png",
-          xml: "<x/>",
-        },
+        { name: "word/media/a.png", contentType: "image/png", xml: "<x/>" },
+        { name: "word/media/b.jpg", contentType: "image/jpeg", xml: "<x/>" },
+        { name: "word/media/c.jpeg", contentType: "image/jpeg", xml: "<x/>" },
+        { name: "word/media/d.PNG", contentType: "image/png", xml: "<x/>" },
+        { name: "word/media/e.Jpeg", contentType: "image/jpeg", xml: "<x/>" },
+        { name: "word/media/f.gif", contentType: "image/gif", xml: "<x/>" },
       ],
       packageRels: [
         { type: OFFICE_DOC, target: "word/document.xml", mode: "internal" },
@@ -131,7 +132,17 @@ describe("ooxml-core package builder (D-3)", () => {
       methods.set(name, dv.getUint16(o + 8, true));
       o += 30 + nameLen + extraLen + dv.getUint32(o + 18, true);
     }
-    assert.equal(methods.get("word/media/a.png"), 0);
+    for (const stored of [
+      "word/media/a.png",
+      "word/media/b.jpg",
+      "word/media/c.jpeg",
+      "word/media/d.PNG",
+      "word/media/e.Jpeg",
+    ]) {
+      assert.equal(methods.get(stored), 0, stored);
+    }
+    // Controls: gif is not on the Store list, xml always deflates.
+    assert.equal(methods.get("word/media/f.gif"), 8);
     assert.equal(methods.get("word/document.xml"), 8);
   });
 
@@ -213,7 +224,7 @@ describe("ooxml-core package builder (D-3)", () => {
         ],
       },
     }).build();
-    assert.ok("word/_rels/document.xml.rels" in unzipSync(bytes));
+    assert.ok(Object.hasOwn(unzipSync(bytes), "word/_rels/document.xml.rels"));
   });
 
   it("fails loudly on contract drift, bad types, and illegal chars", () => {
@@ -259,7 +270,7 @@ describe("ooxml-core package builder (D-3)", () => {
       partRels: {},
     }).build();
     const back = unzipSync(bytes);
-    assert.ok("_rels/.rels" in back);
+    assert.ok(Object.hasOwn(back, "_rels/.rels"));
     const rels = strFromU8(back["_rels/.rels"]);
     assert.ok(rels.includes("<Relationships"));
     assert.ok(!rels.includes("<Relationship "));
@@ -276,6 +287,69 @@ describe("ooxml-core package builder (D-3)", () => {
         }).build(),
       (e: unknown) => e instanceof OoxmlError && e.code === "E_REL_BAD_TARGET",
     );
+    // Mode omitted defaults to internal, so the default path refuses too.
+    assert.throws(
+      () =>
+        PackageBuilder.parse({
+          ...minimalSpec(),
+          partRels: {
+            "word/document.xml": [
+              { type: HYPERLINK, target: "https://example.com/x" },
+            ],
+          },
+        }).build(),
+      (e: unknown) => e instanceof OoxmlError && e.code === "E_REL_BAD_TARGET",
+    );
+  });
+
+  it("allows relative external targets without a package check", () => {
+    const bytes = PackageBuilder.parse({
+      ...minimalSpec(),
+      partRels: {
+        "word/document.xml": [
+          { type: HYPERLINK, target: "other.xml", mode: "external" },
+        ],
+      },
+    }).build();
+    const back = unzipSync(bytes);
+    assert.ok(Object.hasOwn(back, "word/_rels/document.xml.rels"));
+    assert.ok(
+      strFromU8(back["word/_rels/document.xml.rels"]).includes(
+        'Target="other.xml" TargetMode="External"',
+      ),
+    );
+  });
+
+  it("resolves case- and slash-variant rel sources to one scope", () => {
+    const withStyles = {
+      parts: [
+        { name: "word/document.xml", contentType: DOC_MAIN, xml: DOC_XML },
+        { name: "word/styles.xml", contentType: STYLES, xml: DOC_XML },
+      ],
+      packageRels: [
+        { type: OFFICE_DOC, target: "word/document.xml", mode: "internal" },
+      ],
+    };
+    for (const source of [
+      "WORD/document.xml",
+      "word\\document.xml",
+      "/word/document.xml",
+    ]) {
+      const bytes = PackageBuilder.parse({
+        ...withStyles,
+        partRels: {
+          [source]: [{ type: STYLES_REL, target: "styles.xml" }],
+        },
+      }).build();
+      const back = unzipSync(bytes);
+      assert.ok(Object.hasOwn(back, "word/_rels/document.xml.rels"), source);
+      assert.ok(
+        strFromU8(back["word/_rels/document.xml.rels"]).includes(
+          'Target="styles.xml"',
+        ),
+        source,
+      );
+    }
   });
 
   it("refuses __proto__ parts and rel sources instead of corrupting", () => {
@@ -303,7 +377,7 @@ describe("ooxml-core package builder (D-3)", () => {
           ...minimalSpec(),
           partRels: evil,
         }).build(),
-      (e: unknown) => e instanceof OoxmlError && e.code === "E_REL_BAD_TARGET",
+      (e: unknown) => e instanceof OoxmlError && e.code === "E_ZIP_PATH",
     );
   });
 });
