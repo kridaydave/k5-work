@@ -157,3 +157,20 @@ describe("ooxml-core zip writer (D-3)", () => {
       );
     }
   });
+
+  it("refuses duplicate entries case-insensitively and bad levels", () => {
+    const w = new ZipWriter();
+    w.add("word/Doc.xml", "<a/>");
+    assert.throws(
+      () => w.add("WORD/doc.xml", "<b/>"),
+      (e: unknown) =>
+        e instanceof OoxmlError && e.code === "E_PACKAGE_DUP_PART",
+    );
+    for (const level of [-1, 10, 2.5, Number.NaN]) {
+      assert.throws(
+        () => new ZipWriter().add("a.xml", "<x/>", { level }),
+        (e: unknown) => e instanceof OoxmlError && e.code === "E_ZIP_METHOD",
+        `level ${String(level)}`,
+      );
+    }
+  });
