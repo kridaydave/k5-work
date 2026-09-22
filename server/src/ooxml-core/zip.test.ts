@@ -57,3 +57,34 @@ function centralEntries(zip: Uint8Array): Map<string, EntryOpt> {
     o += 46 + nameLen + extraLen + commentLen;
   }
 }
+
+function hasSig(zip: Uint8Array, sig: number): boolean {
+  const dv = new DataView(zip.buffer, zip.byteOffset, zip.length);
+  for (let o = 0; o + 4 <= zip.length; o++) {
+    if (dv.getUint32(o, true) === sig) return true;
+  }
+  return false;
+}
+
+describe("ooxml-core zip writer (D-3)", () => {
+  it("round-trips content and pins a deterministic mtime", () => {
+    const a = new ZipWriter();
+    a.add("b.xml", "<b/>");
+    a.add("[Content_Types].xml", "<t/>");
+    const bytes = a.build();
+    const back = unzipSync(bytes);
+    assert.deepEqual(Object.keys(back).sort(), [
+      "[Content_Types].xml",
+      "b.xml",
+    ]);
+    assert.equal(strFromU8(back["b.xml"]), "<b/>");
+
+    // Insertion order must not leak into the bytes.
+    const b = new ZipWriter();
+    b.add("[Content_Types].xml", "<t/>");
+    b.add("b.xml", "<b/>");
+    assert.deepEqual(Buffer.from(b.build()), Buffer.from(bytes));
+
+    // Wall-clock must not leak either: rebuilding pins PINNED_MTIME.
+    assert.deepEqual(Buffer.from(a.build()), Buffer.from(bytes));
+  });
