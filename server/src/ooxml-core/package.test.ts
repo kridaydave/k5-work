@@ -278,3 +278,32 @@ describe("ooxml-core package builder (D-3)", () => {
     );
   });
 
+  it("refuses __proto__ parts and rel sources instead of corrupting", () => {
+    assert.throws(
+      () =>
+        PackageBuilder.parse({
+          parts: [
+            { name: "word/document.xml", contentType: DOC_MAIN, xml: DOC_XML },
+            { name: "__proto__", contentType: DOC_MAIN, xml: DOC_XML },
+          ],
+          packageRels: [],
+          partRels: {},
+        }).build(),
+      (e: unknown) => e instanceof OoxmlError && e.code === "E_ZIP_PATH",
+    );
+    // JSON round-trip keeps the key; Zod records would drop it silently,
+    // so parse() pre-scans and refuses loudly.
+    const evil = JSON.parse(
+      '{"word/document.xml":[{"type":"t","target":"word/document.xml","mode":"internal"}],"__proto__":[{"type":"t","target":"word/document.xml","mode":"internal"}]}',
+    );
+    assert.ok(Object.keys(evil).includes("__proto__"));
+    assert.throws(
+      () =>
+        PackageBuilder.parse({
+          ...minimalSpec(),
+          partRels: evil,
+        }).build(),
+      (e: unknown) => e instanceof OoxmlError && e.code === "E_REL_BAD_TARGET",
+    );
+  });
+});
