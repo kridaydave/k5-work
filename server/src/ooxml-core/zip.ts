@@ -32,3 +32,24 @@ const ZIP64_EOCD_SIG = 0x06064b50;
 const ZIP64_LOCATOR_SIG = 0x07064b50;
 const UTF8_FLAG = 0x0800;
 const DATA_DESCRIPTOR_FLAG = 0x0008;
+
+export interface ZipAddOptions {
+  // 0 = Store, 1-9 = Deflate. Anything else is refused (E_ZIP_METHOD):
+  // OPC allows no other method.
+  readonly level?: number;
+  readonly mtime?: Date;
+}
+
+interface StoredFile {
+  readonly data: Uint8Array;
+  readonly level: ZipLevel;
+  readonly mtime: Date;
+}
+
+type ZipLevel = 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9;
+
+function assertLevel(level: number): asserts level is ZipLevel {
+  if (!Number.isInteger(level) || level < 0 || level > 9) {
+    throw new OoxmlError("E_ZIP_METHOD", `bad compression level: ${level}`);
+  }
+}
