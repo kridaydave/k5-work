@@ -193,3 +193,13 @@ describe("ooxml-core zip writer (D-3)", () => {
   it("pins the DOS-epoch mtime by default", () => {
     assert.equal(PINNED_MTIME.getTime(), Date.UTC(1980, 0, 1));
   });
+
+  it("refuses __proto__ names instead of corrupting the map", () => {
+    for (const bad of ["__proto__", "__PROTO__", "a/__proto__"]) {
+      assert.throws(
+        () => new ZipWriter().add(bad, "<x/>"),
+        (e: unknown) => e instanceof OoxmlError && e.code === "E_ZIP_PATH",
+        bad,
+      );
+    }
+  });
