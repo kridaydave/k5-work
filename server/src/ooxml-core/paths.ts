@@ -14,6 +14,13 @@ function checkSegments(segs: string[], original: string): void {
     if (seg === "..") {
       throw new OoxmlError("E_ZIP_PATH", `.. in path ${original}`);
     }
+    // "__proto__" is a legal OPC segment but a prototype-pollution vector
+    // in plain-object ZIP maps (fflate input, Zod records, unzip output):
+    // refuse it here so every consumer (zip, content-types, rels) inherits
+    // the guard. "constructor"/"prototype" shadow safely and stay allowed.
+    if (seg.toLowerCase() === "__proto__") {
+      throw new OoxmlError("E_ZIP_PATH", `reserved segment in path ${original}`);
+    }
     if (/^[A-Za-z]:$/.test(seg) || seg.includes(":")) {
       throw new OoxmlError("E_ZIP_PATH", `drive/colon in path ${original}`);
     }
