@@ -216,3 +216,39 @@ describe("ooxml-core package builder (D-3)", () => {
     assert.ok("word/_rels/document.xml.rels" in unzipSync(bytes));
   });
 
+  it("fails loudly on contract drift, bad types, and illegal chars", () => {
+    assert.throws(() => PackageBuilder.parse({ parts: [] }), Error);
+    assert.throws(
+      () => PackageBuilder.parse({ parts: [], extra: 1 }),
+      Error,
+    );
+    assert.throws(
+      () =>
+        PackageBuilder.parse({
+          parts: [
+            { name: "word/document.xml", contentType: "not a type", xml: DOC_XML },
+          ],
+          packageRels: [],
+          partRels: {},
+        }).build(),
+      (e: unknown) =>
+        e instanceof OoxmlError && e.code === "E_CONTENTTYPE_BAD_TYPE",
+    );
+    assert.throws(
+      () =>
+        PackageBuilder.parse({
+          parts: [
+            {
+              name: "word/document.xml",
+              contentType: DOC_MAIN,
+              xml: "bad\u0000 char",
+            },
+          ],
+          packageRels: [],
+          partRels: {},
+        }).build(),
+      (e: unknown) =>
+        e instanceof OoxmlError && e.code === "E_XML_ILLEGAL_CHAR",
+    );
+  });
+
