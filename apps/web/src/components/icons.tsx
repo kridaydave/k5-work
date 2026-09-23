@@ -145,6 +145,24 @@ export function CheckIcon(props: IconProps) {
   );
 }
 
+export function ShieldCheckIcon(props: IconProps) {
+  return (
+    <Base {...props}>
+      <path d="M12 3.5 19 6v5.2c0 4.3-2.5 7.7-7 9.3-4.5-1.6-7-5-7-9.3V6l7-2.5Z" />
+      <path d="m8.7 12 2.1 2.1 4.5-4.5" />
+    </Base>
+  );
+}
+
+export function CopyIcon(props: IconProps) {
+  return (
+    <Base {...props}>
+      <rect width="13" height="13" x="9" y="9" rx="2" />
+      <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+    </Base>
+  );
+}
+
 export function ClockIcon(props: IconProps) {
   return (
     <Base {...props}>
