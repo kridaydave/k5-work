@@ -8,6 +8,8 @@ import {
   OoxmlPackageSpecSchema,
   OoxmlPartSchema,
   PermissionSchema,
+  ProjectDiscoveryResponseSchema,
+  ProjectSchema,
   PromptSchema,
   SessionSchema,
   ToolCallSchema,
@@ -171,5 +173,39 @@ describe("shared wire contracts", () => {
         partRels: { a: [{ type: "t", target: "x" }] },
       }),
     );
+  });
+
+  it("project schema validates valid project and rejects invalid", () => {
+    const project = ProjectSchema.parse({
+      id: "p-1",
+      name: "k5-work",
+      path: "/workspace/k5-work",
+      meta: "~/code/k5-work · branch main",
+      branch: "main",
+      lastOpened: 123456789,
+    });
+    assert.equal(project.id, "p-1");
+    assert.equal(project.name, "k5-work");
+    assert.equal(project.branch, "main");
+
+    // Missing id or name or path fails
+    assert.throws(() => ProjectSchema.parse({ id: "", name: "k5", path: "/a" }));
+    assert.throws(() => ProjectSchema.parse({ id: "p-1", name: "", path: "/a" }));
+    assert.throws(() => ProjectSchema.parse({ id: "p-1", name: "k5", path: "" }));
+  });
+
+  it("project discovery response schema validates project list", () => {
+    const res = ProjectDiscoveryResponseSchema.parse({
+      projects: [
+        {
+          id: "p-1",
+          name: "k5-work",
+          path: "/workspace/k5-work",
+        },
+      ],
+      currentProjectPath: "/workspace/k5-work",
+    });
+    assert.equal(res.projects.length, 1);
+    assert.equal(res.projects[0].name, "k5-work");
   });
 });

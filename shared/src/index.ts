@@ -128,3 +128,24 @@ export const OoxmlPackageSpecSchema = z
   })
   .strict();
 export type OoxmlPackageSpec = z.infer<typeof OoxmlPackageSpecSchema>;
+
+// --- Project Discovery & Local Folder Management ---
+export const ProjectSchema = z
+  .object({
+    id: z.string().min(1),
+    name: z.string().min(1),
+    path: z.string().min(1),
+    meta: z.string().optional(),
+    branch: z.string().optional(),
+    lastOpened: z.number().int().optional(),
+  })
+  .strict();
+export type Project = z.infer<typeof ProjectSchema>;
+
+export const ProjectDiscoveryResponseSchema = z
+  .object({
+    projects: z.array(ProjectSchema),
+    currentProjectPath: z.string().optional(),
+  })
+  .strict();
+export type ProjectDiscoveryResponse = z.infer<typeof ProjectDiscoveryResponseSchema>;
