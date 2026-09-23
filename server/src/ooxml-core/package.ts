@@ -18,10 +18,15 @@ import {
   resolvePackageRelTarget,
   resolveRelTarget,
 } from "./rels.js";
+import { assertValid, validateSpec, validateZipBytes } from "./validate.js";
 import { assertLegalXmlChars } from "./xml.js";
 import { ZipWriter } from "./zip.js";
 
 export const CONTENT_TYPES_PATH = "[Content_Types].xml";
+
+function asciiLower(value: string): string {
+  return value.replace(/[A-Z]/g, (char) => char.toLowerCase());
+}
 
 const RELS_CONTENT_TYPE =
   "application/vnd.openxmlformats-package.relationships+xml";
@@ -35,7 +40,7 @@ const STORED_EXTENSIONS = new Set(["png", "jpg", "jpeg"]);
 function compressionLevel(partName: string): 0 | 6 {
   const seg = partName.slice(partName.lastIndexOf("/") + 1);
   const dot = seg.lastIndexOf(".");
-  const ext = dot < 0 ? "" : seg.slice(dot + 1).toLowerCase();
+  const ext = dot < 0 ? "" : asciiLower(seg.slice(dot + 1));
   return STORED_EXTENSIONS.has(ext) ? 0 : 6;
 }
 
@@ -54,7 +59,7 @@ function assertNoProtoKeys(input: unknown): void {
   const rels = (input as { partRels?: unknown }).partRels;
   if (typeof rels !== "object" || rels === null) return;
   for (const key of Object.keys(rels)) {
-    if (key.toLowerCase() === "__proto__") {
+    if (asciiLower(key) === "__proto__") {
       throw new OoxmlError("E_ZIP_PATH", "reserved rel source: __proto__");
     }
   }
@@ -77,6 +82,7 @@ export class PackageBuilder {
   // Runs every write-time gate, then packs. Deterministic: same spec in,
   // same bytes out (sorted entries, pinned mtime, fixed levels).
   build(): Uint8Array {
+    assertValid(validateSpec(this.spec));
     const parts = this.canonicalParts();
     const table = new ContentTypes();
     table.addDefault("rels", RELS_CONTENT_TYPE);
@@ -103,14 +109,14 @@ export class PackageBuilder {
 
     // Engine-owned paths collide with caller parts: refuse, never merge.
     const reserved = new Set<string>([
-      CONTENT_TYPES_PATH.toLowerCase(),
-      PACKAGE_RELS_PATH.toLowerCase(),
+      asciiLower(CONTENT_TYPES_PATH),
+      asciiLower(PACKAGE_RELS_PATH),
     ]);
     for (const scope of partScopes.values()) {
-      reserved.add(scope.relsPath.toLowerCase());
+      reserved.add(asciiLower(scope.relsPath));
     }
     for (const p of parts.values()) {
-      if (reserved.has(p.name.toLowerCase())) {
+      if (reserved.has(asciiLower(p.name))) {
         throw new OoxmlError(
           "E_PACKAGE_DUP_PART",
           `part collides with an engine path: ${p.name}`,
@@ -130,7 +136,9 @@ export class PackageBuilder {
     for (const p of parts.values()) {
       zip.add(p.name, p.xml, { level: compressionLevel(p.name) });
     }
-    return zip.build();
+    const bytes = zip.build();
+    assertValid(validateZipBytes(bytes));
+    return bytes;
   }
 
   // Canonical ZIP names keyed case-insensitively (OPC equivalence):
@@ -139,7 +147,7 @@ export class PackageBuilder {
     const parts = new Map<string, CanonicalPart>();
     for (const raw of this.spec.parts) {
       const name = toZipPath(raw.name);
-      const folded = name.toLowerCase();
+      const folded = asciiLower(name);
       if (parts.has(folded)) {
         throw new OoxmlError("E_PACKAGE_DUP_PART", `duplicate part: ${name}`);
       }
@@ -154,7 +162,7 @@ export class PackageBuilder {
     source: string,
   ): string {
     const name = toZipPath(source);
-    const hit = parts.get(name.toLowerCase());
+    const hit = parts.get(asciiLower(name));
     if (hit === undefined) {
       throw new OoxmlError(
         "E_REL_BAD_TARGET",
@@ -180,7 +188,7 @@ export class PackageBuilder {
         `internal rel points outside the package: ${rel.target}`,
       );
     }
-    if (!parts.has(resolved.toLowerCase())) {
+    if (!parts.has(asciiLower(resolved))) {
       throw new OoxmlError(
         "E_REL_DANGLING_REF",
         `rel target not in package: ${rel.target}`,

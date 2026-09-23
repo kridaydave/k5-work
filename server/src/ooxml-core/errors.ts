@@ -18,8 +18,10 @@ export type OoxmlErrorCode =
   | "E_ZIP_FORMAT"
   | "E_ZIP_CRC"
   | "E_ZIP_PATH"
+  | "E_XML_MALFORMED"
   | "E_PACKAGE_MISSING_PART"
-  | "E_PACKAGE_DUP_PART";
+  | "E_PACKAGE_DUP_PART"
+  | "E_PACKAGE_ORDER";
 
 export class OoxmlError extends Error {
   readonly code: OoxmlErrorCode;

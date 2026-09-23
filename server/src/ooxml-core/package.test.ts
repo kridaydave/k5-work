@@ -14,9 +14,10 @@ const STYLES_REL =
   "http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles";
 const HYPERLINK =
   "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink";
+const W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
 
 const DOC_XML =
-  `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<w:document/>`;
+  `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<w:document xmlns:w="${W_NS}"/>`;
 
 function minimalSpec() {
   return {
