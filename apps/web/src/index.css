@@ -15,10 +15,10 @@
   --color-ember-400: #f5885a;
   --color-ember-500: #dd5c3a;
 
-  --animate-fade-up: fade-up 0.95s cubic-bezier(0.16, 0.84, 0.28, 1) both;
-  --animate-fade-in: fade-in 1.4s ease both;
-  --animate-menu-in: menu-in 0.16s cubic-bezier(0.2, 0.9, 0.3, 1) both;
-  --animate-toast-in: toast-in 0.4s cubic-bezier(0.2, 0.9, 0.3, 1) both;
+  --animate-fade-up: fade-up 0.65s cubic-bezier(0.4, 0, 0.2, 1) both;
+  --animate-fade-in: fade-in 0.5s cubic-bezier(0.4, 0, 0.2, 1) both;
+  --animate-menu-in: menu-in 0.24s cubic-bezier(0.4, 0, 0.2, 1) both;
+  --animate-toast-in: toast-in 0.35s cubic-bezier(0.4, 0, 0.2, 1) both;
   --animate-bloom: bloom 22s ease-in-out infinite;
   --animate-caret: caret 1.15s steps(1, end) infinite;
 }
@@ -26,7 +26,7 @@
 @keyframes fade-up {
   from {
     opacity: 0;
-    transform: translate3d(0, 18px, 0);
+    transform: translate3d(0, 14px, 0);
   }
   to {
     opacity: 1;
@@ -57,7 +57,7 @@
 @keyframes toast-in {
   from {
     opacity: 0;
-    transform: translateY(14px) scale(0.96);
+    transform: translateY(10px) scale(0.98);
   }
   to {
     opacity: 1;
@@ -97,9 +97,7 @@
 
   html {
     -webkit-text-size-adjust: 100%;
-    /* Scale the whole UI down a touch: Tailwind's rem-based spacing
-       follows this, so layout reads a bit more zoomed out. */
-    font-size: 87.5%;
+    font-size: 100%;
   }
 
   body {
@@ -134,6 +132,12 @@
       0 12px 34px -10px rgba(0, 0, 0, 0.75),
       inset 0 1px 0 rgba(255, 255, 255, 0.05);
   }
+
+  .glass-chrome:hover {
+    border-color: rgba(255, 255, 255, 0.18);
+    background: linear-gradient(180deg, rgba(62, 60, 60, 0.92) 0%, rgba(32, 31, 31, 0.94) 100%);
+  }
+
 
   /* ── Composer surface ─────────────────────────────────────────────── */
   .glass-card {
@@ -174,10 +178,10 @@
   /* ── Scroll reveal ────────────────────────────────────────────────── */
   .reveal {
     opacity: 0;
-    transform: translate3d(0, 16px, 0);
+    transform: translate3d(0, 12px, 0);
     transition:
-      opacity 0.85s cubic-bezier(0.16, 0.84, 0.28, 1),
-      transform 0.85s cubic-bezier(0.16, 0.84, 0.28, 1);
+      opacity 0.6s cubic-bezier(0.4, 0, 0.2, 1),
+      transform 0.6s cubic-bezier(0.4, 0, 0.2, 1);
     will-change: opacity, transform;
   }
 

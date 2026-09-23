@@ -34,12 +34,12 @@ export function Wallpaper({ active = false }: { active?: boolean }) {
 
   return (
     <div className="pointer-events-none absolute inset-0 -z-10 overflow-hidden bg-ink-950" aria-hidden="true">
-      {/* artwork — faded out toward the bottom-right so only the top-left stays visible */}
+      {/* artwork — anchored in top-left and faded out toward center so text stays clear */}
       <div
         className={[
-          "absolute -inset-[6%] bg-cover transition-[background-position,transform] duration-700 ease-out",
-          "[mask-image:linear-gradient(to_bottom_right,black_25%,transparent_72%)]",
-          active ? "bg-left-top" : "bg-center",
+          "absolute -inset-[6%] bg-cover bg-left-top transition-[background-position,transform] duration-700 [transition-timing-function:cubic-bezier(0.4,0,0.2,1)]",
+          "[mask-image:radial-gradient(ellipse_75%_65%_at_0%_0%,black_20%,transparent_68%)]",
+          active ? "opacity-75" : "opacity-90",
         ].join(" ")}
         style={{
           backgroundImage: `url(${wallpaper})`,
@@ -47,11 +47,11 @@ export function Wallpaper({ active = false }: { active?: boolean }) {
         }}
       />
 
-      {/* warm bloom that slowly breathes */}
-      <div className="animate-bloom absolute -inset-[10%] bg-[radial-gradient(60%_45%_at_42%_46%,rgba(255,138,74,0.30),rgba(221,92,58,0.10)_45%,transparent_72%)]" />
+      {/* warm bloom that slowly breathes in the top-left */}
+      <div className="animate-bloom absolute -inset-[10%] bg-[radial-gradient(55%_45%_at_16%_16%,rgba(255,138,74,0.22),rgba(221,92,58,0.08)_45%,transparent_70%)]" />
 
       {/* readability scrims */}
-      <div className="absolute inset-0 bg-[linear-gradient(to_bottom,rgba(5,8,14,0.62)_0%,rgba(6,9,15,0.24)_16%,rgba(7,10,15,0.05)_30%,rgba(8,11,15,0.42)_46%,rgba(8,10,14,0.86)_62%,#080a0e_78%)]" />
+      <div className="absolute inset-0 bg-[linear-gradient(to_bottom,rgba(5,8,14,0.55)_0%,rgba(6,9,15,0.22)_18%,rgba(7,10,15,0.32)_38%,rgba(8,10,14,0.86)_65%,#080a0e_80%)]" />
       <div className="absolute inset-0 bg-[radial-gradient(120%_90%_at_50%_18%,transparent_38%,rgba(4,6,10,0.55)_100%)]" />
 
       {/* texture */}
