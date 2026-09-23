@@ -13,8 +13,12 @@ import { doc, el } from "./xml.js";
 export const CT_NS =
   "http://schemas.openxmlformats.org/package/2006/content-types";
 
+function asciiLower(value: string): string {
+  return value.replace(/[A-Z]/g, (char) => char.toLowerCase());
+}
+
 function normExt(extension: string): string {
-  const ext = extension.trim().toLowerCase();
+  const ext = asciiLower(extension.trim());
   return ext.startsWith(".") ? ext.slice(1) : ext;
 }
 
@@ -78,9 +82,9 @@ export class ContentTypes {
   addOverride(partName: string, contentType: string): void {
     const name = toPartName(partName);
     assertContentType(contentType, `part ${name}`);
-    const prev = this.overrides.get(name.toLowerCase());
+    const prev = this.overrides.get(asciiLower(name));
     if (prev === undefined) {
-      this.overrides.set(name.toLowerCase(), { name, type: contentType });
+      this.overrides.set(asciiLower(name), { name, type: contentType });
       return;
     }
     if (prev.type !== contentType) {
@@ -95,21 +99,21 @@ export class ContentTypes {
   // of the last path segment, else null — never a guess.
   resolve(partName: string): string | null {
     const name = toPartName(partName);
-    const over = this.overrides.get(name.toLowerCase());
+    const over = this.overrides.get(asciiLower(name));
     if (over !== undefined) return over.type;
     const seg = name.slice(name.lastIndexOf("/") + 1);
     const dot = seg.lastIndexOf(".");
     if (dot < 0) return null;
-    return this.defaults.get(seg.slice(dot + 1).toLowerCase()) ?? null;
+    return this.defaults.get(asciiLower(seg.slice(dot + 1))) ?? null;
   }
 
   // Every Override must point at a part actually in the package.
   // A dangling Override alone triggers the PowerPoint repair dialog.
   assertNoOrphans(partNames: Iterable<string>): void {
     const known = new Set<string>();
-    for (const p of partNames) known.add(toPartName(p).toLowerCase());
+    for (const p of partNames) known.add(asciiLower(toPartName(p)));
     for (const { name } of this.overrides.values()) {
-      if (!known.has(name.toLowerCase())) {
+      if (!known.has(asciiLower(name))) {
         throw new OoxmlError(
           "E_CONTENTTYPE_ORPHAN_OVERRIDE",
           `override for missing part ${name}`,

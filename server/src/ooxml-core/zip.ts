@@ -87,6 +87,10 @@ interface SortKey {
   readonly raw: Uint8Array;
 }
 
+function asciiLower(value: string): string {
+  return value.replace(/[A-Z]/g, (char) => char.toLowerCase());
+}
+
 function byteCompare(a: Uint8Array, b: Uint8Array): number {
   const n = Math.min(a.length, b.length);
   for (let i = 0; i < n; i++) {
@@ -113,7 +117,7 @@ export class ZipWriter {
     if (name.endsWith("/")) {
       throw new OoxmlError("E_ZIP_PATH", `directory entries refused: ${path}`);
     }
-    const folded = name.toLowerCase();
+    const folded = asciiLower(name);
     if (this.known.has(folded)) {
       throw new OoxmlError("E_PACKAGE_DUP_PART", `duplicate entry: ${name}`);
     }

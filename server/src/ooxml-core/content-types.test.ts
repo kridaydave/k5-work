@@ -121,6 +121,11 @@ describe("ooxml-core content-types (D-2)", () => {
       { partName: "/word/doc.xml", contentType: DOC_MAIN },
     ]);
     assert.deepEqual(ct.defaultEntries(), []);
+
+    const unicode = new ContentTypes();
+    unicode.addOverride("word/Ä.xml", DOC_MAIN);
+    unicode.addOverride("word/ä.xml", DOC_MAIN);
+    assert.equal(unicode.overrideEntries().length, 2);
   });
 
   it("escapes special chars in the emitted table", () => {

@@ -219,6 +219,16 @@ describe("ooxml-core zip writer (D-3)", () => {
     }
   });
 
+  it("uses ASCII-only case folding for ZIP names", () => {
+    const writer = new ZipWriter();
+    writer.add("word/Ä.xml", "<a/>");
+    writer.add("word/ä.xml", "<b/>");
+    assert.deepEqual(Object.keys(unzipSync(writer.build())).sort(), [
+      "word/Ä.xml",
+      "word/ä.xml",
+    ]);
+  });
+
   it("refuses duplicate entries case-insensitively and bad levels", () => {
     const w = new ZipWriter();
     w.add("word/Doc.xml", "<a/>");
