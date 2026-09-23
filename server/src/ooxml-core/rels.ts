@@ -70,7 +70,7 @@ const DRIVE = /^[A-Za-z]:/;
 export function isExternalTarget(target: string): boolean {
   const t = target.replace(/\\/g, "/");
   if (DRIVE.test(t)) return false;
-  return ABS_IRI.test(t);
+  return t.startsWith("//") || ABS_IRI.test(t);
 }
 
 // Resolve an internal rel target against its source part ("." / ".."

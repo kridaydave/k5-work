@@ -110,6 +110,18 @@ describe("ooxml-core rels (D-2)", () => {
         ]),
       (e: unknown) => isCode(e, "E_REL_BAD_TARGET"),
     );
+    assert.throws(
+      () =>
+        buildRelsXml([
+          {
+            rId: "rId1",
+            type: "t",
+            target: "//example.com/x",
+            mode: "internal",
+          },
+        ]),
+      (e: unknown) => isCode(e, "E_REL_BAD_TARGET"),
+    );
     const scope = new RelScope(PACKAGE_RELS_PATH);
     assert.throws(
       () => scope.add("t", "https://example.com"),
