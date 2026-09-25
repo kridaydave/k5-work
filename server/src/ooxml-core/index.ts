@@ -1,6 +1,13 @@
 // ooxml-core public surface (D-1 through D-4).
 export { OoxmlError } from "./errors.js";
 export type { OoxmlErrorCode } from "./errors.js";
+export {
+  MAX_ZIP_ARCHIVE_BYTES,
+  MAX_ZIP_COMPRESSION_RATIO,
+  MAX_ZIP_ENTRIES,
+  MAX_ZIP_ENTRY_UNCOMPRESSED_BYTES,
+  MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES,
+} from "./limits.js";
 export { XML_DECL, assertLegalXmlChars, doc, el, escAttr, escText } from "./xml.js";
 export type { XmlAttr } from "./xml.js";
 export { ContentTypes, CT_NS } from "./content-types.js";

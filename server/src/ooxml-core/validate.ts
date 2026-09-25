@@ -1,4 +1,4 @@
-import { inflateSync } from "fflate";
+import { Inflate } from "fflate";
 import { SaxesParser } from "saxes";
 import type { SaxesTagNS, XMLDecl } from "saxes";
 import { isNameChar, isNameStartChar } from "xmlchars/xml/1.0/ed5.js";
@@ -14,6 +14,13 @@ import {
   resolveRelTarget,
 } from "./rels.js";
 import { assertLegalXmlChars } from "./xml.js";
+import {
+  MAX_ZIP_ARCHIVE_BYTES,
+  MAX_ZIP_COMPRESSION_RATIO,
+  MAX_ZIP_ENTRIES,
+  MAX_ZIP_ENTRY_UNCOMPRESSED_BYTES,
+  MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES,
+} from "./limits.js";
 
 export type IssueKind = "spec" | "heuristic";
 
@@ -75,6 +82,10 @@ const WORD_NAMESPACES = new Set([
   "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
   "http://purl.oclc.org/ooxml/wordprocessingml/main",
 ]);
+const MAX_XML_DEPTH = 256;
+const MAX_XML_ELEMENTS = 100_000;
+
+class XmlLimitError extends Error {}
 
 class Issues {
   readonly errors: ValidationIssue[] = [];
@@ -171,6 +182,8 @@ function parseXml(
   let root: XmlElement | null = null;
   let firstError: Error | null = null;
   let hasDoctype = false;
+  let elementCount = 0;
+  let limitMessage = "";
 
   parser.on("error", (error) => {
     firstError ??= error;
@@ -179,6 +192,15 @@ function parseXml(
     hasDoctype = true;
   });
   parser.on("opentag", (tag: SaxesTagNS) => {
+    elementCount += 1;
+    if (stack.length >= MAX_XML_DEPTH) {
+      limitMessage = `XML depth exceeds ${MAX_XML_DEPTH}`;
+      throw new XmlLimitError();
+    }
+    if (elementCount > MAX_XML_ELEMENTS) {
+      limitMessage = `XML element count exceeds ${MAX_XML_ELEMENTS}`;
+      throw new XmlLimitError();
+    }
     const element: XmlElement = {
       uri: tag.uri,
       local: tag.local,
@@ -208,6 +230,10 @@ function parseXml(
   try {
     parser.write(text).close();
   } catch (error) {
+    if (error instanceof XmlLimitError) {
+      issues.error("E_XML_LIMIT", limitMessage, path);
+      return null;
+    }
     firstError ??= error instanceof Error ? error : new Error(String(error));
   }
 
@@ -241,8 +267,16 @@ function hasElementChildren(element: XmlElement): boolean {
 }
 
 function walk(element: XmlElement, visit: (element: XmlElement) => void): void {
-  visit(element);
-  for (const child of element.children) walk(child, visit);
+  const pending: XmlElement[] = [element];
+  while (pending.length > 0) {
+    const current = pending.pop();
+    if (current === undefined) continue;
+    visit(current);
+    for (let index = current.children.length - 1; index >= 0; index -= 1) {
+      const child = current.children[index];
+      if (child !== undefined) pending.push(child);
+    }
+  }
 }
 
 function relationshipReferences(root: XmlElement): string[] {
@@ -710,6 +744,10 @@ export function validateSpec(
     issues.error("E_PACKAGE_MISSING_PART", "spec has no parts");
     return issues.result();
   }
+  if (spec.parts.length >= MAX_ZIP_ENTRIES) {
+    issues.error("E_ZIP_LIMIT", `spec part limit is ${MAX_ZIP_ENTRIES - 1}`);
+    return issues.result();
+  }
 
   const files = new Map<string, string>();
   const documents = new Map<string, ParsedXml>();
@@ -754,6 +792,14 @@ export function validateSpec(
         `invalid content type for ${path}: ${part.contentType}`,
         part.name,
       );
+    }
+    if (part.xml.length > MAX_ZIP_ENTRY_UNCOMPRESSED_BYTES) {
+      issues.error(
+        "E_ZIP_LIMIT",
+        `${path}: XML part exceeds ${MAX_ZIP_ENTRY_UNCOMPRESSED_BYTES} characters`,
+        part.name,
+      );
+      continue;
     }
     files.set(key, path);
     const parsed = parseXml(part.xml, part.name, issues);
@@ -897,6 +943,7 @@ interface ZipEntry {
   readonly dataStart: number;
   readonly localOffset: number;
   readonly localEnd: number;
+  readonly externalAttributes: number;
   readonly isDirectory: boolean;
 }
 
@@ -911,6 +958,28 @@ const CRC_TABLE = (() => {
   }
   return table;
 })();
+
+class BoundedInflateError extends Error {}
+
+function inflateBounded(data: Uint8Array, maxBytes: number): Uint8Array {
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  const inflater = new Inflate((chunk) => {
+    if (size + chunk.byteLength > maxBytes) {
+      throw new BoundedInflateError();
+    }
+    size += chunk.byteLength;
+    chunks.push(chunk);
+  });
+  inflater.push(data, true);
+  const output = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    output.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return output;
+}
 
 function crc32(data: Uint8Array): number {
   let value = 0xffffffff;
@@ -931,13 +1000,13 @@ function checkEntryName(name: string, issues: Issues): void {
   if (name.startsWith("/")) reject(`absolute entry name ${name}`);
   if (name.includes("\\")) reject(`backslash in entry name ${name}`);
   if (name !== name.trim()) reject(`surrounding whitespace in entry name ${name}`);
-  const body = name.endsWith("/") ? name.slice(0, -1) : name;
-  if (body.length === 0) reject(`empty entry name ${name}`);
-  for (const segment of body.split("/")) {
-    if (segment === "" || segment === ".") reject(`bad segment in entry name ${name}`);
-    if (segment === "..") reject(`.. in entry name ${name}`);
-    if (segment.includes(":")) reject(`colon in entry name ${name}`);
-    if (asciiLower(segment) === "__proto__") reject(`reserved segment in entry name ${name}`);
+  if (name.endsWith("/")) reject(`directory entries are forbidden: ${name}`);
+  if (name.length === 0) reject(`empty entry name ${name}`);
+  try {
+    const canonical = toZipPath(name);
+    if (canonical !== name) reject(`non-canonical entry name ${name}`);
+  } catch (error) {
+    reject(errorMessage(error));
   }
   for (const char of name) {
     const code = char.codePointAt(0) ?? 0;
@@ -1002,6 +1071,10 @@ function inspectZip(data: Uint8Array, issues: Issues): ZipEntry[] | null {
   const centralDisk = u16(eocd + 6);
   const diskEntries = u16(eocd + 8);
   const entryCount = u16(eocd + 10);
+  if (entryCount > MAX_ZIP_ENTRIES) {
+    issues.error("E_ZIP_LIMIT", `ZIP has ${entryCount} entries; limit is ${MAX_ZIP_ENTRIES}`);
+    return null;
+  }
   const centralSize = u32(eocd + 12);
   const centralOffset = u32(eocd + 16);
   if (disk !== 0 || centralDisk !== 0 || diskEntries !== entryCount) {
@@ -1014,6 +1087,7 @@ function inspectZip(data: Uint8Array, issues: Issues): ZipEntry[] | null {
   }
 
   const entries: ZipEntry[] = [];
+  let totalDeclaredSize = 0;
   let offset = centralOffset;
   for (let index = 0; index < entryCount; index += 1) {
     if (offset + 46 > eocd || u32(offset) !== CENTRAL_SIGNATURE) {
@@ -1029,6 +1103,7 @@ function inspectZip(data: Uint8Array, issues: Issues): ZipEntry[] | null {
     const extraLength = u16(offset + 30);
     const commentLength = u16(offset + 32);
     const diskStart = u16(offset + 34);
+    const externalAttributes = u32(offset + 38);
     const localOffset = u32(offset + 42);
     const recordLength = 46 + nameLength + extraLength + commentLength;
     if (offset + recordLength > eocd) {
@@ -1046,14 +1121,57 @@ function inspectZip(data: Uint8Array, issues: Issues): ZipEntry[] | null {
       continue;
     }
     const isDirectory = name.endsWith("/");
+    if (compressedSize === 0xffffffff || size === 0xffffffff || localOffset === 0xffffffff) {
+      issues.error("E_ZIP_ZIP64", `${name}: ZIP64 fields are not supported`, name);
+      return null;
+    }
+    const unixFileType = (externalAttributes >>> 16) & 0xf000;
+    if (unixFileType === 0xa000 || (externalAttributes & 0x0400) !== 0) {
+      issues.error("E_ZIP_SYMLINK", `${name}: symlink entries are forbidden`, name);
+      return null;
+    }
+    if (
+      unixFileType !== 0 &&
+      unixFileType !== 0x4000 &&
+      unixFileType !== 0x8000
+    ) {
+      issues.error("E_ZIP_FORMAT", `${name}: special filesystem entry is forbidden`, name);
+      return null;
+    }
+    if (size > MAX_ZIP_ENTRY_UNCOMPRESSED_BYTES) {
+      issues.error(
+        "E_ZIP_LIMIT",
+        `${name}: uncompressed size ${size} exceeds ${MAX_ZIP_ENTRY_UNCOMPRESSED_BYTES}`,
+        name,
+      );
+      return null;
+    }
+    totalDeclaredSize += size;
+    if (totalDeclaredSize > MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES) {
+      issues.error(
+        "E_ZIP_LIMIT",
+        `ZIP uncompressed total exceeds ${MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES}`,
+        name,
+      );
+      return null;
+    }
+    if (
+      method === 8 &&
+      size >= 64 * 1024 &&
+      (compressedSize === 0 ||
+        size / compressedSize > MAX_ZIP_COMPRESSION_RATIO)
+    ) {
+      issues.error(
+        "E_ZIP_LIMIT",
+        `${name}: compression ratio exceeds ${MAX_ZIP_COMPRESSION_RATIO}`,
+        name,
+      );
+      return null;
+    }
     let dataStart = 0;
     let localEnd = localOffset;
     if (diskStart !== 0) {
       issues.error("E_ZIP_FORMAT", `${name}: entry starts on another disk`, name);
-    }
-    if (compressedSize === 0xffffffff || size === 0xffffffff || localOffset === 0xffffffff) {
-      issues.error("E_ZIP_ZIP64", `${name}: ZIP64 fields are not supported`, name);
-      return null;
     }
     const extra = data.subarray(
       offset + 46 + nameLength,
@@ -1186,6 +1304,7 @@ function inspectZip(data: Uint8Array, issues: Issues): ZipEntry[] | null {
       dataStart,
       localOffset,
       localEnd,
+      externalAttributes,
       isDirectory,
     });
     offset += recordLength;
@@ -1280,6 +1399,13 @@ export function validateZipBytes(
   options: ZipValidateOptions = {},
 ): ValidationResult {
   const issues = new Issues();
+  if (data.byteLength > MAX_ZIP_ARCHIVE_BYTES) {
+    issues.error(
+      "E_ZIP_LIMIT",
+      `ZIP archive exceeds ${MAX_ZIP_ARCHIVE_BYTES} bytes`,
+    );
+    return issues.result();
+  }
   const entries = inspectZip(data, issues);
   if (entries === null) return issues.result();
 
@@ -1323,6 +1449,7 @@ export function validateZipBytes(
   }
 
   const files = new Map<string, Uint8Array>();
+  let totalBytes = 0;
   for (const entry of entries) {
     if (entry.isDirectory) continue;
     if (
@@ -1332,17 +1459,52 @@ export function validateZipBytes(
     ) {
       continue;
     }
-    const compressed = data.subarray(entry.dataStart, entry.dataStart + entry.compressedSize);
-    let bytes: Uint8Array;
-    try {
-      bytes = entry.method === 8 ? inflateSync(compressed) : compressed;
-    } catch (error) {
+    if (entry.size > MAX_ZIP_ENTRY_UNCOMPRESSED_BYTES) {
       issues.error(
-        "E_ZIP_FORMAT",
-        `${entry.name}: extraction failed: ${errorMessage(error)}`,
+        "E_ZIP_LIMIT",
+        `${entry.name}: uncompressed size exceeds ${MAX_ZIP_ENTRY_UNCOMPRESSED_BYTES}`,
         entry.name,
       );
       continue;
+    }
+    const compressed = data.subarray(entry.dataStart, entry.dataStart + entry.compressedSize);
+    let bytes: Uint8Array;
+    try {
+      bytes = entry.method === 8
+        ? inflateBounded(compressed, MAX_ZIP_ENTRY_UNCOMPRESSED_BYTES)
+        : compressed;
+    } catch (error) {
+      if (error instanceof BoundedInflateError) {
+        issues.error(
+          "E_ZIP_LIMIT",
+          `${entry.name}: uncompressed size exceeds ${MAX_ZIP_ENTRY_UNCOMPRESSED_BYTES}`,
+          entry.name,
+        );
+      } else {
+        issues.error(
+          "E_ZIP_FORMAT",
+          `${entry.name}: extraction failed: ${errorMessage(error)}`,
+          entry.name,
+        );
+      }
+      continue;
+    }
+    if (bytes.byteLength > MAX_ZIP_ENTRY_UNCOMPRESSED_BYTES) {
+      issues.error(
+        "E_ZIP_LIMIT",
+        `${entry.name}: uncompressed size exceeds ${MAX_ZIP_ENTRY_UNCOMPRESSED_BYTES}`,
+        entry.name,
+      );
+      continue;
+    }
+    totalBytes += bytes.byteLength;
+    if (totalBytes > MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES) {
+      issues.error(
+        "E_ZIP_LIMIT",
+        `ZIP uncompressed total exceeds ${MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES}`,
+        entry.name,
+      );
+      return issues.result();
     }
     files.set(entry.name, bytes);
     if (bytes.byteLength !== entry.size) {

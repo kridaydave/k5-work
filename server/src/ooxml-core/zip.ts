@@ -14,6 +14,11 @@
 
 import { strToU8, zipSync } from "fflate";
 import { OoxmlError } from "./errors.js";
+import {
+  MAX_ZIP_ENTRIES,
+  MAX_ZIP_ENTRY_UNCOMPRESSED_BYTES,
+  MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES,
+} from "./limits.js";
 import { toZipPath } from "./paths.js";
 
 // Pinned default mtime. fflate encodes LOCAL calendar fields
@@ -105,6 +110,7 @@ export class ZipWriter {
   // "a.xml" + "A.XML" would be one part to a reader, so refuse it here.
   private readonly known = new Set<string>();
   private readonly defaultMtime: Date;
+  private totalBytes = 0;
 
   constructor(defaultMtime: Date = PINNED_MTIME) {
     assertMtime(defaultMtime, "default");
@@ -124,7 +130,38 @@ export class ZipWriter {
     const level = opts.level ?? DEFAULT_LEVEL;
     assertLevel(level);
     if (opts.mtime !== undefined) assertMtime(opts.mtime, `entry ${name}`);
+    if (this.files.size >= MAX_ZIP_ENTRIES) {
+      throw new OoxmlError("E_ZIP_LIMIT", `ZIP entry limit is ${MAX_ZIP_ENTRIES}`);
+    }
+    if (typeof data !== "string" && !(data instanceof Uint8Array)) {
+      throw new OoxmlError("E_ZIP_FORMAT", `bad data type for entry ${name}`);
+    }
+    if (typeof data === "string" && data.length > MAX_ZIP_ENTRY_UNCOMPRESSED_BYTES) {
+      throw new OoxmlError(
+        "E_ZIP_LIMIT",
+        `${name}: uncompressed size exceeds ${MAX_ZIP_ENTRY_UNCOMPRESSED_BYTES}`,
+      );
+    }
+    if (typeof data !== "string" && data.byteLength > MAX_ZIP_ENTRY_UNCOMPRESSED_BYTES) {
+      throw new OoxmlError(
+        "E_ZIP_LIMIT",
+        `${name}: uncompressed size exceeds ${MAX_ZIP_ENTRY_UNCOMPRESSED_BYTES}`,
+      );
+    }
     const bytes = typeof data === "string" ? strToU8(data) : assertBytes(data, name);
+    if (bytes.byteLength > MAX_ZIP_ENTRY_UNCOMPRESSED_BYTES) {
+      throw new OoxmlError(
+        "E_ZIP_LIMIT",
+        `${name}: uncompressed size exceeds ${MAX_ZIP_ENTRY_UNCOMPRESSED_BYTES}`,
+      );
+    }
+    if (this.totalBytes + bytes.byteLength > MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES) {
+      throw new OoxmlError(
+        "E_ZIP_LIMIT",
+        `ZIP uncompressed total exceeds ${MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES}`,
+      );
+    }
+    this.totalBytes += bytes.byteLength;
     this.known.add(folded);
     this.files.set(name, {
       data: bytes,
