@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      LIBREOFFICE_BIN: libreoffice
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install LibreOffice
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libreoffice-writer
+          libreoffice --version
+      - run: npm ci
+      - name: Build
+        run: npm run build
+      - name: Unit and contract tests
+        run: npm test
+      - name: Adversarial security tests
+        run: npm run test:security -w server
+      - name: Office repair gate
+        run: npm run test:office -w server
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Dev command smoke test
+        run: |
+          set -euo pipefail
+          setsid npm run dev > /tmp/k5-work-dev.log 2>&1 &
+          dev_pid=$!
+          cleanup_dev() {
+            kill -- -"$dev_pid" 2>/dev/null || true
+            wait "$dev_pid" 2>/dev/null || true
+          }
+          trap cleanup_dev EXIT
+          curl --fail --silent --show-error --retry 20 --retry-connrefused --retry-delay 1 http://127.0.0.1:8787/health
+          curl --fail --silent --show-error --retry 20 --retry-connrefused --retry-delay 1 http://127.0.0.1:5173/
+          curl --fail --silent --show-error --retry 20 --retry-connrefused --retry-delay 1 http://127.0.0.1:5173/api/projects | python3 -c 'import json,sys; data=json.load(sys.stdin); assert "projects" in data and "currentProjectPath" in data'
+          cleanup_dev
+          trap - EXIT
+      - name: Server health smoke test
+        run: |
+          PORT=8788 HOST=127.0.0.1 node server/dist/index.js > /tmp/k5-work-server.log 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+          health=$(curl --fail --silent --show-error --retry 20 --retry-connrefused --retry-delay 1 http://127.0.0.1:8788/health)
+          test "$health" = '{"status":"ok"}'
+          kill "$server_pid"
+          wait "$server_pid" 2>/dev/null || true
+          trap - EXIT
+      - name: Reject remote bind by default
+        run: |
+          set +e
+          HOST=0.0.0.0 PORT=8789 timeout 5s node server/dist/index.js > /tmp/k5-work-remote-bind.log 2>&1
+          code=$?
+          set -e
+          test "$code" -eq 1
