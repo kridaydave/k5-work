@@ -109,7 +109,10 @@ describe("ooxml-core content-types (D-2)", () => {
     ct.addDefault("gz", "application/gzip");
     assert.equal(ct.resolve("a/tar.gz"), "application/gzip");
     assert.equal(ct.resolve("/a.b/c"), null);
-    assert.equal(ct.resolve("word/foo."), null);
+    assert.throws(
+      () => ct.resolve("word/foo."),
+      (e: unknown) => e instanceof OoxmlError && e.code === "E_ZIP_PATH",
+    );
   });
 
   it("normalizes backslashes and exposes snapshot readers", () => {

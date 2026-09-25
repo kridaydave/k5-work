@@ -44,4 +44,20 @@ describe("ooxml-core paths (review fix)", () => {
     assert.throws(() => toZipPath("word/doc.xml "), isZipPath);
     assert.throws(() => toPartName("  word/doc.xml  "), isZipPath);
   });
+
+  it("rejects bidi, zero-width, and Windows device names", () => {
+    for (const bad of [
+      "word/\u202e-trojan.xml",
+      "word/zero\u200bwidth.xml",
+      "word/CON.xml",
+      "word/NUL",
+      "word/PRN.txt",
+      "word/AUX.xml",
+      "word/COM1",
+      "word/LPT9.log",
+      "word/control\u0000.xml",
+    ]) {
+      assert.throws(() => toZipPath(bad), isZipPath, bad);
+    }
+  });
 });

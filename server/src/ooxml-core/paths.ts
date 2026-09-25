@@ -6,13 +6,36 @@
 
 import { OoxmlError } from "./errors.js";
 
+const WINDOWS_DEVICE_NAME = /^(?:con|prn|aux|nul|conin\$|conout\$|clock\$|com[1-9]|lpt[1-9])$/i;
+const UNSAFE_UNICODE = /[\u200b-\u200f\u202a-\u202e\u2060\u2066-\u2069\ufeff]/u;
+
+function isWindowsDeviceName(segment: string): boolean {
+  const stem = segment.split(".", 1)[0]?.replace(/[ .]+$/g, "") ?? "";
+  return WINDOWS_DEVICE_NAME.test(stem);
+}
+
 function checkSegments(segs: string[], original: string): void {
   for (const seg of segs) {
     if (seg === "" || seg === ".") {
       throw new OoxmlError("E_ZIP_PATH", `bad segment in path ${original}`);
     }
     if (seg === "..") {
-      throw new OoxmlError("E_ZIP_PATH", `.. in path ${original}`);
+      throw new OoxmlError("E_ZIP_PATH", `.. in segment of ${original}`);
+    }
+    if (seg.endsWith(".") || seg.endsWith(" ")) {
+      throw new OoxmlError("E_ZIP_PATH", `trailing dot or space in ${original}`);
+    }
+    for (const char of seg) {
+      const codePoint = char.codePointAt(0) ?? 0;
+      if (codePoint < 0x20 || codePoint === 0x7f) {
+        throw new OoxmlError("E_ZIP_PATH", `control character in ${original}`);
+      }
+    }
+    if (UNSAFE_UNICODE.test(seg)) {
+      throw new OoxmlError("E_ZIP_PATH", `unsafe Unicode in segment of ${original}`);
+    }
+    if (isWindowsDeviceName(seg)) {
+      throw new OoxmlError("E_ZIP_PATH", `reserved device name in ${original}`);
     }
     // "__proto__" is a legal OPC segment but a prototype-pollution vector
     // in plain-object ZIP maps (fflate input, Zod records, unzip output):
