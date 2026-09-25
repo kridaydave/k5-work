@@ -4,9 +4,13 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "predev": "npm --prefix ../shared run build && npm run build",
     "dev": "node --watch dist/index.js",
     "build": "tsc -p tsconfig.json",
-    "test": "node --test dist/service.test.js dist/acp/plug.test.js dist/projects.test.js dist/ooxml-core/xml.test.js dist/ooxml-core/paths.test.js dist/ooxml-core/content-types.test.js dist/ooxml-core/rels.test.js dist/ooxml-core/zip.test.js dist/ooxml-core/package.test.js dist/ooxml-core/validate.test.js"
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "node --test dist/service.test.js dist/acp/plug.test.js dist/projects.test.js dist/project-api.test.js dist/ooxml-core/xml.test.js dist/ooxml-core/paths.test.js dist/ooxml-core/content-types.test.js dist/ooxml-core/rels.test.js dist/ooxml-core/zip.test.js dist/ooxml-core/package.test.js dist/ooxml-core/validate.test.js dist/ooxml-core/security.test.js dist/ooxml-core/docx.test.js",
+    "test:security": "node --test dist/projects.test.js dist/project-api.test.js dist/ooxml-core/security.test.js",
+    "test:office": "node --test dist/ooxml-core/docx.test.js"
   },
   "dependencies": {
     "@k5-work/shared": "0.1.0",

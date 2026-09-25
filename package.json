@@ -5,10 +5,10 @@
   "type": "module",
   "workspaces": ["apps/web", "server", "shared"],
   "scripts": {
-    "dev": "concurrently -n server,web \"npm run dev -w server\" \"npm run dev -w apps/web\"",
+    "dev": "npm run build -w shared && concurrently -n server,web \"npm run dev -w server\" \"npm run dev -w apps/web -- --host 127.0.0.1\"",
     "build": "npm run build -w shared && npm run build -w server && npm run build -w apps/web",
     "test": "npm run test -w shared && npm run test -w server",
-    "typecheck": "tsc --noEmit -p tsconfig.json"
+    "typecheck": "npm run typecheck -w shared && npm run typecheck -w server && npm run typecheck -w apps/web"
   },
   "devDependencies": {
     "concurrently": "^9.1.0",
