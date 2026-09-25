@@ -15,16 +15,17 @@ Thin-slice MVP covering all four pillars:
 cp .env.example .env
 npm install
 npm run dev
-# web: http://localhost:5173  server: http://localhost:8787
+# web: http://localhost:5173
+# server health: http://localhost:8787/health
+# project API is available on both the web dev origin and the server origin
 ```
 
-ACP mode (default `mock` works with no keys):
+The server binds to loopback by default. A non-loopback `HOST` requires
+`ALLOW_REMOTE=true`; do not expose the project API publicly.
 
-```bash
-ACP_COMMAND="opencode acp"  # any ACP server on stdio
-# or OpenAI-compatible fallback:
-# MODEL_BASE_URL=https://api.anthropic.com/v1 OPENAI_API_KEY=...
-```
+The current server runtime exposes health and project-discovery endpoints. ACP
+service/plug contracts are implemented separately; no external ACP process is
+started by the default dev command.
 
 Sandbox for Computer Use (optional):
 
@@ -36,5 +37,5 @@ docker compose up sandbox
 ## Layout
 
 - `apps/web` — React chat + approvals + workspace UI (Cowork feel)
-- `server` — Express + WS agent loop, ACP client, tools, integrations
+- `server` — Node HTTP health/API server, ACP service foundations, and tools
 - `shared` — Tool / event / connector types shared by both
