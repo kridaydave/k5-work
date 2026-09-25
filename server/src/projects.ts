@@ -9,6 +9,38 @@ import {
   ProjectSchema,
 } from "@k5-work/shared";
 
+export const MAX_GIT_HEAD_BYTES = 4096;
+export const MAX_DISCOVERY_ENTRIES_PER_ROOT = 2000;
+export const MAX_DISCOVERY_PROJECT_ENTRIES = 100;
+export const MAX_DISCOVERY_PROJECTS = 500;
+
+function canonicalDirectory(targetPath: string): string | null {
+  try {
+    const stat = fs.lstatSync(targetPath);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) return null;
+    return fs.realpathSync(targetPath);
+  } catch {
+    return null;
+  }
+}
+
+function hasVisibleEntry(directoryPath: string): boolean {
+  let directory: fs.Dir | undefined;
+  try {
+    directory = fs.opendirSync(directoryPath);
+    for (let index = 0; index < MAX_DISCOVERY_PROJECT_ENTRIES; index += 1) {
+      const entry = directory.readSync();
+      if (entry === null) return false;
+      if (!entry.name.startsWith(".")) return true;
+    }
+    return false;
+  } catch {
+    return false;
+  } finally {
+    directory?.closeSync();
+  }
+}
+
 function formatHomeRelativePath(p: string): string {
   const home = os.homedir();
   if (p === home) return "~";
@@ -25,10 +57,26 @@ function getProjectId(projectPath: string, name: string): string {
 }
 
 function readGitBranch(projectPath: string): string | undefined {
+  let descriptor: number | undefined;
   try {
-    const gitHeadPath = path.join(projectPath, ".git", "HEAD");
-    if (!fs.existsSync(gitHeadPath)) return undefined;
-    const content = fs.readFileSync(gitHeadPath, "utf8").trim();
+    const gitPath = path.join(projectPath, ".git");
+    const gitStat = fs.lstatSync(gitPath);
+    if (gitStat.isSymbolicLink() || !gitStat.isDirectory()) return undefined;
+    const realGitPath = fs.realpathSync(gitPath);
+    const relativeGitPath = path.relative(projectPath, realGitPath);
+    if (
+      relativeGitPath === ".." ||
+      relativeGitPath.startsWith(`..${path.sep}`) ||
+      path.isAbsolute(relativeGitPath)
+    ) {
+      return undefined;
+    }
+    const gitHeadPath = path.join(realGitPath, "HEAD");
+    const noFollow = fs.constants.O_NOFOLLOW ?? 0;
+    descriptor = fs.openSync(gitHeadPath, fs.constants.O_RDONLY | noFollow);
+    const headStat = fs.fstatSync(descriptor);
+    if (!headStat.isFile() || headStat.size > MAX_GIT_HEAD_BYTES) return undefined;
+    const content = fs.readFileSync(descriptor, "utf8").trim();
     if (content.startsWith("ref: refs/heads/")) {
       return content.replace(/^ref: refs\/heads\//, "");
     }
@@ -36,7 +84,9 @@ function readGitBranch(projectPath: string): string | undefined {
       return content.slice(0, 7);
     }
   } catch {
-    // Ignore read errors
+    return undefined;
+  } finally {
+    if (descriptor !== undefined) fs.closeSync(descriptor);
   }
   return undefined;
 }
@@ -50,19 +100,18 @@ export function getProjectInfo(targetPath: string): Project | null {
           ? path.join(os.homedir(), targetPath.slice(2))
           : targetPath;
     const resolved = path.resolve(expandedPath);
-    if (!fs.existsSync(resolved)) return null;
-    const stat = fs.statSync(resolved);
-    if (!stat.isDirectory()) return null;
+    const canonical = canonicalDirectory(resolved);
+    if (canonical === null) return null;
 
-    const name = path.basename(resolved) || "root";
-    const branch = readGitBranch(resolved);
-    const displayPath = formatHomeRelativePath(resolved);
+    const name = path.basename(canonical) || "root";
+    const branch = readGitBranch(canonical);
+    const displayPath = formatHomeRelativePath(canonical);
     const meta = branch ? `${displayPath} · branch ${branch}` : displayPath;
 
     return ProjectSchema.parse({
-      id: getProjectId(resolved, name),
+      id: getProjectId(canonical, name),
       name,
-      path: resolved,
+      path: canonical,
       meta,
       branch,
       lastOpened: Date.now(),
@@ -77,25 +126,7 @@ export function discoverLocalProjects(
   currentRoot?: string,
 ): ProjectDiscoveryResponse {
   const discoveredMap = new Map<string, Project>();
-  let cwd = currentRoot ? path.resolve(currentRoot) : process.cwd();
-
-  // If cwd is inside apps/web or a sub-workspace, find the repository root
-  if (fs.existsSync(path.join(cwd, "..", "package.json"))) {
-    try {
-      const parentPkg = JSON.parse(fs.readFileSync(path.join(cwd, "..", "package.json"), "utf8"));
-      if (parentPkg.workspaces) {
-        cwd = path.resolve(cwd, "..");
-      }
-    } catch {}
-  }
-  if (fs.existsSync(path.join(cwd, "../..", "package.json"))) {
-    try {
-      const rootPkg = JSON.parse(fs.readFileSync(path.join(cwd, "../..", "package.json"), "utf8"));
-      if (rootPkg.workspaces) {
-        cwd = path.resolve(cwd, "../..");
-      }
-    } catch {}
-  }
+  const cwd = currentRoot ? path.resolve(currentRoot) : process.cwd();
 
   // Root folders to search for projects
   const searchRoots: string[] = candidateRoots ?? [
@@ -113,42 +144,54 @@ export function discoverLocalProjects(
   }
 
   for (const root of searchRoots) {
+    if (discoveredMap.size >= MAX_DISCOVERY_PROJECTS) break;
     try {
       if (!fs.existsSync(root)) continue;
       const stat = fs.statSync(root);
       if (!stat.isDirectory()) continue;
 
-      const entries = fs.readdirSync(root, { withFileTypes: true });
-      for (const entry of entries) {
-        if (!entry.isDirectory()) continue;
-        if (entry.name.startsWith(".") || entry.name === "node_modules") continue;
-
-        const subPath = path.join(root, entry.name);
-        try {
-          const real = fs.realpathSync(subPath);
-          if (discoveredMap.has(real)) continue;
-
-          // Check if it's a project (e.g. contains .git, package.json, or non-empty workspace directory)
-          const isProject =
-            fs.existsSync(path.join(real, ".git")) ||
-            fs.existsSync(path.join(real, "package.json")) ||
-            fs.existsSync(path.join(real, "Cargo.toml")) ||
-            fs.existsSync(path.join(real, "pyproject.toml")) ||
-            fs.existsSync(path.join(real, "go.mod")) ||
-            (fs.existsSync(real) && fs.readdirSync(real).filter((f) => !f.startsWith(".")).length > 0);
-
-          if (isProject) {
-            const info = getProjectInfo(real);
-            if (info) {
-              discoveredMap.set(real, info);
-            }
+      const directory = fs.opendirSync(root);
+      let examined = 0;
+      try {
+        for (;;) {
+          const entry = directory.readSync();
+          if (entry === null) break;
+          if (
+            examined >= MAX_DISCOVERY_ENTRIES_PER_ROOT ||
+            discoveredMap.size >= MAX_DISCOVERY_PROJECTS
+          ) {
+            break;
           }
-        } catch {
-          // Skip inaccessible entries
+          examined += 1;
+          if (!entry.isDirectory()) continue;
+          if (entry.name.startsWith(".") || entry.name === "node_modules") continue;
+
+          const subPath = path.join(root, entry.name);
+          try {
+            const real = fs.realpathSync(subPath);
+            if (discoveredMap.has(real)) continue;
+
+            const isProject =
+              fs.existsSync(path.join(real, ".git")) ||
+              fs.existsSync(path.join(real, "package.json")) ||
+              fs.existsSync(path.join(real, "Cargo.toml")) ||
+              fs.existsSync(path.join(real, "pyproject.toml")) ||
+              fs.existsSync(path.join(real, "go.mod")) ||
+              hasVisibleEntry(real);
+
+            if (isProject) {
+              const info = getProjectInfo(real);
+              if (info) discoveredMap.set(real, info);
+            }
+          } catch {
+            continue;
+          }
         }
+      } finally {
+        directory.closeSync();
       }
     } catch {
-      // Skip inaccessible root
+      continue;
     }
   }
 
