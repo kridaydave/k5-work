@@ -9,6 +9,7 @@ import {
   OoxmlPartSchema,
   PermissionSchema,
   ProjectDiscoveryResponseSchema,
+  ProjectOpenRequestSchema,
   ProjectSchema,
   PromptSchema,
   SessionSchema,
@@ -173,6 +174,15 @@ describe("shared wire contracts", () => {
         partRels: { a: [{ type: "t", target: "x" }] },
       }),
     );
+  });
+
+  it("project open request requires one non-blank path", () => {
+    assert.deepEqual(ProjectOpenRequestSchema.parse({ path: "/tmp/project" }), {
+      path: "/tmp/project",
+    });
+    assert.throws(() => ProjectOpenRequestSchema.parse({ path: "   " }));
+    assert.throws(() => ProjectOpenRequestSchema.parse({ path: "/tmp", extra: true }));
+    assert.throws(() => ProjectOpenRequestSchema.parse({ path: 42 }));
   });
 
   it("project schema validates valid project and rejects invalid", () => {

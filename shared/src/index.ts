@@ -130,6 +130,11 @@ export const OoxmlPackageSpecSchema = z
 export type OoxmlPackageSpec = z.infer<typeof OoxmlPackageSpecSchema>;
 
 // --- Project Discovery & Local Folder Management ---
+export const ProjectOpenRequestSchema = z
+  .object({ path: nonBlank("project path") })
+  .strict();
+export type ProjectOpenRequest = z.infer<typeof ProjectOpenRequestSchema>;
+
 export const ProjectSchema = z
   .object({
     id: z.string().min(1),
