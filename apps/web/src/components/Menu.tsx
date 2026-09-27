@@ -20,6 +20,8 @@ type MenuProps = {
   className?: string;
   panelClassName?: string;
   ariaLabel?: string;
+  /** Disables the trigger; a menu with nothing to offer must not open. */
+  disabled?: boolean;
 };
 
 export function Menu({
@@ -32,9 +34,16 @@ export function Menu({
   className,
   panelClassName,
   ariaLabel,
+  disabled = false,
 }: MenuProps) {
   const [open, setOpen] = useState(false);
   const wrapperRef = useRef<HTMLDivElement>(null);
+
+  // A menu that becomes unusable must close: leaving it open would let the user
+  // pick a value the source no longer offers.
+  useEffect(() => {
+    if (disabled) setOpen(false);
+  }, [disabled]);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const menuId = useId();
@@ -136,9 +145,14 @@ export function Menu({
         aria-expanded={open}
         aria-controls={open ? menuId : undefined}
         aria-label={ariaLabel}
+        disabled={disabled}
         onClick={() => (open ? closeMenu() : openMenu())}
         onKeyDown={handleTriggerKeyDown}
-        className={cn("group/menu cursor-pointer text-left", className)}
+        className={cn(
+          "group/menu text-left",
+          disabled ? "cursor-not-allowed opacity-60" : "cursor-pointer",
+          className,
+        )}
       >
         {children}
         <ChevronDownIcon

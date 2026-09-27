@@ -2,33 +2,9 @@ import { useEffect, useState } from "react";
 import { FolderIcon, PlusIcon, SearchIcon } from "@/components/icons";
 import { cn } from "@/utils/cn";
 import type { Project } from "@k5-work/shared";
+import type { ConnectionState } from "@k5-work/shared";
 
-export type Session = { title: string; meta: string };
-
-const GROUPS: { label: string; sessions: Session[] }[] = [
-  {
-    label: "Today",
-    sessions: [
-      { title: "Fable 5.1", meta: "2m · true · 300K · Low" },
-      { title: "Refactor the composer state", meta: "26m · Sonnet 4.5" },
-      { title: "Sunset artwork pass", meta: "1h · Opus 4.5" },
-    ],
-  },
-  {
-    label: "Yesterday",
-    sessions: [
-      { title: "Cowork window polish", meta: "14h · Sonnet 4.5" },
-      { title: "Dependency triage", meta: "18h · Haiku 4.5" },
-    ],
-  },
-  {
-    label: "Earlier this week",
-    sessions: [
-      { title: "Kepler migration plan", meta: "Tue · Opus 4.5" },
-      { title: "Weekly review notes", meta: "Mon · Sonnet 4.5" },
-    ],
-  },
-];
+export type Session = { id: string; title: string; meta: string; group: string };
 
 type SidebarProps = {
   open: boolean;
@@ -42,7 +18,28 @@ type SidebarProps = {
   onOpenProject: () => void;
   onSelectProject: (id: string) => void;
   onSelectSession: (session: Session) => void;
+  /**
+   * Real sessions only. k5 does not keep a session history yet, so this is at
+   * most the live session; inventing entries here would present work that never
+   * happened as if it had.
+   */
+  sessions: Session[];
+  connection?: ConnectionState;
 };
+
+/** Buckets sessions by their group label, preserving the caller's order. */
+function groupSessions(sessions: Session[]): { label: string; sessions: Session[] }[] {
+  const order: string[] = [];
+  const byLabel = new Map<string, Session[]>();
+  for (const session of sessions) {
+    if (!byLabel.has(session.group)) {
+      byLabel.set(session.group, []);
+      order.push(session.group);
+    }
+    byLabel.get(session.group)?.push(session);
+  }
+  return order.map((label) => ({ label, sessions: byLabel.get(label) ?? [] }));
+}
 
 export function Sidebar({
   open,
@@ -56,6 +53,8 @@ export function Sidebar({
   onOpenProject,
   onSelectProject,
   onSelectSession,
+  sessions,
+  connection = "connecting",
 }: SidebarProps) {
   const [search, setSearch] = useState("");
   const [compactViewport, setCompactViewport] = useState(
@@ -71,7 +70,7 @@ export function Sidebar({
 
   const hidden = !open && compactViewport;
   const normalizedSearch = search.trim().toLowerCase();
-  const groups = GROUPS.map((group) => ({
+  const groups: { label: string; sessions: Session[] }[] = groupSessions(sessions).map((group) => ({
     ...group,
     sessions: group.sessions.filter(
       (session) =>
@@ -80,7 +79,7 @@ export function Sidebar({
         session.meta.toLowerCase().includes(normalizedSearch),
     ),
   })).filter((group) => group.sessions.length > 0);
-  const sessions = groups.flatMap((group) => group.sessions);
+  const visibleSessions: Session[] = groups.flatMap((group) => group.sessions);
 
   const runAndClose = (action: () => void) => {
     action();
@@ -294,7 +293,7 @@ export function Sidebar({
                       <h3 className="px-2 pb-1.5 text-[11px] font-medium text-white/35">{group.label}</h3>
                       <ul className="space-y-0.5">
                         {group.sessions.map((session) => (
-                          <li key={session.title}>
+                          <li key={session.id}>
                             <button
                               type="button"
                               onClick={() => runAndClose(() => onSelectSession(session))}
@@ -315,14 +314,16 @@ export function Sidebar({
                   ))}
                 </div>
               ) : (
-                <p className="px-2 py-2 text-[12px] text-white/35">No matching tasks.</p>
+                <p className="px-2 py-2 text-[12px] text-white/35">
+                  {sessions.length === 0 ? "No tasks yet." : "No matching tasks."}
+                </p>
               )}
             </section>
-          ) : sessions.length > 0 ? (
+          ) : visibleSessions.length > 0 ? (
             <section aria-label="Tasks" className="space-y-1">
-              {sessions.slice(0, 7).map((session) => (
+              {visibleSessions.slice(0, 7).map((session) => (
                 <button
-                  key={session.title}
+                  key={session.id}
                   type="button"
                   aria-label={session.title}
                   title={session.title}
@@ -339,9 +340,22 @@ export function Sidebar({
         <div className="shrink-0 border-t border-white/[0.07] p-3">
           {open ? (
             <div className="flex items-center gap-2 rounded-xl px-2 py-2 text-white/45">
-              <span className="h-1.5 w-1.5 rounded-full bg-white/50" />
+              {/* The pill reports the real socket state. "ready" was a static
+                  string that became false the moment sockets could drop. */}
+              <span
+                className={cn(
+                  "h-1.5 w-1.5 rounded-full",
+                  connection === "open"
+                    ? "bg-white/50"
+                    : connection === "connecting"
+                      ? "bg-white/30"
+                      : "bg-white/15",
+                )}
+              />
               <span className="text-[11.5px]">Local workspace</span>
-              <span className="ml-auto text-[10.5px] text-white/25">ready</span>
+              <span className="ml-auto text-[10.5px] text-white/25">
+                {connection === "open" ? "ready" : connection === "connecting" ? "connecting" : "offline"}
+              </span>
             </div>
           ) : (
             <div className="grid h-9 place-items-center text-[10px] font-bold tracking-[0.08em] text-white/30">K5</div>

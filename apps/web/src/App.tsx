@@ -1,55 +1,41 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Composer,
   type ComposerSettings,
-  type PromptAttachment,
   type PromptSubmission,
 } from "@/components/Composer";
 import { Markdown } from "@/components/Markdown";
-import { PaperclipIcon } from "@/components/icons";
+import { PermissionPrompt } from "@/components/PermissionPrompt";
 import { PathPromptModal } from "@/components/PathPromptModal";
 import { Sidebar, type Session } from "@/components/Sidebar";
 import { Wallpaper } from "@/components/Wallpaper";
 import { WindowChrome } from "@/components/WindowChrome";
+import { useK5Socket } from "@/hooks/useK5Socket";
 import { useProjects } from "@/hooks/useProjects";
 import { cn } from "@/utils/cn";
 
-type ChatMessage = {
-  id: string;
-  role: "user" | "assistant";
-  text: string;
-  attachments: PromptAttachment[];
-};
-
-const REPLY_DELAY_MS = 1400;
+// Only `full` is servable: OpenCode 1.18.31 resolves a blanket `*: allow` and
+// drops any config that would narrow it, so a narrower pill would be a promise
+// k5 cannot keep. See docs/posture-and-trust-decisions.md.
+// Model and mode start empty and are filled from what the harness advertises.
+// Naming a vendor model up front would offer a choice that fails for anyone
+// without those credentials.
 const DEFAULT_COMPOSER_SETTINGS: ComposerSettings = {
-  model: "sonnet",
-  thinking: "medium",
-  permissions: "review",
+  model: "",
+  mode: "",
+  permissions: "full",
 };
-
-function simulatedReply(prompt: string, followUp: boolean): string {
-  const head = prompt.length > 64 ? `${prompt.slice(0, 64).trimEnd()}…` : prompt;
-  if (/list|steps|items|one.*two/i.test(prompt)) {
-    return `Here is the breakdown for "${head}":\n\n- **Phase 1**: Initial discovery and workspace mapping\n- **Phase 2**: Implementation and targeted testing\n- **Phase 3**: Verification and polish\n\n\`\`\`ts\nconst status = "ready";\nconsole.log({ status });\n\`\`\`\n\nTell me what to adjust.`;
-  }
-  if (!followUp) {
-    return `Here is a first pass at "${head}":\n\n- Mapped the relevant files in this workspace\n- Drafted the smallest change that fits the existing patterns\n\nTell me what to adjust.`;
-  }
-  return `I folded that into "${head}":\n\n- Updated the current draft\n- Re-ran the targeted checks\n\nSend the next change when ready.`;
-}
 
 export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [pendingCount, setPendingCount] = useState(0);
   const [sessionKey, setSessionKey] = useState(0);
   const [composerSettings, setComposerSettings] = useState<ComposerSettings>(DEFAULT_COMPOSER_SETTINGS);
   const [projectPromptOpen, setProjectPromptOpen] = useState(false);
+  // Pre-session failures (auth, seat cap, plugin refusal) must be visible, or a
+  // prompt looks like it is doing nothing.
+  const [transcriptNote, setTranscriptNote] = useState<string | null>(null);
   const mainRef = useRef<HTMLElement>(null);
   const composerWrapRef = useRef<HTMLDivElement>(null);
-  const firstRect = useRef<DOMRect | null>(null);
-  const timers = useRef<number[]>([]);
   const {
     projects,
     activeProject,
@@ -58,25 +44,56 @@ export default function App() {
     selectProject,
     openPath,
   } = useProjects();
+  const k5 = useK5Socket();
+  const { state } = k5;
+  // The Composer clears its textarea on send and onSend returns void, so a
+  // prompt issued while the seat is still opening must be held here rather than
+  // dropped. Bounded to one turn: a second queued prompt is refused visibly
+  // rather than silently lost.
+  const queuedPrompt = useRef<string | null>(null);
+  const queueFullRef = useRef(false);
+  // A model/mode the user picked but the harness has not confirmed yet.
+  const pendingChoice = useRef<{ model?: string; mode?: string }>({});
+  // The last confirmed values, so a refused change can be rolled back to what
+  // the seat is actually running.
+  const confirmed = useRef<{ model?: string; mode?: string }>({});
 
-  const active = messages.length > 0;
-  const pending = pendingCount > 0;
+  const messages = state.entries;
+  const active = state.entries.length > 0;
+  // The existing working dots are reused rather than a new busy prop.
+  const pending = state.turnStatus === "running" || state.turnStatus === "cancelling";
 
-  const cancelReplies = useCallback(() => {
-    timers.current.forEach((id) => window.clearTimeout(id));
-    timers.current = [];
-    firstRect.current = null;
-    setPendingCount(0);
-  }, []);
+  // Derived from real state only. k5 has no session history yet, so the sidebar
+  // shows the live session and nothing else rather than plausible-looking rows
+  // for work that never happened.
+  const sidebarSessions = useMemo<Session[]>(() => {
+    if (state.sessionId === null || activeProject === undefined) return [];
+    const model = state.configOptions.find((o) => o.id === "model")?.current;
+    const title = activeProject.name;
+    return [
+      {
+        id: state.sessionId,
+        title,
+        meta: model ?? "connecting",
+        group: "This task",
+      },
+    ];
+  }, [activeProject, state.sessionId, state.configOptions]);
 
   const handleNewTask = useCallback(() => {
-    cancelReplies();
-    setMessages([]);
+    queuedPrompt.current = null;
+    queueFullRef.current = false;
+    pendingChoice.current = {};
+    confirmed.current = {};
+    // A new task must clear any note; a stale error above an empty hero reads as
+    // a current failure.
+    setTranscriptNote(null);
+    k5.newTask();
     setSessionKey((current) => current + 1);
     requestAnimationFrame(() => {
       document.getElementById("composer-input")?.focus();
     });
-  }, [cancelReplies]);
+  }, [k5]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -99,28 +116,25 @@ export default function App() {
   }, [handleNewTask]);
 
   useEffect(() => {
-    return () => {
-      timers.current.forEach((id) => window.clearTimeout(id));
-    };
-  }, []);
-
-  useEffect(() => {
-    const first = firstRect.current;
-    firstRect.current = null;
     const element = composerWrapRef.current;
-    if (!first || !element || messages.length === 0) return;
+    if (!element || messages.length === 0) return;
     if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
     const last = element.getBoundingClientRect();
-    const offsetY = first.top - last.top;
-    if (Math.abs(offsetY) < 4) return;
+    if (Math.abs(last.top) < 0.5) return;
     element.animate(
-      [{ transform: `translateY(${offsetY}px)` }, { transform: "translateY(0)" }],
+      [{ transform: `translateY(${last.top}px)` }, { transform: "translateY(0)" }],
       {
         duration: 460,
         easing: "cubic-bezier(0.4, 0, 0.2, 1)",
       },
     );
   }, [messages.length]);
+
+  // A failed session is a state, not a silent nothing.
+  useEffect(() => {
+    if (state.session !== "failed") return;
+    setTranscriptNote(state.sessionMessage ?? `Session failed: ${state.sessionReason ?? "unknown"}`);
+  }, [state.session, state.sessionMessage, state.sessionReason]);
 
   useEffect(() => {
     const element = mainRef.current;
@@ -129,59 +143,62 @@ export default function App() {
     element.scrollTo({ top: element.scrollHeight, behavior: smooth ? "smooth" : "auto" });
   }, [messages.length, pending]);
 
+  // A queued prompt is sent as soon as the session opens, so the submission
+  // always reaches the harness.
+  useEffect(() => {
+    // A healthy session clears the previous failure note.
+    if (state.session === "open") setTranscriptNote(null);
+  }, [state.session]);
+
+  useEffect(() => {
+    const queued = queuedPrompt.current;
+    if (state.sessionId === null || queued === null) return;
+    setTranscriptNote(null);
+    queuedPrompt.current = null;
+    queueFullRef.current = false;
+    k5.prompt(queued);
+  }, [k5, state.sessionId]);
+
   const handleSend = useCallback(
     (submission: PromptSubmission) => {
       const text = submission.text.trim();
       if (!text) return;
-      firstRect.current = composerWrapRef.current?.getBoundingClientRect() ?? null;
-      const followUp = messages.length > 0;
-      const attachments: PromptAttachment[] = submission.attachments.map((file) => ({
-        name: file.name,
-        size: file.size,
-        type: file.type,
-      }));
-      setMessages((current) => [
-        ...current,
-        {
-          id: `${Date.now()}-user`,
-          role: "user",
-          text,
-          attachments,
-        },
-      ]);
-      setPendingCount((count) => count + 1);
-      const id = window.setTimeout(() => {
-        setPendingCount((count) => Math.max(0, count - 1));
-        setMessages((current) => [
-          ...current,
-          {
-            id: `${Date.now()}-assistant`,
-            role: "assistant",
-            text: simulatedReply(text, followUp),
-            attachments: [],
-          },
-        ]);
-      }, REPLY_DELAY_MS);
-      timers.current.push(id);
+      const busy = state.turnStatus === "running" || state.turnStatus === "cancelling";
+      if (busy || queuedPrompt.current !== null) {
+        if (queueFullRef.current) return;
+        queueFullRef.current = true;
+        setTranscriptNote("One prompt is already queued. Wait for it to finish.");
+        return;
+      }
+      if (state.sessionId === null) {
+        if (!activeProject) return;
+        if (state.session === "failed") {
+          setTranscriptNote(
+            state.sessionMessage ?? "The previous session could not be opened.",
+          );
+          return;
+        }
+        // The seat opens lazily on the first prompt, so an empty hero costs no
+        // harness process.
+        queuedPrompt.current = text;
+        k5.openSession(activeProject.id);
+        return;
+      }
+      k5.prompt(text);
     },
-    [messages.length],
+    [activeProject, k5, state.session, state.sessionId, state.sessionMessage, state.turnStatus],
   );
 
   const handleSelectSession = useCallback(
     (session: Session) => {
-      cancelReplies();
-      setSessionKey((current) => current + 1);
-      setMessages([
-        { id: `${Date.now()}-user`, role: "user", text: session.title, attachments: [] },
-        {
-          id: `${Date.now()}-assistant`,
-          role: "assistant",
-          text: simulatedReply(session.title, false),
-          attachments: [],
-        },
-      ]);
+      // The sidebar still lists placeholder sessions from the original build.
+      // Selecting one used to fabricate a transcript; now that it would also
+      // close a live seat, it does nothing at all. Durable session history is
+      // Phase 4 work, and a placeholder that destroys real work is worse than
+      // an honest no-op.
+      void session;
     },
-    [cancelReplies],
+    [],
   );
 
   const handleSelectProject = useCallback(
@@ -225,6 +242,8 @@ export default function App() {
           onOpenProject={handleOpenProject}
           onSelectProject={handleSelectProject}
           onSelectSession={handleSelectSession}
+          sessions={sidebarSessions}
+          connection={state.connection}
         />
 
         <section className="relative isolate flex min-w-0 flex-1 flex-col">
@@ -247,12 +266,6 @@ export default function App() {
                     <div key={message.id} className="animate-fade-up flex justify-end">
                       <div className="max-w-[80%] rounded-2xl rounded-br-md border border-white/10 bg-white/[0.07] px-4 py-2.5 text-[14px] leading-relaxed text-white/90">
                         <Markdown content={message.text} variant="user" />
-                        {message.attachments.length > 0 ? (
-                          <div className="mt-2 flex items-start gap-1.5 border-t border-white/10 pt-2 text-[11.5px] text-white/45">
-                            <PaperclipIcon className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                            <span>{message.attachments.map((file) => file.name).join(", ")}</span>
-                          </div>
-                        ) : null}
                       </div>
                     </div>
                   ) : (
@@ -278,6 +291,22 @@ export default function App() {
               </div>
             ) : null}
 
+            {state.pendingPermission ? (
+              <PermissionPrompt
+                request={state.pendingPermission}
+                onDecide={(optionId) => k5.decidePermission(optionId)}
+              />
+            ) : null}
+
+            {transcriptNote ? (
+              <div
+                role="status"
+                className="mx-auto w-full max-w-[800px] pb-2 text-[12px] text-white/55"
+              >
+                {transcriptNote}
+              </div>
+            ) : null}
+
             <div
               ref={composerWrapRef}
               className={cn(
@@ -292,10 +321,26 @@ export default function App() {
                 activeProject={activeProject}
                 projects={projects}
                 settings={composerSettings}
+                configOptions={state.session === "open" ? state.configOptions : null}
                 compact={active}
                 onRequestProject={handleOpenProject}
                 onSelectProject={handleSelectProject}
-                onSettingsChange={setComposerSettings}
+                onSettingsChange={(next) => {
+                  const sessionId = state.sessionId;
+                  for (const id of ["model", "mode"] as const) {
+                    const value = next[id];
+                    if (!value || value === composerSettings[id]) continue;
+                    if (sessionId) {
+                      // Marked pending so the harness's echoed current value
+                      // does not revert the pick before it is applied.
+                      pendingChoice.current[id] = value;
+                      k5.configure(sessionId, id, value);
+                    } else {
+                      confirmed.current[id] = value;
+                    }
+                  }
+                  setComposerSettings(next);
+                }}
                 onSend={handleSend}
               />
             </div>

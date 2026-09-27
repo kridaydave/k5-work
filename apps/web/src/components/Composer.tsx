@@ -3,7 +3,6 @@ import {
   useRef,
   useState,
   type ChangeEvent,
-  type DragEvent,
   type KeyboardEvent,
 } from "react";
 import { Menu, type MenuItem } from "@/components/Menu";
@@ -17,32 +16,31 @@ import {
   SparkIcon,
 } from "@/components/icons";
 import { cn } from "@/utils/cn";
-import type { Project } from "@k5-work/shared";
+import type { ConfigOptionSummary, Project } from "@k5-work/shared";
+import { findConfigOption } from "@k5-work/shared";
 
-const MODELS: MenuItem[] = [
-  { id: "opus", label: "Claude Opus 4.5", meta: "Deepest reasoning · slowest" },
-  { id: "sonnet", label: "Claude Sonnet 4.5", meta: "Best for everyday work" },
-  { id: "haiku", label: "Claude Haiku 4.5", meta: "Fastest responses" },
-];
+// Models and modes are NOT hardcoded. The harness advertises what the current
+// machine can actually reach, which is the only list that can be honest: a
+// static list of paid vendor models would offer choices that fail for anyone
+// without those credentials. See docs/posture-and-trust-decisions.md.
+const MODELS_DISCOVERY_HINT = "Discovering models…";
+const MODELS_EMPTY_HINT = "No models available from this harness";
 
-const THINKING_LEVELS: MenuItem[] = [
-  { id: "low", label: "Low", meta: "Quick edits and simple questions" },
-  { id: "medium", label: "Medium", meta: "Balanced depth and speed" },
-  { id: "high", label: "High", meta: "Deeper planning for complex work" },
-];
-
+// Only `full` is offered. OpenCode 1.18.31 resolves a blanket `*: allow` and
+// drops any config that would narrow it, so a narrower pill would promise
+// something k5 cannot enforce.
 const PERMISSION_MODES: MenuItem[] = [
   { id: "full", label: "Full access", meta: "Read, edit, and run project commands" },
-  { id: "review", label: "Review changes", meta: "Pause before applying edits" },
-  { id: "read", label: "Read only", meta: "Inspect files without changing them" },
 ];
 
 const OPEN_PROJECT_ID = "open-project";
 const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
 
 export type ComposerSettings = {
+  /** A harness-advertised model value id. Empty until discovery returns. */
   model: string;
-  thinking: string;
+  /** A harness-advertised session mode id (build/plan). */
+  mode: string;
   permissions: string;
 };
 
@@ -63,6 +61,8 @@ type ComposerProps = {
   activeProject?: Project;
   projects: Project[];
   settings: ComposerSettings;
+  /** Harness-advertised config options; null before a session is open. */
+  configOptions: ConfigOptionSummary[] | null;
   compact?: boolean;
   onRequestProject: () => void;
   onSelectProject: (id: string) => void;
@@ -84,6 +84,7 @@ export function Composer({
   activeProject,
   projects,
   settings,
+  configOptions,
   compact = false,
   onRequestProject,
   onSelectProject,
@@ -92,7 +93,7 @@ export function Composer({
 }: ComposerProps) {
   const [value, setValue] = useState("");
   const [focused, setFocused] = useState(false);
-  const [dragging, setDragging] = useState(false);
+  const [dragRefused, setDragRefused] = useState(false);
   const [attachmentError, setAttachmentError] = useState("");
   const [attachments, setAttachments] = useState<File[]>([]);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -142,12 +143,6 @@ export function Composer({
   const handleFileChange = (event: ChangeEvent<HTMLInputElement>) => {
     addFiles(Array.from(event.target.files ?? []));
     event.target.value = "";
-  };
-
-  const handleDrop = (event: DragEvent<HTMLDivElement>) => {
-    event.preventDefault();
-    setDragging(false);
-    addFiles(Array.from(event.dataTransfer.files));
   };
 
   const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -270,8 +265,28 @@ export function Composer({
     }
   };
 
-  const activeModel = MODELS.find((item) => item.id === settings.model);
-  const activeThinking = THINKING_LEVELS.find((item) => item.id === settings.thinking);
+  // Discovered by the harness at session open. `null` means the session is not
+  // open yet, which is different from "open with nothing to offer".
+  const modelsOption = configOptions === null ? null : findConfigOption(configOptions, "model");
+  const modeOption = configOptions === null ? null : findConfigOption(configOptions, "mode");
+  // A boolean option carries no value list, so it is reported as unusable rather
+  // than rendered as a menu that can never open.
+  const toMenuItems = (option: ConfigOptionSummary | null): MenuItem[] | null => {
+    if (!option || option.type !== "select") return null;
+    return option.values.map((v) => ({ id: v.value, label: v.label }));
+  };
+  const models = toMenuItems(modelsOption);
+  const modes = toMenuItems(modeOption);
+  // The harness's `current` is authoritative once a session is open: it is what
+  // the seat is actually running. The composer's value is a pending intent, so
+  // it is only used when the harness has not reported a current value yet.
+  // Falling back to the first entry would be a guess.
+  const activeModel =
+    models?.find((item) => item.id === (modelsOption?.current ?? settings.model)) ??
+    models?.find((item) => item.id === settings.model);
+  const activeMode =
+    modes?.find((item) => item.id === (modeOption?.current ?? settings.mode)) ??
+    modes?.find((item) => item.id === settings.mode);
   const activePermissions = PERMISSION_MODES.find((item) => item.id === settings.permissions);
   const projectItems: MenuItem[] = [
     {
@@ -318,20 +333,26 @@ export function Composer({
         </Menu>
       </div>
 
+      {/* Drag-and-drop is deliberately inert. The paperclip is disabled, so a
+          live drop target would still accept real files, render attachment chips,
+          and then hand the submission to a transport that has no way to deliver
+          them. Refusing the drop is the honest behaviour until attachments ship. */}
       <div
-        onDragEnter={(event) => {
+        onDragOver={(event) => {
+          // Refuse rather than highlight: nothing can be delivered.
           event.preventDefault();
-          setDragging(true);
+          event.dataTransfer.dropEffect = "none";
         }}
-        onDragOver={(event) => event.preventDefault()}
-        onDragLeave={() => setDragging(false)}
-        onDrop={handleDrop}
+        onDrop={(event) => {
+          event.preventDefault();
+          setDragRefused(true);
+        }}
         className={cn(
           "glass-card animate-fade-up rounded-[28px] transition-[box-shadow,border-color,transform] duration-300 [transition-timing-function:cubic-bezier(0.4,0,0.2,1)] hover:border-white/[0.12]",
           focused
             ? "border-white/[0.13] shadow-[0_34px_90px_-26px_rgba(0,0,0,0.9),0_0_0_1px_rgba(255,190,150,0.09),inset_0_1px_0_rgba(255,255,255,0.07)]"
             : null,
-          dragging && "border-white/30 shadow-[0_34px_90px_-26px_rgba(0,0,0,0.9)]",
+          dragRefused && "border-white/30 shadow-[0_34px_90px_-26px_rgba(0,0,0,0.9)]",
         )}
         style={{ animationDelay: "120ms" }}
       >
@@ -377,7 +398,7 @@ export function Composer({
           ref={textareaRef}
           rows={1}
           value={value}
-          placeholder={dragging ? "Drop files to attach" : "Describe the change or attach a file…"}
+          placeholder="Describe the change the agent should make…"
           onFocus={() => setFocused(true)}
           onBlur={() => setFocused(false)}
           onChange={(event) => setValue(event.target.value)}
@@ -397,13 +418,17 @@ export function Composer({
             tabIndex={-1}
             onChange={handleFileChange}
           />
+          {/* Attachments are disabled until there is an out-of-band transport.
+              A live chip that renders but discards its bytes would imply the
+              agent received something it never saw. The glyph is kept, dimmed,
+              so the control's place in the layout is unchanged. */}
           <button
             type="button"
-            aria-label="Attach files"
-            title="Attach files"
-            onClick={() => fileInputRef.current?.click()}
+            aria-label="Attach files (not available yet)"
+            title="Attachments are not available yet"
+            disabled
             className={cn(
-              "grid shrink-0 cursor-pointer place-items-center rounded-full text-white/55 transition duration-200 hover:bg-white/[0.09] hover:text-white active:scale-95",
+              "grid shrink-0 cursor-not-allowed place-items-center rounded-full text-white/25",
               compact ? "h-8 w-8" : "h-9 w-9",
             )}
           >
@@ -411,27 +436,40 @@ export function Composer({
           </button>
 
           <div className="flex min-w-0 flex-1 flex-wrap items-center gap-0.5">
+            {/* Models come from the harness. Until a session is open the menu
+                says so rather than showing a hardcoded vendor list that may
+                not be reachable on this machine. */}
             <Menu
-              ariaLabel={`Model. Current: ${activeModel?.label ?? "unknown"}`}
-              items={MODELS}
+              ariaLabel={`Model. Current: ${activeModel?.label ?? "not discovered yet"}`}
+              items={models ?? [{ id: "", label: configOptions === null ? MODELS_DISCOVERY_HINT : MODELS_EMPTY_HINT }]}
               value={settings.model}
               onSelect={(model) => onSettingsChange({ ...settings, model })}
+              disabled={models === null || models.length === 0}
               direction="up"
               className="flex min-w-0 items-center gap-1.5 rounded-full px-2 py-1.5 text-[12.5px] font-medium text-white/70 transition-colors duration-200 hover:bg-white/[0.09] hover:text-white"
             >
               <CubeIcon className="h-4 w-4 shrink-0 text-white/70" />
-              <span className="max-w-24 truncate">{activeModel?.label.replace("Claude ", "") ?? "Model"}</span>
+              <span className="max-w-24 truncate">
+                {activeModel?.label ??
+                  (configOptions === null ? "Discovering…" : "No models")}
+              </span>
             </Menu>
+            {/* The harness calls this a session mode (build/plan), not a
+                thinking level. Labelling it as a thinking level would claim a
+                capability the harness does not have. */}
             <Menu
-              ariaLabel={`Thinking level. Current: ${activeThinking?.label ?? "unknown"}`}
-              items={THINKING_LEVELS}
-              value={settings.thinking}
-              onSelect={(thinking) => onSettingsChange({ ...settings, thinking })}
+              ariaLabel={`Session mode. Current: ${activeMode?.label ?? "not discovered yet"}`}
+              items={modes ?? [{ id: "", label: MODELS_DISCOVERY_HINT }]}
+              value={settings.mode}
+              onSelect={(mode) => onSettingsChange({ ...settings, mode })}
+              disabled={modes === null || modes.length === 0}
               direction="up"
               className="flex items-center gap-1.5 rounded-full px-2 py-1.5 text-[12.5px] font-medium text-white/65 transition-colors duration-200 hover:bg-white/[0.09] hover:text-white"
             >
               <SparkIcon className="h-3.5 w-3.5 shrink-0 text-white/60" />
-              <span>{activeThinking?.label ?? "Medium"}</span>
+              <span>
+                {activeMode?.label ?? (configOptions === null ? "Mode" : "No modes")}
+              </span>
             </Menu>
             <Menu
               ariaLabel={`Permissions. Current: ${activePermissions?.label ?? "unknown"}`}
