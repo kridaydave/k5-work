@@ -1,7 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
-  AccessModeSchema,
   AuditSchema,
   EventSchema,
   HarnessSchema,
@@ -20,7 +19,18 @@ describe("shared wire contracts", () => {
   it("prompt defaults access to full", () => {
     const p = PromptSchema.parse({ sessionId: "s-1", text: "hello" });
     assert.equal(p.access, "full");
-    assert.equal(AccessModeSchema.parse(undefined), "full");
+    // Access is a closed label now, so an unparseable value must fail rather
+    // than silently defaulting to "full".
+    assert.equal(PromptSchema.parse({ sessionId: "s-1", text: "x" }).access, "full");
+    assert.equal(
+      PromptSchema.safeParse({
+        sessionId: "s-1",
+        text: "x",
+        access: "yolo",
+      }).success,
+      false,
+      "an unknown access label must be refused, not defaulted",
+    );
   });
 
   it("prompt rejects empty text/session", () => {
@@ -28,13 +38,24 @@ describe("shared wire contracts", () => {
     assert.throws(() => PromptSchema.parse({ sessionId: "s-1", text: "" }));
   });
 
-  it("access is opaque per-harness string", () => {
+  it("access is a declared profile label, not a free string", () => {
+    // A per-harness opaque string would fail open: any value, including a typo
+    // or a vendor-specific bypass token, would silently mean "full" without ever
+    // corresponding to a profile the posture check verified.
     const p = PromptSchema.parse({
       sessionId: "s-1",
       text: "hi",
-      access: "opencode-full-bypass",
+      access: "review",
     });
-    assert.equal(p.access, "opencode-full-bypass");
+    assert.equal(p.access, "review");
+    assert.equal(
+      PromptSchema.safeParse({
+        sessionId: "s-1",
+        text: "hi",
+        access: "opencode-full-bypass",
+      }).success,
+      false,
+    );
   });
 
   it("toolCall keeps harness vs k5 origin", () => {

@@ -1,4 +1,12 @@
 import { z } from "zod";
+import {
+  ComposerAccessLabelSchema,
+  type ComposerAccessLabel,
+} from "./access.js";
+
+export * from "./contracts.js";
+export * from "./access.js";
+export * from "./reducer.js";
 
 export const HarnessSchema = z.enum(["opencode", "kilo", "cline"]);
 export type Harness = z.infer<typeof HarnessSchema>;
@@ -13,18 +21,20 @@ export const SessionSchema = z.object({
 });
 export type Session = z.infer<typeof SessionSchema>;
 
-export const AccessModeSchema = z.string().min(1).default("full");
-export type AccessMode = z.infer<typeof AccessModeSchema>;
-
+/**
+ * Access is a closed label from the access profile vocabulary, never a free
+ * string. An opaque defaulting string would fail open: any value, including a
+ * typo, would silently mean "full" and no longer correspond to a profile the
+ * posture check actually verified.
+ */
 export const PromptSchema = z.object({
   sessionId: z.string().min(1),
   text: z.string().min(1),
   model: z.string().optional(),
-  // Opaque per-harness access mode, set in composer. Default: full access.
-  // e.g. opencode/kilo/cline each map "full" to their own flag.
-  access: AccessModeSchema,
+  access: ComposerAccessLabelSchema.default("full"),
 });
 export type Prompt = z.infer<typeof PromptSchema>;
+export type AccessMode = ComposerAccessLabel;
 
 export const ToolOriginSchema = z.enum(["harness", "k5"]);
 export type ToolOrigin = z.infer<typeof ToolOriginSchema>;
@@ -68,6 +78,9 @@ export const AuditSchema = z.object({
 });
 export type Audit = z.infer<typeof AuditSchema>;
 
+// Internal plug->service event stream. NOT the browser wire contract: the
+// browser contract is a typed command/event union defined when the /ws gateway
+// lands, and that union is the single source of truth for the web client.
 export const EventKindSchema = z.enum(["chat", "tool", "permission", "audit"]);
 export type EventKind = z.infer<typeof EventKindSchema>;
 
