@@ -5,22 +5,27 @@
   "type": "module",
   "scripts": {
     "predev": "npm --prefix ../shared run build && npm run build",
-    "dev": "node --watch dist/index.js",
+    "dev": "node --env-file-if-exists=../.env --watch dist/index.js",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "node --test dist/service.test.js dist/acp/plug.test.js dist/projects.test.js dist/project-api.test.js dist/ooxml-core/xml.test.js dist/ooxml-core/paths.test.js dist/ooxml-core/content-types.test.js dist/ooxml-core/rels.test.js dist/ooxml-core/zip.test.js dist/ooxml-core/package.test.js dist/ooxml-core/validate.test.js dist/ooxml-core/security.test.js dist/ooxml-core/docx.test.js",
     "test:security": "node --test dist/projects.test.js dist/project-api.test.js dist/ooxml-core/security.test.js",
-    "test:office": "node --test dist/ooxml-core/docx.test.js"
+    "test:office": "node --test dist/ooxml-core/docx.test.js",
+    "probe": "node --env-file-if-exists=../.env dist/acp/probe.cli.js",
+    "test:acp": "node --test --test-timeout 120000 dist/acp/spawn.test.js dist/acp/probe.test.js dist/acp/seat-pool.test.js dist/acp/updates.test.js dist/acp/posture.test.js dist/acp/posture-opencode.test.js dist/acp/plugin-guard.test.js"
   },
   "dependencies": {
+    "@agentclientprotocol/sdk": "^1.5.0",
     "@k5-work/shared": "0.1.0",
     "fflate": "^0.8.3",
     "saxes": "^6.0.0",
+    "ws": "^8.22.0",
     "xmlchars": "^2.2.0",
     "zod": "^3.23.8"
   },
   "devDependencies": {
     "@types/node": "22.19.17",
+    "@types/ws": "^8.18.1",
     "typescript": "^5.6.3"
   }
 }
