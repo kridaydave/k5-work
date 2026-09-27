@@ -51,19 +51,28 @@ Locked decisions: `docs/posture-and-trust-decisions.md`.
 - [x] Model and session-mode discovery: the composer menu is populated from the
       harness's advertised `configOptions`, applied via `session/set_config_option`,
       and refuses any value the harness never offered. No hardcoded vendor list.
-- [x] Browser test runner (`vitest` + `jsdom`) with a suite for the socket hook.
+- [x] Browser test runner (`vitest` + `jsdom`) with a suite for the socket hook
+      and the sidebar.
+- [x] `session/request_permission` answered: the seat registers the handler, the
+      browser renders and sends a decision, a refusal is passed to the harness as
+      a refusal, and every path that ends a question resolves it (cancel, turn
+      end, socket close, overflow). OpenCode 1.18.31 resolves `*: allow` and does
+      not currently ask, so this is unreachable with that harness today, but any
+      harness that does ask must not hang.
+- [x] Seat idle TTL scheduled: the countdown is armed when a turn ends, cleared
+      on any further activity, and reaps the harness child on expiry.
+- [x] Sidebar no longer fabricates sessions; it takes real sessions and says
+      "No tasks yet." instead of showing the original build's placeholders.
+- [x] Configure failures are scoped to the command that caused them, so a
+      refused model change can no longer kill a working turn.
 
 ## Not done
 
 - [ ] Phase 4 — policy and persistence
-  - Permission UI and the `session/request_permission` handler. The plumbing and
-    contracts exist and are tested, but OpenCode 1.18.31 resolves `*: allow` and
-    never asks, so the UI would be unreachable with the current harness.
+  - Real session history. The sidebar renders the live session only, because
+    there is no store to read a list from yet; `session/list` is what unblocks it.
   - `session/load`, `session/list`, `session/resume` behind their capability
     gates with stored-cwd validation.
   - Out-of-band attachments, then durable transcripts and bounded replay.
-  - Sidebar session list still shows the original build's placeholders; it needs
-    real session history, and until then selecting one deliberately does nothing.
-  - Only the socket hook has a browser test. Component-level coverage for the
-    transcript, tool cards, and permission card is still to come.
-  - Seat idle TTL is wired in the pool but nothing schedules the reaper yet.
+  - Component-level coverage for the transcript and tool cards. The permission
+    prompt is covered through the socket hook, not rendered directly.
