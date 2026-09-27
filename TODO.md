@@ -53,12 +53,13 @@ Locked decisions: `docs/posture-and-trust-decisions.md`.
       and refuses any value the harness never offered. No hardcoded vendor list.
 - [x] Browser test runner (`vitest` + `jsdom`) with a suite for the socket hook
       and the sidebar.
-- [x] `session/request_permission` answered: the seat registers the handler, the
-      browser renders and sends a decision, a refusal is passed to the harness as
-      a refusal, and every path that ends a question resolves it (cancel, turn
-      end, socket close, overflow). OpenCode 1.18.31 resolves `*: allow` and does
-      not currently ask, so this is unreachable with that harness today, but any
-      harness that does ask must not hang.
+- [x] `session/request_permission` refused rather than ignored: the seat answers
+      the ACP `cancelled` outcome immediately. There is no permission screen —
+      OpenCode 1.18.31 resolves `*: allow` and never asks, so a prompt would be
+      unreachable UI. The handler still has to exist, because an unanswered
+      request leaves the harness blocked for the rest of the turn. A test asserts
+      both halves: the turn still ends, and the refusal is never reported to the
+      harness as consent.
 - [x] Seat idle TTL scheduled: the countdown is armed when a turn ends, cleared
       on any further activity, and reaps the harness child on expiry.
 - [x] Sidebar no longer fabricates sessions; it takes real sessions and says
@@ -74,5 +75,7 @@ Locked decisions: `docs/posture-and-trust-decisions.md`.
   - `session/load`, `session/list`, `session/resume` behind their capability
     gates with stored-cwd validation.
   - Out-of-band attachments, then durable transcripts and bounded replay.
-  - Component-level coverage for the transcript and tool cards. The permission
-    prompt is covered through the socket hook, not rendered directly.
+  - Component-level coverage for the transcript and tool cards.
+  - A permission screen, if a harness ever asks. It needs the wire contract, the
+    reducer state and the browser decision path back; today the refusal is
+    unconditional.

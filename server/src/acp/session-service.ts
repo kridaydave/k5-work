@@ -3,20 +3,12 @@ import {
   type BrowserCommand,
   type CommandFailureReason,
   type ConfigOptionSummary,
-  type PermissionResolvedReason,
   type ServerEvent,
 } from "@k5-work/shared";
 import type { AcceptedConnection, ConnectionHandlers } from "../ws/gateway.js";
 import { SeatOpenError, type SeatRunner } from "./seat-runner.js";
 import { AcpAuthRequiredError } from "./probe.js";
-import type {
-  AcpPermissionRequest,
-  AcpSeat,
-  SeatStreamEvent,
-} from "./acp-seat.js";
-
-/** Monotonic so a permission requestId is never reused within a connection. */
-let permissionCounter = 0;
+import type { AcpSeat, SeatStreamEvent } from "./acp-seat.js";
 import type { TurnCompletedEvent } from "@k5-work/shared";
 type TurnStopReason = TurnCompletedEvent["stopReason"];
 import type { AcpChild } from "./spawn.js";
@@ -61,11 +53,6 @@ interface ConnectionState {
   turn: { id: string; closed: boolean } | null;
   /** Set while a seat is being torn down; awaited by waitForIdle. */
   releasing: Promise<void> | null;
-  /** Pending permission decisions, single-use by construction. */
-  pendingPermissions: Map<
-    string,
-    { optionIds: Set<string>; resolve: (optionId: string | null) => void }
-  >;
   closed: boolean;
 }
 
@@ -86,7 +73,6 @@ export function createSessionHandlers(
     acp: null,
     turn: null,
     releasing: null,
-    pendingPermissions: new Map(),
     closed: false,
   };
 
@@ -183,29 +169,18 @@ export function createSessionHandlers(
         case "session.configure":
           void applyConfig(command);
           return;
-        case "permission.decide":
-          decidePermission(command);
-          return;
       }
     },
 
     overflow() {
-      // Every pending permission is resolved locally, because the socket is
-      // about to close and a dropped request would strand the agent.
-      resolveOutstandingPermissions("overflow");
+      // The socket is about to close, so a seat is released now rather than
+      // leaving a harness running behind a connection that can no longer answer.
+      if (state.seat) state.releasing = releaseSeat(state);
     },
 
     closed() {
       state.closed = true;
-      // A tab that closes mid-turn must not leave the seat or the agent waiting.
-      for (const requestId of [...state.pendingPermissions.keys()]) {
-        options.onAudit?.({
-          sessionId: state.sessionId,
-          action: "permission.resolved",
-          detail: `socket-closed ${requestId}`,
-        });
-      }
-      resolveOutstandingPermissions("revoked");
+      // A tab that closes mid-turn must not leave the seat or the agent running.
       if (state.seat) state.releasing = releaseSeat(state);
     },
   };
@@ -288,7 +263,6 @@ export function createSessionHandlers(
           access: "full",
         },
         (turnId, event) => forwardSeatEvent(state, turnId, event),
-        (request) => askPermission(request),
       );
       state.seat = opened.seat;
       state.acp = opened.acp;
@@ -333,9 +307,6 @@ export function createSessionHandlers(
     const sessionId = state.sessionId;
     if (sessionId === null) return;
     emit({ type: "turn.completed", sessionId, turnId, stopReason });
-    // Whatever the turn was waiting on is now moot. Leaving it open would hold
-    // the harness on a question nobody can answer any more.
-    resolveOutstandingPermissions(stopReason === "cancelled" ? "cancelled" : "revoked");
     armIdleTimer();
   }
 
@@ -548,113 +519,5 @@ export function createSessionHandlers(
       emit({ type: "seat.reaped", sessionId, reason });
       state.releasing = releaseSeat(state);
     }
-  }
-
-  /**
-   * Puts a harness permission request to the browser and waits for its answer.
-   *
-   * The promise must always settle. If the browser never answers, the harness
-   * waits forever, so the seat's own abort signal (from the ACP runtime) and
-   * the connection closing both release it.
-   */
-  function askPermission(request: AcpPermissionRequest): Promise<string | null> {
-    const sessionId = state.sessionId;
-    const turnId = state.turn?.id ?? null;
-    if (sessionId === null || turnId === null) {
-      return Promise.resolve(null);
-    }
-    const requestId = `perm-${++permissionCounter}`;
-    const options = request.options.slice(0, 16);
-    if (options.length === 0) return Promise.resolve(null);
-
-    return new Promise<string | null>((resolve) => {
-      const settle = (): void => {
-        state.pendingPermissions.delete(requestId);
-      };
-      state.pendingPermissions.set(requestId, {
-        optionIds: new Set(options.map((o) => o.optionId)),
-        resolve: (optionId) => {
-          settle();
-          resolve(optionId);
-        },
-      });
-      const delivered = emit({
-        type: "permission.requested",
-        requestId,
-        sessionId,
-        turnId,
-        toolCallId: request.toolCallId,
-        title: request.title,
-        options,
-      });
-      // A socket that cannot carry the question can never answer it, so the
-      // request is withdrawn instead of stranding the agent.
-      if (!delivered) {
-        settle();
-        resolve(null);
-      }
-    });
-  }
-
-  /**
-   * Answers every outstanding permission question and tells the browser why.
-   *
-   * Any path that leaves a question open strands the harness, which blocks on
-   * `session/request_permission` until it is answered. It also strands the
-   * browser, which would keep a prompt for a turn that no longer exists.
-   */
-  function resolveOutstandingPermissions(reason: PermissionResolvedReason): void {
-    for (const [requestId, pending] of state.pendingPermissions) {
-      pending.resolve(null);
-      emit({ type: "permission.resolved", requestId, reason });
-    }
-    state.pendingPermissions.clear();
-  }
-
-  function decidePermission(
-    command: Extract<BrowserCommand, { type: "permission.decide" }>,
-  ) {
-    const pending = state.pendingPermissions.get(command.requestId);
-    if (!pending) {
-      // A late or forged decision is rejected locally and never reaches the
-      // agent. The record is single-use, so there is nothing to answer.
-      emit({
-        type: "command.result",
-        commandId: command.commandId,
-        ok: false,
-        reason: "not-found",
-        message: "no such pending permission",
-      });
-      emit({
-        type: "permission.resolved",
-        requestId: command.requestId,
-        reason: "forged",
-      });
-      return;
-    }
-    if (command.optionId !== null && !pending.optionIds.has(command.optionId)) {
-      // An option the server never offered is a forgery, not a preference.
-      emit({
-        type: "command.result",
-        commandId: command.commandId,
-        ok: false,
-        reason: "invalid-payload",
-        message: "option was not offered by the harness",
-      });
-      emit({
-        type: "permission.resolved",
-        requestId: command.requestId,
-        reason: "forged",
-      });
-      return;
-    }
-    state.pendingPermissions.delete(command.requestId);
-    pending.resolve(command.optionId);
-    emit({ type: "command.result", commandId: command.commandId, ok: true, reason: "ok" });
-    emit({
-      type: "permission.resolved",
-      requestId: command.requestId,
-      reason: command.optionId === null ? "cancelled" : "selected",
-    });
   }
 }

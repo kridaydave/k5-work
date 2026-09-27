@@ -42,27 +42,7 @@ export interface AcpSeatOptions {
   clientName?: string;
   openTimeoutMs?: number;
   turnTimeoutMs?: number;
-  /**
-   * Asks the owner to decide a permission request. Returns the chosen
-   * `optionId`, or null to cancel.
-   *
-   * Without this the seat never answers `session/request_permission`, so a
-   * harness that asks before running a tool waits forever and the turn hangs
-   * with no visible cause.
-   */
-  onPermission?: AcpPermissionBroker;
 }
-
-/** A permission request in the shape the browser contract already uses. */
-export interface AcpPermissionRequest {
-  toolCallId: string | null;
-  title: string;
-  options: { optionId: string; name: string; kind: string }[];
-}
-
-export type AcpPermissionBroker = (
-  request: AcpPermissionRequest,
-) => Promise<string | null>;
 
 export interface AcpSeatInfo {
   sessionId: string;
@@ -140,44 +120,15 @@ export class AcpSeat {
   private async handshake(): Promise<void> {
     const seat = this;
     const app = client({ name: this.options.clientName ?? "k5-work" });
-    // Registered before the handshake so a permission request raised during the
-    // first turn is answered rather than left hanging on the harness.
-    app.onRequest("session/request_permission", async ({ params, signal }) => {
-      const offer = params.options.map((o) => ({
-        optionId: o.optionId,
-        name: o.name,
-        kind: String(o.kind),
-      }));
-      const toolCallId =
-        params.toolCall.toolCallId === undefined ? null : String(params.toolCall.toolCallId);
-      const title = params.toolCall.title ?? params.toolCall.kind ?? "tool call";
-      // A cancel aborts this request, so a decision can never be delivered after
-      // the harness stopped waiting. Racing the signal keeps the turn from
-      // hanging on a decision the user can no longer make.
-      const chosen =
-        (await Promise.race([
-          this.options.onPermission?.({ toolCallId, title, options: offer }) ??
-            Promise.resolve(null),
-          new Promise<null>((resolve) => {
-            if (signal.aborted) {
-              resolve(null);
-              return;
-            }
-            signal.addEventListener("abort", () => resolve(null), { once: true });
-          }),
-        ])) ?? null;
-      // The broker is the only source of a decision, and only an option this
-      // harness actually offered may be echoed back.
-      if (chosen !== null && !offer.some((o) => o.optionId === chosen)) {
-        return { outcome: { outcome: "cancelled" } };
-      }
-      return {
-        outcome:
-          chosen === null
-            ? { outcome: "cancelled" }
-            : { outcome: "selected", optionId: chosen },
-      };
-    });
+    // There is no permission screen, so a harness that asks is refused rather
+    // than left waiting. The handler must exist: without one the request goes
+    // unanswered and the harness blocks on it for the rest of the turn, which is
+    // worse than a visible refusal. Fail-closed is the only honest answer while
+    // nobody can be asked.
+    app.onRequest("session/request_permission", () => ({
+      outcome: { outcome: "cancelled" },
+    }));
+
     const settled = new Promise<AcpSeatInfo>((resolve, reject) => {
       void app
         .connectWith(this.child.stream, async (ctx) => {

@@ -160,38 +160,9 @@ describe("view reducer", () => {
     assert.deepEqual(state.entries, []);
     assert.equal(state.session, "none");
     assert.equal(state.activeTurnId, null);
-    assert.equal(state.pendingPermission, null);
   });
 
-  it("holds a single pending permission and clears it on resolve", () => {
-    const first: ServerEvent = {
-      type: "permission.requested",
-      requestId: "r-1",
-      sessionId: "s-1",
-      turnId: "t-1",
-      toolCallId: "tool-1",
-      title: "run ls",
-      options: [{ optionId: "allow", name: "Allow", kind: "allow_always" }],
-    };
-    let state = applyServerEvent(running(), first);
-    assert.equal(state.pendingPermission?.requestId, "r-1");
 
-    // A second concurrent request cannot be answered honestly, so the first is
-    // kept rather than replaced.
-    state = applyServerEvent(state, { ...first, requestId: "r-2" } as ServerEvent);
-    assert.equal(state.pendingPermission?.requestId, "r-1");
-
-    state = applyServerEvent(state, { type: "permission.resolved", requestId: "r-1", reason: "selected" });
-    assert.equal(state.pendingPermission, null);
-  });
-
-  it("drops a stale permission resolve for an unknown request", () => {
-    const state = applyServerEvent(running(), {
-      type: "permission.resolved", requestId: "r-nope", reason: "cancelled",
-    });
-    assert.equal(state.pendingPermission, null);
-    assert.equal(state.turnReason, null);
-  });
 
   it("stores the advertised config options from session.opened", () => {
     const state = applyServerEvent(INITIAL_VIEW_STATE, opened);
@@ -320,43 +291,5 @@ describe("configure failures are not turn failures", () => {
       text: "still going",
     });
     assert.equal(after.entries.at(-1)?.text, "still going");
-  });
-});
-
-describe("a permission prompt never outlives its turn", () => {
-  it("is dropped when the turn is cancelled", () => {
-    // The one-way door this guards: a prompt left on screen for a finished turn
-    // asks the user to authorise work that will never run, and answering it
-    // reaches a harness that is no longer waiting.
-    const state = applyServerEvents(INITIAL_VIEW_STATE, [
-      {
-        type: "session.opened",
-        commandId: "c-open",
-        sessionId: "s-1",
-        projectId: "p-1",
-        cwd: "/tmp/p",
-        configOptions: [],
-      },
-    ]);
-    const live = beginTurn(state, "t-1", "go");
-    const asked = applyServerEvent(live, {
-      type: "permission.requested",
-      requestId: "r-1",
-      sessionId: "s-1",
-      turnId: "t-1",
-      toolCallId: "tool-1",
-      title: "write a file",
-      options: [{ optionId: "reject", name: "Reject", kind: "reject_once" }],
-    });
-    assert.equal(asked.pendingPermission?.requestId, "r-1");
-
-    const cancelled = applyServerEvent(asked, {
-      type: "turn.completed",
-      sessionId: "s-1",
-      turnId: "t-1",
-      stopReason: "cancelled",
-    });
-    assert.equal(cancelled.turnStatus, "done");
-    assert.equal(cancelled.pendingPermission, null);
   });
 });

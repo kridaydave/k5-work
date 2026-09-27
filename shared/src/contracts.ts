@@ -100,27 +100,12 @@ export const SessionCloseCommandSchema = z
   .strict();
 export type SessionCloseCommand = z.infer<typeof SessionCloseCommandSchema>;
 
-export const PermissionDecideCommandSchema = z
-  .object({
-    ...commandBase,
-    type: z.literal("permission.decide"),
-    sessionId: SessionIdSchema,
-    requestId: z.string().min(1).max(128),
-    // Only an option the server actually offered, or a cancel.
-    optionId: z.string().min(1).max(128).nullable(),
-  })
-  .strict();
-export type PermissionDecideCommand = z.infer<
-  typeof PermissionDecideCommandSchema
->;
-
 export const BrowserCommandSchema = z.discriminatedUnion("type", [
   SessionOpenCommandSchema,
   SessionConfigureCommandSchema,
   SessionPromptCommandSchema,
   SessionCancelCommandSchema,
   SessionCloseCommandSchema,
-  PermissionDecideCommandSchema,
 ]);
 export type BrowserCommand = z.infer<typeof BrowserCommandSchema>;
 
@@ -267,59 +252,6 @@ export const ToolUpdatedEventSchema = z
   .strict();
 export type ToolUpdatedEvent = z.infer<typeof ToolUpdatedEventSchema>;
 
-export const PermissionRequestedEventSchema = z
-  .object({
-    type: z.literal("permission.requested"),
-    requestId: z.string().min(1).max(128),
-    sessionId: SessionIdSchema,
-    turnId: TurnIdSchema,
-    toolCallId: z.string().max(256).nullable(),
-    title: z.string().max(500),
-    options: z
-      .array(
-        z
-          .object({
-            optionId: z.string().min(1).max(128),
-            name: z.string().max(200),
-            kind: z.string().max(100),
-          })
-          .strict(),
-      )
-      .max(16),
-  })
-  .strict();
-export type PermissionRequestedEvent = z.infer<
-  typeof PermissionRequestedEventSchema
->;
-
-export const PermissionResolvedReasonSchema = z.enum([
-  "selected",
-  "cancelled",
-  "timeout",
-  "revoked",
-  "forged",
-  "protocol-cancelled",
-  "socket-closed",
-  "overflow",
-  "turn-cancelled",
-  "child-failure",
-  "seat-reaped",
-]);
-export type PermissionResolvedReason = z.infer<
-  typeof PermissionResolvedReasonSchema
->;
-
-export const PermissionResolvedEventSchema = z
-  .object({
-    type: z.literal("permission.resolved"),
-    requestId: z.string().min(1).max(128),
-    reason: PermissionResolvedReasonSchema,
-  })
-  .strict();
-export type PermissionResolvedEvent = z.infer<
-  typeof PermissionResolvedEventSchema
->;
-
 export const TurnCompletedEventSchema = z
   .object({
     type: z.literal("turn.completed"),
@@ -369,8 +301,6 @@ export const ServerEventSchema = z.discriminatedUnion("type", [
   TurnStartedEventSchema,
   TurnDeltaEventSchema,
   ToolUpdatedEventSchema,
-  PermissionRequestedEventSchema,
-  PermissionResolvedEventSchema,
   TurnCompletedEventSchema,
   SeatReapedEventSchema,
   ErrorEventSchema,

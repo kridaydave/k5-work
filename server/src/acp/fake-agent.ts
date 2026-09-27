@@ -25,7 +25,6 @@ export const SCENARIOS = [
   "unsupported-request",
   "long-title",
   "permission",
-  "permission-cancelled",
 ] as const;
 export type Scenario = (typeof SCENARIOS)[number];
 
@@ -225,7 +224,7 @@ export function handleMessage(
         ? prompt.filter((b) => b?.type === "text").map((b) => b?.text ?? "").join("")
         : "";
       const script = promptScript(scenario, text);
-      if (scenario === "permission" || scenario === "permission-cancelled") {
+      if (scenario === "permission") {
         pending.push(
           {
             jsonrpc: "2.0",

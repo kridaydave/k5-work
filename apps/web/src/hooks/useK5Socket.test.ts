@@ -363,37 +363,6 @@ describe("useK5Socket", () => {
     expect(socket.commands().map((c) => c.type)).toContain("session.close");
   });
 
-  it("rejects a forged permission decision locally", async () => {
-    const { result, sockets } = await mount();
-    const socket = sockets.at(-1)!;
-    act(() => {
-      socket.receive({
-        type: "session.opened",
-        commandId: "c-1",
-        sessionId: "s-1",
-        projectId: "p-1",
-        cwd: "/tmp/p",
-        configOptions: [],
-      });
-      socket.receive({
-        type: "permission.requested",
-        requestId: "r-1",
-        sessionId: "s-1",
-        turnId: "t-1",
-        toolCallId: "tool-1",
-        title: "run ls",
-        options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }],
-      });
-    });
-    expect(result.current.state.pendingPermission?.requestId).toBe("r-1");
-
-    act(() => result.current.decidePermission("allow"));
-    expect(socket.commands().at(-1)).toMatchObject({
-      type: "permission.decide",
-      requestId: "r-1",
-      optionId: "allow",
-    });
-  });
 
   it("applies a discovered config option through session.configure", async () => {
     const { result, sockets } = await mount();
@@ -417,77 +386,5 @@ describe("useK5Socket", () => {
       });
     });
     expect(result.current.state.configOptions[0].current).toBe("opencode/space-bunny-free");
-  });
-});
-
-describe("permission prompts", () => {
-  it("surfaces a harness permission request and answers it", async () => {
-    // The whole point of the round trip: the request must be visible in state
-    // and the answer must reach the wire, or the harness waits forever.
-    const { result, sockets } = await mount();
-    const socket = sockets.at(-1)!;
-    act(() => {
-      socket.receive({
-        type: "session.opened",
-        commandId: "c-1",
-        sessionId: "s-1",
-        projectId: "p-1",
-        cwd: "/tmp/p",
-        configOptions: [],
-      });
-    });
-    act(() =>
-      socket.receive({
-        type: "permission.requested",
-        requestId: "r-1",
-        sessionId: "s-1",
-        turnId: "t-1",
-        toolCallId: "tool-1",
-        title: "write a file",
-        options: [
-          { optionId: "allow-once", name: "Allow once", kind: "allow_once" },
-          { optionId: "reject", name: "Reject", kind: "reject_once" },
-        ],
-      }),
-    );
-    expect(result.current.state.pendingPermission?.title).toBe("write a file");
-    expect(result.current.state.pendingPermission?.options).toHaveLength(2);
-
-    act(() => result.current.decidePermission("allow-once"));
-    const sent = socket.sent.map((raw) => JSON.parse(raw) as { type: string; optionId?: string });
-    expect(sent.some((c) => c.type === "permission.decide" && c.optionId === "allow-once")).toBe(true);
-  });
-
-  it("clears the prompt only once the harness confirms the decision", async () => {
-    // Clearing on click would let the user believe a refusal was recorded while
-    // the harness is still waiting, and the turn would look finished.
-    const { result, sockets } = await mount();
-    const socket = sockets.at(-1)!;
-    act(() => {
-      socket.receive({
-        type: "session.opened",
-        commandId: "c-1",
-        sessionId: "s-1",
-        projectId: "p-1",
-        cwd: "/tmp/p",
-        configOptions: [],
-      });
-      socket.receive({
-        type: "permission.requested",
-        requestId: "r-1",
-        sessionId: "s-1",
-        turnId: "t-1",
-        toolCallId: null,
-        title: "run a command",
-        options: [{ optionId: "reject", name: "Reject", kind: "reject_once" }],
-      });
-    });
-    act(() => result.current.decidePermission(null));
-    expect(result.current.state.pendingPermission).not.toBeNull();
-
-    act(() =>
-      socket.receive({ type: "permission.resolved", requestId: "r-1", reason: "cancelled" }),
-    );
-    expect(result.current.state.pendingPermission).toBeNull();
   });
 });

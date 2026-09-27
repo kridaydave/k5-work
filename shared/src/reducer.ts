@@ -2,7 +2,6 @@ import type {
   BrowserCommand,
   CommandFailureReason,
   ConfigOptionSummary,
-  PermissionResolvedReason,
   ServerEvent,
   ToolLifecycle,
   ToolStatus,
@@ -54,18 +53,6 @@ export interface K5ViewState {
   tools: Record<string, ToolCard>;
   thinking: string;
   configOptions: ConfigOptionSummary[];
-  /**
-   * At most one live permission request per turn. A second one is refused by
-   * the server, so a list here would imply a capacity that does not exist.
-   */
-  pendingPermission: PendingPermission | null;
-}
-
-export interface PendingPermission {
-  requestId: string;
-  title: string;
-  toolCallId: string | null;
-  options: { optionId: string; name: string; kind: string }[];
 }
 
 export const INITIAL_VIEW_STATE: K5ViewState = {
@@ -81,7 +68,6 @@ export const INITIAL_VIEW_STATE: K5ViewState = {
   tools: {},
   thinking: "",
   configOptions: [],
-  pendingPermission: null,
 };
 
 export function isTurnTerminal(status: TurnStatus): boolean {
@@ -185,8 +171,7 @@ export function applyServerEvent(
         turnReason: null,
         thinking: "",
         tools: {},
-        pendingPermission: null,
-      };
+            };
 
     case "session.failed":
       return {
@@ -206,8 +191,7 @@ export function applyServerEvent(
         turnStatus: isTurnTerminal(state.turnStatus) ? state.turnStatus : "idle",
         turnReason: null,
         thinking: "",
-        pendingPermission: null,
-        // Every open path has a visible reverse state, and a reaped seat takes
+              // Every open path has a visible reverse state, and a reaped seat takes
         // its in-progress tool cards with it rather than leaving them spinning.
         tools: Object.fromEntries(
           Object.entries(state.tools).map(([id, card]) => [
@@ -282,30 +266,6 @@ export function applyServerEvent(
       };
     }
 
-    case "permission.requested":
-      // A second concurrent request cannot be answered honestly, so the existing
-      // one is kept and the new one is ignored rather than silently replacing it.
-      if (state.pendingPermission !== null) return state;
-      return {
-        ...state,
-        pendingPermission: {
-          requestId: event.requestId,
-          title: event.title,
-          toolCallId: event.toolCallId,
-          options: event.options,
-        },
-      };
-
-    case "permission.resolved": {
-      const reason: PermissionResolvedReason = event.reason;
-      if (state.pendingPermission?.requestId !== event.requestId) return state;
-      return {
-        ...state,
-        pendingPermission: null,
-        turnReason: reason === "forged" ? "permission-forged" : state.turnReason,
-      };
-    }
-
     case "turn.completed": {
       if (state.activeTurnId !== event.turnId) return state;
       if (isTurnTerminal(state.turnStatus)) {
@@ -320,10 +280,6 @@ export function applyServerEvent(
         ...state,
         turnStatus: failed ? "error" : "done",
         turnReason: failed ? event.stopReason : null,
-        // A turn that has ended cannot be waiting on a permission answer, so the
-        // prompt goes with it. Keeping it would be a one-way door: the user would
-        // be asked to authorise a turn that no longer exists.
-        pendingPermission: null,
         // A cancelled turn must not leave a tool card claiming to be running.
         tools: Object.fromEntries(
           Object.entries(state.tools).map(([id, card]) =>

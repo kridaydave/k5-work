@@ -22,13 +22,6 @@ describe("browser command contract", () => {
       { ...base, type: "session.prompt", sessionId: "s-1", turnId: "t-1", text: "hi" },
       { ...base, type: "session.cancel", sessionId: "s-1" },
       { ...base, type: "session.close", sessionId: "s-1" },
-      {
-        ...base,
-        type: "permission.decide",
-        sessionId: "s-1",
-        requestId: "r-1",
-        optionId: null,
-      },
     ];
     for (const command of commands) {
       const parsed = BrowserCommandSchema.safeParse(command);

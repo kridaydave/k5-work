@@ -38,7 +38,6 @@ export interface K5Socket {
   cancel(): void;
   closeSession(): void;
   newTask(): void;
-  decidePermission(optionId: string | null): void;
   /** Applies a harness-advertised config option to the live seat. */
   configure(sessionId: string, configOptionId: string, value: string): void;
   connected: boolean;
@@ -295,20 +294,6 @@ export function useK5Socket(options: UseK5SocketOptions = {}): K5Socket {
     [send],
   );
 
-  const decidePermission = useCallback(
-    (optionId: string | null) => {
-      const { pendingPermission, sessionId } = stateRef.current;
-      if (!pendingPermission || !sessionId) return;
-      send({
-        commandId: nextCommandId(),
-        type: "permission.decide",
-        sessionId,
-        requestId: pendingPermission.requestId,
-        optionId,
-      });
-    },
-    [send],
-  );
 
   return {
     state,
@@ -317,7 +302,6 @@ export function useK5Socket(options: UseK5SocketOptions = {}): K5Socket {
     cancel,
     closeSession,
     newTask,
-    decidePermission,
     configure,
     connected: state.connection === "open",
   };

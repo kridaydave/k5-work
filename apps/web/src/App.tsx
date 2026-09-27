@@ -5,7 +5,6 @@ import {
   type PromptSubmission,
 } from "@/components/Composer";
 import { Markdown } from "@/components/Markdown";
-import { PermissionPrompt } from "@/components/PermissionPrompt";
 import { PathPromptModal } from "@/components/PathPromptModal";
 import { Sidebar, type Session } from "@/components/Sidebar";
 import { Wallpaper } from "@/components/Wallpaper";
@@ -289,13 +288,6 @@ export default function App() {
                   </div>
                 ) : null}
               </div>
-            ) : null}
-
-            {state.pendingPermission ? (
-              <PermissionPrompt
-                request={state.pendingPermission}
-                onDecide={(optionId) => k5.decidePermission(optionId)}
-              />
             ) : null}
 
             {transcriptNote ? (

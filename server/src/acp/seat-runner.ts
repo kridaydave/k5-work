@@ -19,12 +19,7 @@ import {
   verifyPosture,
 } from "./posture.js";
 import { describeFinding, findPluginSignals } from "./plugin-guard.js";
-import {
-  AcpSeat,
-  type AcpPermissionBroker,
-  type AcpSeatInfo,
-  type SeatStreamEvent,
-} from "./acp-seat.js";
+import { AcpSeat, type AcpSeatInfo, type SeatStreamEvent } from "./acp-seat.js";
 import {
   SeatBusyError,
   SeatCapError,
@@ -108,7 +103,6 @@ export class SeatRunner {
   async open(
     request: OpenSeatOptions,
     onEvent: ((turnId: string, event: SeatStreamEvent) => void) | null = null,
-    onPermission: AcpPermissionBroker | undefined = undefined,
   ): Promise<OpenSeatResult> {
     if (this.options.disableLiveSeats) {
       throw new SeatOpenError(
@@ -199,7 +193,6 @@ export class SeatRunner {
           ...(this.options.openDeadlineMs === undefined
             ? {}
             : { openTimeoutMs: this.options.openDeadlineMs }),
-          ...(onPermission === undefined ? {} : { onPermission }),
         },
         onEvent,
       );

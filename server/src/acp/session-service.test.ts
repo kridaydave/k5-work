@@ -320,26 +320,6 @@ describe("session open over the gateway", () => {
     }
   });
 
-  it("rejects a forged permission decision and never reaches the agent", async () => {
-    const h = await start();
-    try {
-      const ws = await h.connect("http://127.0.0.1:5173");
-      ws.send(
-        JSON.stringify({
-          commandId: "c-1",
-          type: "permission.decide",
-          sessionId: "s-1",
-          requestId: "r-nope",
-          optionId: "allow",
-        }),
-      );
-      const resolved = await waitFor(h.events, "permission.resolved");
-      if (resolved.type !== "permission.resolved") throw new Error("unreachable");
-      assert.equal(resolved.reason, "forged");
-    } finally {
-      await h.close();
-    }
-  });
 });
 
 describe("session.configure", () => {
@@ -535,12 +515,11 @@ describe("seat idle timeout", () => {
   });
 });
 
-describe("permission requests", () => {
-
-  it("puts a harness permission request to the browser", async () => {
-    // Before this handler existed the seat never answered
-    // session/request_permission, so the harness waited forever and the turn
-    // hung with nothing on screen to explain it.
+describe("a harness that asks for permission", () => {
+  it("is refused and its turn still ends, rather than being left waiting", async () => {
+    // There is no permission screen, so the seat answers cancelled. The property
+    // that matters is both halves: the harness is not left blocked on a request
+    // nobody will answer, and a refusal is never reported to it as consent.
     const h = await start({ scenario: "permission" });
     try {
       const ws = await h.connect("http://127.0.0.1:5173");
@@ -556,157 +535,21 @@ describe("permission requests", () => {
           text: "do the thing",
         }),
       );
-      const asked = await waitFor(h.events, "permission.requested");
-      if (asked.type !== "permission.requested") throw new Error("unreachable");
-      // The browser is told what is being asked for, not just that something is.
-      assert.equal(asked.title, "write a file");
-      assert.equal(asked.toolCallId, "tool-1");
-      assert.deepEqual(
-        asked.options.map((o) => o.optionId),
-        ["allow-once", "reject"],
-      );
-      assert.equal(asked.turnId, "t-1");
 
-      ws.send(
-        JSON.stringify({
-          commandId: "c-allow",
-          type: "permission.decide",
-          sessionId: opened.sessionId,
-          requestId: asked.requestId,
-          optionId: "allow-once",
-        }),
-      );
-      const result = await waitForCommand(h.events, "c-allow");
-      assert.equal(result.ok, true);
-      // The turn must actually finish, proving the harness got its answer.
+      // The turn terminates, so the harness was not left blocked.
       await waitFor(h.events, "turn.completed");
-      const delta = h.events.find(
-        (e) => e.type === "turn.delta" && e.text.includes("ran the tool"),
-      );
-      assert.ok(delta, "the harness was not told the permission was granted");
-    } finally {
-      await h.close();
-    }
-  });
-
-  it("passes a cancelled decision to the harness", async () => {
-    const h = await start({ scenario: "permission" });
-    try {
-      const ws = await h.connect("http://127.0.0.1:5173");
-      ws.send(openCommand("c-1"));
-      const opened = await waitFor(h.events, "session.opened");
-      if (opened.type !== "session.opened") throw new Error("unreachable");
-      ws.send(
-        JSON.stringify({
-          commandId: "c-turn",
-          type: "session.prompt",
-          sessionId: opened.sessionId,
-          turnId: "t-1",
-          text: "do the thing",
-        }),
-      );
-      const asked = await waitFor(h.events, "permission.requested");
-      if (asked.type !== "permission.requested") throw new Error("unreachable");
-
-      ws.send(
-        JSON.stringify({
-          commandId: "c-no",
-          type: "permission.decide",
-          sessionId: opened.sessionId,
-          requestId: asked.requestId,
-          optionId: null,
-        }),
-      );
-      const result = await waitForCommand(h.events, "c-no");
-      assert.equal(result.ok, true);
-      await waitFor(h.events, "turn.completed");
-      // The point of the test: a refusal is never reported to the agent as
-      // consent.
       const delta = h.events.find(
         (e) => e.type === "turn.delta" && e.text.includes("skipped the tool"),
       );
-      assert.ok(delta, "a cancelled decision was not passed to the harness");
-    } finally {
-      await h.close();
-    }
-  });
-
-  it("refuses an option the harness never offered", async () => {
-    const h = await start({ scenario: "permission" });
-    try {
-      const ws = await h.connect("http://127.0.0.1:5173");
-      ws.send(openCommand("c-1"));
-      const opened = await waitFor(h.events, "session.opened");
-      if (opened.type !== "session.opened") throw new Error("unreachable");
-      ws.send(
-        JSON.stringify({
-          commandId: "c-turn",
-          type: "session.prompt",
-          sessionId: opened.sessionId,
-          turnId: "t-1",
-          text: "do the thing",
-        }),
+      assert.ok(
+        delta,
+        "the harness must be told the permission was refused, not granted",
       );
-      const asked = await waitFor(h.events, "permission.requested");
-      if (asked.type !== "permission.requested") throw new Error("unreachable");
-
-      ws.send(
-        JSON.stringify({
-          commandId: "c-forged",
-          type: "permission.decide",
-          sessionId: opened.sessionId,
-          requestId: asked.requestId,
-          optionId: "allow-everything",
-        }),
-      );
-      const result = await waitForCommand(h.events, "c-forged");
-      assert.equal(result.ok, false);
-      assert.equal(result.reason, "invalid-payload");
-      // The question is still live, so the user can still answer properly.
       assert.equal(
-        h.events.some((e) => e.type === "permission.resolved" && e.reason === "forged"),
-        true,
+        h.events.some((e) => e.type === "turn.delta" && e.text.includes("ran the tool")),
+        false,
+        "a permission the user never gave must never look granted",
       );
-    } finally {
-      await h.close();
-    }
-  });
-
-  it("resolves an outstanding permission when the turn is cancelled", async () => {
-    // Cancelling must not leave the question hanging. A harness blocked on
-    // session/request_permission waits forever, and the browser keeps a prompt
-    // for a turn that no longer exists.
-    const h = await start({ scenario: "permission" });
-    try {
-      const ws = await h.connect("http://127.0.0.1:5173");
-      ws.send(openCommand("c-1"));
-      const opened = await waitFor(h.events, "session.opened");
-      if (opened.type !== "session.opened") throw new Error("unreachable");
-      ws.send(
-        JSON.stringify({
-          commandId: "c-turn",
-          type: "session.prompt",
-          sessionId: opened.sessionId,
-          turnId: "t-1",
-          text: "go",
-        }),
-      );
-      const asked = await waitFor(h.events, "permission.requested");
-      if (asked.type !== "permission.requested") throw new Error("unreachable");
-
-      ws.send(
-        JSON.stringify({
-          commandId: "c-cancel",
-          type: "session.cancel",
-          sessionId: opened.sessionId,
-        }),
-      );
-      const resolved = await waitFor(h.events, "permission.resolved", 3_000);
-      if (resolved.type !== "permission.resolved") throw new Error("unreachable");
-      assert.equal(resolved.requestId, asked.requestId);
-      assert.equal(resolved.reason, "cancelled");
-      // The turn still ends normally rather than being left marked running.
-      await waitFor(h.events, "turn.completed");
     } finally {
       await h.close();
     }
