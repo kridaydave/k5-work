@@ -671,4 +671,44 @@ describe("permission requests", () => {
       await h.close();
     }
   });
+
+  it("resolves an outstanding permission when the turn is cancelled", async () => {
+    // Cancelling must not leave the question hanging. A harness blocked on
+    // session/request_permission waits forever, and the browser keeps a prompt
+    // for a turn that no longer exists.
+    const h = await start({ scenario: "permission" });
+    try {
+      const ws = await h.connect("http://127.0.0.1:5173");
+      ws.send(openCommand("c-1"));
+      const opened = await waitFor(h.events, "session.opened");
+      if (opened.type !== "session.opened") throw new Error("unreachable");
+      ws.send(
+        JSON.stringify({
+          commandId: "c-turn",
+          type: "session.prompt",
+          sessionId: opened.sessionId,
+          turnId: "t-1",
+          text: "go",
+        }),
+      );
+      const asked = await waitFor(h.events, "permission.requested");
+      if (asked.type !== "permission.requested") throw new Error("unreachable");
+
+      ws.send(
+        JSON.stringify({
+          commandId: "c-cancel",
+          type: "session.cancel",
+          sessionId: opened.sessionId,
+        }),
+      );
+      const resolved = await waitFor(h.events, "permission.resolved", 3_000);
+      if (resolved.type !== "permission.resolved") throw new Error("unreachable");
+      assert.equal(resolved.requestId, asked.requestId);
+      assert.equal(resolved.reason, "cancelled");
+      // The turn still ends normally rather than being left marked running.
+      await waitFor(h.events, "turn.completed");
+    } finally {
+      await h.close();
+    }
+  });
 });

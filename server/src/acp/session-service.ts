@@ -192,29 +192,20 @@ export function createSessionHandlers(
     overflow() {
       // Every pending permission is resolved locally, because the socket is
       // about to close and a dropped request would strand the agent.
-      for (const [requestId, pending] of state.pendingPermissions) {
-        pending.resolve(null);
-        emit({
-          type: "permission.resolved",
-          requestId,
-          reason: "overflow" satisfies PermissionResolvedReason,
-        });
-      }
-      state.pendingPermissions.clear();
+      resolveOutstandingPermissions("overflow");
     },
 
     closed() {
       state.closed = true;
       // A tab that closes mid-turn must not leave the seat or the agent waiting.
-      for (const [requestId, pending] of state.pendingPermissions) {
-        pending.resolve(null);
+      for (const requestId of [...state.pendingPermissions.keys()]) {
         options.onAudit?.({
           sessionId: state.sessionId,
           action: "permission.resolved",
           detail: `socket-closed ${requestId}`,
         });
       }
-      state.pendingPermissions.clear();
+      resolveOutstandingPermissions("revoked");
       if (state.seat) state.releasing = releaseSeat(state);
     },
   };
@@ -342,6 +333,9 @@ export function createSessionHandlers(
     const sessionId = state.sessionId;
     if (sessionId === null) return;
     emit({ type: "turn.completed", sessionId, turnId, stopReason });
+    // Whatever the turn was waiting on is now moot. Leaving it open would hold
+    // the harness on a question nobody can answer any more.
+    resolveOutstandingPermissions(stopReason === "cancelled" ? "cancelled" : "revoked");
     armIdleTimer();
   }
 
@@ -600,6 +594,21 @@ export function createSessionHandlers(
         resolve(null);
       }
     });
+  }
+
+  /**
+   * Answers every outstanding permission question and tells the browser why.
+   *
+   * Any path that leaves a question open strands the harness, which blocks on
+   * `session/request_permission` until it is answered. It also strands the
+   * browser, which would keep a prompt for a turn that no longer exists.
+   */
+  function resolveOutstandingPermissions(reason: PermissionResolvedReason): void {
+    for (const [requestId, pending] of state.pendingPermissions) {
+      pending.resolve(null);
+      emit({ type: "permission.resolved", requestId, reason });
+    }
+    state.pendingPermissions.clear();
   }
 
   function decidePermission(
