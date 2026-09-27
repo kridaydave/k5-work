@@ -320,6 +320,10 @@ export function applyServerEvent(
         ...state,
         turnStatus: failed ? "error" : "done",
         turnReason: failed ? event.stopReason : null,
+        // A turn that has ended cannot be waiting on a permission answer, so the
+        // prompt goes with it. Keeping it would be a one-way door: the user would
+        // be asked to authorise a turn that no longer exists.
+        pendingPermission: null,
         // A cancelled turn must not leave a tool card claiming to be running.
         tools: Object.fromEntries(
           Object.entries(state.tools).map(([id, card]) =>

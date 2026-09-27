@@ -322,3 +322,41 @@ describe("configure failures are not turn failures", () => {
     assert.equal(after.entries.at(-1)?.text, "still going");
   });
 });
+
+describe("a permission prompt never outlives its turn", () => {
+  it("is dropped when the turn is cancelled", () => {
+    // The one-way door this guards: a prompt left on screen for a finished turn
+    // asks the user to authorise work that will never run, and answering it
+    // reaches a harness that is no longer waiting.
+    const state = applyServerEvents(INITIAL_VIEW_STATE, [
+      {
+        type: "session.opened",
+        commandId: "c-open",
+        sessionId: "s-1",
+        projectId: "p-1",
+        cwd: "/tmp/p",
+        configOptions: [],
+      },
+    ]);
+    const live = beginTurn(state, "t-1", "go");
+    const asked = applyServerEvent(live, {
+      type: "permission.requested",
+      requestId: "r-1",
+      sessionId: "s-1",
+      turnId: "t-1",
+      toolCallId: "tool-1",
+      title: "write a file",
+      options: [{ optionId: "reject", name: "Reject", kind: "reject_once" }],
+    });
+    assert.equal(asked.pendingPermission?.requestId, "r-1");
+
+    const cancelled = applyServerEvent(asked, {
+      type: "turn.completed",
+      sessionId: "s-1",
+      turnId: "t-1",
+      stopReason: "cancelled",
+    });
+    assert.equal(cancelled.turnStatus, "done");
+    assert.equal(cancelled.pendingPermission, null);
+  });
+});
