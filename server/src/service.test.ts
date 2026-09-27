@@ -26,20 +26,32 @@ describe("K5Service memory impl", () => {
     assert.deepEqual(events[0].payload, { text: "hi", access: "full" });
   });
 
-  it("prompt forwards opaque access verbatim", async () => {
+  it("forwards a declared access label verbatim", async () => {
     const svc = createMemoryService();
     const s = svc.sessionNew("kilo");
     const events = [];
     for await (const e of svc.prompt({
       sessionId: s.id,
       text: "hi",
-      access: "kilo-plan-mode",
+      access: "review",
     })) {
       events.push(e);
     }
-    assert.deepEqual(events[0].payload, {
-      text: "hi",
-      access: "kilo-plan-mode",
+    assert.deepEqual(events[0].payload, { text: "hi", access: "review" });
+  });
+
+  it("refuses an access value outside the declared vocabulary", async () => {
+    const svc = createMemoryService();
+    const s = svc.sessionNew("kilo");
+    await assert.rejects(async () => {
+      for await (const _ of svc.prompt({
+        sessionId: s.id,
+        text: "hi",
+        // @ts-expect-error an undeclared label must not typecheck
+        access: "kilo-plan-mode",
+      })) {
+        // drain
+      }
     });
   });
 
