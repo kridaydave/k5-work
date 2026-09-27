@@ -227,16 +227,17 @@ describe("session open over the gateway", () => {
 
       const seat = h.pool.get(`opencode:p-1:full`);
       assert.ok(seat, "the seat must be tracked while the socket is open");
-      const pid = seat.child?.pid;
+      const child = seat.child;
+      const pid = child?.pid;
       assert.equal(typeof pid, "number");
       assert.equal(isAlive(pid as number), true);
 
       ws.terminate();
-      // Reaping is asynchronous; wait for the key to actually leave the pool.
-      const deadline = Date.now() + 20_000;
-      while (h.pool.size > 0 && Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 25));
-      }
+      // The child's own exit is the receipt. The pool key is released when
+      // teardown *starts*, which is deliberately before the process is gone, so
+      // polling for the pid to disappear would be racing the teardown it is
+      // meant to observe.
+      await child?.exited;
       assert.equal(h.pool.size, 0, "the seat key must be released after reaping");
       assert.equal(
         isAlive(pid as number),
@@ -456,7 +457,8 @@ describe("seat idle timeout", () => {
       ws.send(openCommand("c-1"));
       const opened = await waitFor(h.events, "session.opened");
       if (opened.type !== "session.opened") throw new Error("unreachable");
-      const pid = h.pool.list()[0]?.child?.pid;
+      const child = h.pool.list()[0]?.child;
+      const pid = child?.pid;
       assert.equal(typeof pid, "number");
 
       ws.send(
@@ -477,11 +479,10 @@ describe("seat idle timeout", () => {
       assert.equal(closed.reason, "idle-timeout");
       assert.equal(h.pool.activeCount, 0);
 
-      // The real proof: the OS process is gone.
-      const deadline = Date.now() + 10_000;
-      while (Date.now() < deadline && isAlive(pid as number)) {
-        await new Promise((r) => setTimeout(r, 50));
-      }
+      // The real proof: the OS process is gone. Awaiting the child's own exit is
+      // the receipt for that, rather than polling a pid that teardown has
+      // already been asked to reap.
+      await child?.exited;
       assert.equal(isAlive(pid as number), false, "the harness child outlived its idle timeout");
     } finally {
       await h.close();
