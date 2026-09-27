@@ -6,9 +6,53 @@ import {
   acpCommandArgv,
   parseArgv,
   spawnAcpChild,
+  type AcpChild,
+  type SpawnAcpChildOptions,
 } from "./spawn.js";
 
 const NODE = process.execPath;
+
+// Keeps the child's event loop alive so that only a signal can reap it.
+const KEEP_ALIVE = "setInterval(() => {}, 1000);";
+
+// Emitted by the child on stdout once its SIGTERM handler is installed. The
+// backslashes are escaped so the child receives a literal newline escape rather
+// than a real newline inside its own string literal.
+const REPORT =
+  "const report = () => process.stdout.write('{\"k5Ready\":true}\\n');";
+
+/**
+ * Spawns a child and returns only once it has reported that its own signal
+ * handler is installed.
+ *
+ * Both escalation tests are about what happens to a child that is already
+ * running, so they must not race the child's startup. A SIGTERM that arrives
+ * while node is still booting hits the default disposition and kills it
+ * outright, which makes the test assert the wrong thing: this pair failed
+ * intermittently under load, reporting SIGTERM where SIGKILL was expected,
+ * purely because a loaded machine took longer than the grace window to boot.
+ *
+ * The receipt is a real message on the child's own stream, awaited as an event
+ * rather than slept for, so the precondition is established instead of hoped
+ * for.
+ */
+async function spawnReportingReady(
+  options: SpawnAcpChildOptions,
+): Promise<AcpChild> {
+  const child = await spawnAcpChild(options);
+  const reader = (
+    child.stream.readable as ReadableStream<unknown>
+  ).getReader();
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) {
+      throw new Error("the child exited before reporting that it was ready");
+    }
+    if (JSON.stringify(value) === '{"k5Ready":true}') break;
+  }
+  reader.releaseLock();
+  return child;
+}
 
 describe("ACP_COMMAND parsing", () => {
   it("splits plain argv and collapses runs of whitespace", () => {
@@ -109,11 +153,11 @@ describe("spawnAcpChild", () => {
 
   it("escalates to SIGTERM when the child outlives stdin EOF", async () => {
     // The interval keeps the child's loop alive, so only a signal reaps it.
-    const child = await spawnAcpChild({
+    const child = await spawnReportingReady({
       argv: [
         NODE,
         "-e",
-        "setInterval(() => {}, 1000); process.on('SIGTERM', () => process.exit(7));",
+        `${KEEP_ALIVE}; ${REPORT}; process.on('SIGTERM', () => process.exit(7)); report();`,
       ],
       cwd: process.cwd(),
       exitGraceMs: 200,
@@ -125,8 +169,8 @@ describe("spawnAcpChild", () => {
   });
 
   it("escalates to SIGKILL when SIGTERM is ignored, and reports the signal", async () => {
-    const child = await spawnAcpChild({
-      argv: [NODE, "-e", "setInterval(() => {}, 1000); process.on('SIGTERM', () => {});"],
+    const child = await spawnReportingReady({
+      argv: [NODE, "-e", `${KEEP_ALIVE}; ${REPORT}; process.on('SIGTERM', () => {}); report();`],
       cwd: process.cwd(),
       exitGraceMs: 200,
       exitHardMs: 300,
