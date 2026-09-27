@@ -1,0 +1,192 @@
+import assert from "node:assert/strict";
+import { describe, it } from "node:test";
+import {
+  BrowserCommandSchema,
+  CommandFailureReasonSchema,
+  ServerEventSchema,
+} from "./contracts.js";
+
+describe("browser command contract", () => {
+  const base = { commandId: "c-1" };
+
+  it("accepts every implemented command", () => {
+    const commands = [
+      { ...base, type: "session.open", projectId: "p-1" },
+      {
+        ...base,
+        type: "session.configure",
+        sessionId: "s-1",
+        configOptionId: "model",
+        value: "anthropic/claude",
+      },
+      { ...base, type: "session.prompt", sessionId: "s-1", turnId: "t-1", text: "hi" },
+      { ...base, type: "session.cancel", sessionId: "s-1" },
+      { ...base, type: "session.close", sessionId: "s-1" },
+      {
+        ...base,
+        type: "permission.decide",
+        sessionId: "s-1",
+        requestId: "r-1",
+        optionId: null,
+      },
+    ];
+    for (const command of commands) {
+      const parsed = BrowserCommandSchema.safeParse(command);
+      assert.equal(parsed.success, true, `${command.type} must parse`);
+    }
+  });
+
+  it("rejects an unknown command type rather than ignoring it", () => {
+    const parsed = BrowserCommandSchema.safeParse({ ...base, type: "session.hack" });
+    assert.equal(parsed.success, false);
+  });
+
+  it("rejects unknown keys so a drifted client fails loudly", () => {
+    const parsed = BrowserCommandSchema.safeParse({
+      ...base,
+      type: "session.cancel",
+      sessionId: "s-1",
+      surprise: true,
+    });
+    assert.equal(parsed.success, false, "extra keys must not be stripped silently");
+  });
+
+  it("rejects an empty prompt and an empty session id", () => {
+    assert.equal(
+      BrowserCommandSchema.safeParse({
+        ...base,
+        type: "session.prompt",
+        sessionId: "s-1",
+        turnId: "t-1",
+        text: "",
+      }).success,
+      false,
+    );
+    assert.equal(
+      BrowserCommandSchema.safeParse({ ...base, type: "session.close", sessionId: "" })
+        .success,
+      false,
+    );
+  });
+
+  it("requires a correlation id on every command", () => {
+    assert.equal(
+      BrowserCommandSchema.safeParse({ type: "session.close", sessionId: "s-1" })
+        .success,
+      false,
+    );
+  });
+
+  it("caps prompt length so one command cannot exhaust memory", () => {
+    const parsed = BrowserCommandSchema.safeParse({
+      ...base,
+      type: "session.prompt",
+      sessionId: "s-1",
+      turnId: "t-1",
+      text: "x".repeat(20_001),
+    });
+    assert.equal(parsed.success, false);
+  });
+});
+
+describe("server event contract", () => {
+  it("keeps tool lifecycle separate from the ACP tool status", () => {
+    // ACP 1.5.0 has no `cancelled` status, so a cancelled card must be
+    // expressible without inventing an ACP status value.
+    const parsed = ServerEventSchema.safeParse({
+      type: "tool.updated",
+      sessionId: "s-1",
+      turnId: "t-1",
+      toolCallId: "tool-1",
+      title: "read file",
+      status: "pending",
+      lifecycle: "cancelled",
+    });
+    assert.equal(parsed.success, true);
+    assert.equal(
+      ServerEventSchema.safeParse({
+        type: "tool.updated",
+        sessionId: "s-1",
+        turnId: "t-1",
+        toolCallId: "tool-1",
+        title: "read file",
+        status: "cancelled",
+        lifecycle: "active",
+      }).success,
+      false,
+      "cancelled must not be a valid ACP status",
+    );
+  });
+
+  it("allows a seat failure with no session scope", () => {
+    assert.equal(
+      ServerEventSchema.safeParse({
+        type: "seat.reaped",
+        sessionId: null,
+        reason: "initialize-failed",
+      }).success,
+      true,
+    );
+    assert.equal(
+      ServerEventSchema.safeParse({
+        type: "seat.reaped",
+        reason: "initialize-failed",
+      }).success,
+      false,
+      "sessionId must be present, even when null",
+    );
+  });
+
+  it("bounds the advertised config option inventory", () => {
+    const option = {
+      id: "model",
+      name: "Model",
+      type: "select",
+      current: null,
+      values: [],
+    };
+    assert.equal(
+      ServerEventSchema.safeParse({
+        type: "session.opened",
+        commandId: "c-1",
+        sessionId: "s-1",
+        projectId: "p-1",
+        cwd: "/tmp",
+        configOptions: [option],
+      }).success,
+      true,
+    );
+    assert.equal(
+      ServerEventSchema.safeParse({
+        type: "session.opened",
+        commandId: "c-1",
+        sessionId: "s-1",
+        projectId: "p-1",
+        cwd: "/tmp",
+        configOptions: Array.from({ length: 33 }, () => option),
+      }).success,
+      false,
+      "a harness must not be able to push an unbounded option list",
+    );
+  });
+
+  it("keeps the failure reason enum closed", () => {
+    assert.equal(CommandFailureReasonSchema.safeParse("made-up").success, false);
+    assert.equal(CommandFailureReasonSchema.safeParse("auth-required").success, true);
+  });
+
+  it("distinguishes a k5-side stop from a harness stop reason", () => {
+    for (const stopReason of ["end_turn", "cancelled", "k5-timeout", "k5-cancelled", "k5-error"]) {
+      assert.equal(
+        ServerEventSchema.safeParse({
+          type: "turn.completed",
+          sessionId: "s-1",
+          turnId: "t-1",
+          stopReason,
+        }).success,
+        true,
+        `${stopReason} must be a valid stop reason`,
+      );
+    }
+  });
+});
