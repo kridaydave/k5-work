@@ -29,6 +29,10 @@ jobs:
         run: npm run build
       - name: Unit and contract tests
         run: npm test
+      - name: Browser layer tests
+        # Shared must be built first: the web suite resolves @k5-work/shared
+        # from dist, and a stale contract would silently test the wrong schema.
+        run: npm run build -w shared && npm run test -w apps/web
       - name: Adversarial security tests
         run: npm run test:security -w server
       - name: Office repair gate
@@ -36,6 +40,9 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
       - name: Dev command smoke test
+        env:
+          K5_SERVER_ORIGIN: http://127.0.0.1:8787
+          K5_ALLOWED_ORIGINS: http://127.0.0.1:5173,http://localhost:5173,http://127.0.0.1:4173
         run: |
           set -euo pipefail
           setsid npm run dev > /tmp/k5-work-dev.log 2>&1 &
@@ -47,23 +54,58 @@ jobs:
           trap cleanup_dev EXIT
           curl --fail --silent --show-error --retry 20 --retry-connrefused --retry-delay 1 http://127.0.0.1:8787/health
           curl --fail --silent --show-error --retry 20 --retry-connrefused --retry-delay 1 http://127.0.0.1:5173/
+          # Reached through the Vite proxy, so this proves the Node server owns /api.
           curl --fail --silent --show-error --retry 20 --retry-connrefused --retry-delay 1 http://127.0.0.1:5173/api/projects | python3 -c 'import json,sys; data=json.load(sys.stdin); assert "projects" in data and "currentProjectPath" in data'
           cleanup_dev
           trap - EXIT
       - name: Server health smoke test
+        env:
+          K5_ALLOWED_ORIGINS: http://127.0.0.1:5173,http://localhost:5173,http://127.0.0.1:4173
         run: |
           PORT=8788 HOST=127.0.0.1 node server/dist/index.js > /tmp/k5-work-server.log 2>&1 &
           server_pid=$!
           trap 'kill "$server_pid" 2>/dev/null || true' EXIT
           health=$(curl --fail --silent --show-error --retry 20 --retry-connrefused --retry-delay 1 http://127.0.0.1:8788/health)
           test "$health" = '{"status":"ok"}'
+          # The listener must be gone after SIGTERM, not merely unresponsive.
+          kill "$server_pid"
+          for _ in $(seq 1 30); do
+            kill -0 "$server_pid" 2>/dev/null || break
+            sleep 0.2
+          done
+          if kill -0 "$server_pid" 2>/dev/null; then
+            echo "server did not exit within 6s of SIGTERM" >&2
+            exit 1
+          fi
+          wait "$server_pid" 2>/dev/null || true
+          trap - EXIT
+      - name: Reject a rebound Host header
+        run: |
+          set -euo pipefail
+          PORT=8790 HOST=127.0.0.1 node server/dist/index.js > /tmp/k5-work-host.log 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 40); do
+            curl --silent --fail --output /dev/null http://127.0.0.1:8790/health && break
+            sleep 0.25
+          done
+          code=$(curl --silent --output /dev/null --write-out '%{http_code}' -H 'Host: evil.example:8790' http://127.0.0.1:8790/api/projects)
+          test "$code" = "421"
+          write=$(curl --silent --output /dev/null --write-out '%{http_code}' -X POST -H 'Host: evil.example:8790' -H 'Content-Type: application/json' -d '{"path":"/etc"}' http://127.0.0.1:8790/api/projects/open)
+          test "$write" = "421"
+          ok=$(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:8790/health)
+          test "$ok" = "200"
           kill "$server_pid"
           wait "$server_pid" 2>/dev/null || true
           trap - EXIT
       - name: Reject remote bind by default
+        env:
+          K5_ALLOWED_ORIGINS: http://127.0.0.1:5173,http://localhost:5173,http://127.0.0.1:4173
         run: |
           set +e
           HOST=0.0.0.0 PORT=8789 timeout 5s node server/dist/index.js > /tmp/k5-work-remote-bind.log 2>&1
           code=$?
           set -e
           test "$code" -eq 1
+          # Exit code alone could come from any unrelated failure.
+          grep -q "remote HOST requires ALLOW_REMOTE=true" /tmp/k5-work-remote-bind.log
