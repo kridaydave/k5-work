@@ -3,6 +3,9 @@ node_modules/
 apps/*/node_modules/
 server/node_modules/
 shared/node_modules/
+# A nested lockfile in a workspace creates a second install tree; the root
+# package-lock.json is the single source of truth.
+apps/*/package-lock.json
 
 # builds
 dist/
