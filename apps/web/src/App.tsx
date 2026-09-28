@@ -8,9 +8,16 @@ import {
 import { Markdown } from "@/components/Markdown";
 import { PathPromptModal } from "@/components/PathPromptModal";
 import { Sidebar, type Session } from "@/components/Sidebar";
+import { ShieldCheckIcon } from "@/components/icons";
+import { ToolCard } from "@/components/ToolCard";
 import { Wallpaper } from "@/components/Wallpaper";
 import { WindowChrome } from "@/components/WindowChrome";
-import type { AttachmentRef, ProjectedTranscript } from "@k5-work/shared";
+import type {
+  AttachmentRef,
+  PostureGrant,
+  ProjectedTranscript,
+  ResolvedPostureReport,
+} from "@k5-work/shared";
 import { uploadAttachments } from "@/hooks/useAttachments";
 import { useK5Socket } from "@/hooks/useK5Socket";
 import { useProjects } from "@/hooks/useProjects";
@@ -28,6 +35,41 @@ const DEFAULT_COMPOSER_SETTINGS: ComposerSettings = {
   mode: "",
   permissions: "full",
 };
+
+/** How much of the streamed thought text is shown, oldest characters dropped. */
+const THOUGHT_TAIL_CHARS = 400;
+
+/**
+ * What the seat's harness actually resolved, in words the resolver supports.
+ *
+ * The unverified check comes first and returns early on purpose. An unreadable
+ * posture reaches the browser as `wildcardAllow: true` with nothing behind it,
+ * so a caller that read that flag before asking whether it was earned would
+ * render an unevidenced claim of unrestricted access — which is the exact lie
+ * this replaced. A named list and a blanket wildcard are also not the same fact
+ * and are never phrased the same way.
+ */
+function describePosture(posture: ResolvedPostureReport | null): {
+  summary: string;
+  grants: PostureGrant[];
+} {
+  if (posture === null || !posture.verified) {
+    return { summary: "Permissions not verified for this seat", grants: [] };
+  }
+  if (posture.wildcardAllow) {
+    return { summary: "Every tool allowed, with no scope", grants: [] };
+  }
+  // Every grant is listed, not only the named ones: a `*` grant carrying a
+  // pattern is a subtree allow, and hiding it would understate the posture.
+  const grants = posture.grants;
+  return {
+    summary:
+      grants.length === 1
+        ? "1 permission granted"
+        : `${String(grants.length)} permissions granted`,
+    grants,
+  };
+}
 
 export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
@@ -144,6 +186,20 @@ export default function App() {
   const active = state.entries.length > 0;
   // The existing working dots are reused rather than a new busy prop.
   const pending = state.turnStatus === "running" || state.turnStatus === "cancelling";
+  // One turn's tool rail and nothing historical: the reducer clears it when the
+  // next turn begins, so a card here is always work from the turn on screen.
+  const liveTools = Object.values(state.tools);
+  // Thought deltas accumulate for the whole turn and are never cleared by
+  // `turn.completed`, so the tail is shown while the turn runs and dropped once
+  // the answer is in the transcript. A harness that narrates for minutes must
+  // not be able to push the whole conversation off the screen.
+  const thought = state.thinking.trim();
+  const thinking =
+    thought.length > THOUGHT_TAIL_CHARS ? `…${thought.slice(-THOUGHT_TAIL_CHARS)}` : thought;
+  // Only while a seat is live. With no seat there is no posture to report, and an
+  // empty hero must stay clean, so the unverified line belongs to a session, not
+  // to the screen.
+  const seatPosture = state.session === "open" ? describePosture(state.posture) : null;
 
   // Derived from real state only. k5 has no session history yet, so the sidebar
   // shows the live session and nothing else rather than plausible-looking rows
@@ -403,6 +459,18 @@ export default function App() {
                     </div>
                   ),
                 )}
+                {liveTools.length > 0 ? (
+                  <ul aria-label="Tool calls in this turn" className="flex flex-col gap-1.5">
+                    {liveTools.map((card) => (
+                      <ToolCard key={card.toolCallId} card={card} />
+                    ))}
+                  </ul>
+                ) : null}
+                {pending && thinking.length > 0 ? (
+                  <p className="break-words whitespace-pre-wrap text-[12px] leading-relaxed text-white/35">
+                    {thinking}
+                  </p>
+                ) : null}
                 {pending ? (
                   <div className="flex items-center gap-1.5 py-1" aria-label="The agent is working">
                     {[0, 1, 2].map((dot) => (
@@ -423,6 +491,39 @@ export default function App() {
                 className="mx-auto w-full max-w-[800px] pb-2 text-[12px] text-white/55"
               >
                 {transcriptNote}
+              </div>
+            ) : null}
+
+            {/* A native disclosure, so closing it needs no state and no new
+                component: the affordance the Composer's permissions pill always
+                implied now has a way to show its evidence and a way to put it
+                away. The summary is the claim, the body is the scope. */}
+            {seatPosture ? (
+              <div className="mx-auto w-full max-w-[800px] pb-2 text-[12px] text-white/55">
+                <details>
+                  <summary
+                    className={cn(
+                      "flex w-fit cursor-pointer list-none items-center gap-1.5",
+                      "transition-colors duration-200 hover:text-white/75",
+                    )}
+                  >
+                    <ShieldCheckIcon className="h-3.5 w-3.5 shrink-0 text-white/45" />
+                    <span className="truncate">{seatPosture.summary}</span>
+                  </summary>
+                  {seatPosture.grants.length > 0 ? (
+                    <ul className="mt-1.5 flex flex-col gap-0.5">
+                      {seatPosture.grants.map((grant) => (
+                        <li
+                          key={`${grant.permission} ${grant.pattern}`}
+                          className="break-words text-white/40"
+                        >
+                          <span className="text-white/60">{grant.permission}</span>
+                          <span> — {grant.pattern}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : null}
+                </details>
               </div>
             ) : null}
 

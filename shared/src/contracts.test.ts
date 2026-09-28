@@ -6,7 +6,10 @@ import {
   CommandFailureReasonSchema,
   MAX_ATTACHMENTS,
   MAX_ATTACHMENT_BYTES,
+  MAX_POSTURE_GRANTS,
+  ResolvedPostureSchema,
   ServerEventSchema,
+  SessionPostureEventSchema,
   SessionPromptCommandSchema,
   TurnStartedEventSchema,
 } from "./contracts.js";
@@ -267,8 +270,7 @@ describe("a prompt is capped in bytes, not in characters", () => {
   });
 });
 
-describe("attachments on the wire", () => {
-  const prompt = { commandId: "c-1", type: "session.prompt", sessionId: "s-1", turnId: "t-1", text: "look" };
+describe("attachments on the wire", () => {  const prompt = { commandId: "c-1", type: "session.prompt", sessionId: "s-1", turnId: "t-1", text: "look" };
   const manifestEntry = {
     attachmentId: "att-1",
     name: "screenshot.png",
@@ -370,5 +372,108 @@ describe("attachments on the wire", () => {
     });
     assert.equal(parsed.success, false);
     assert.match(parsed.error?.issues[0]?.message ?? "", /bytes of UTF-8/);
+  });
+});
+
+describe("the resolved posture on the wire", () => {
+  const wildcard = {
+    verified: true,
+    allowedTools: [],
+    wildcardAllow: true,
+    ruleCount: 83,
+    grants: [],
+  };
+  const named = {
+    verified: true,
+    allowedTools: ["read", "external_directory"],
+    wildcardAllow: false,
+    ruleCount: 4,
+    grants: [
+      { permission: "read", pattern: "*" },
+      { permission: "external_directory", pattern: "/tmp/*" },
+    ],
+  };
+
+  it("carries a blanket wildcard and a named grant list as different facts", () => {
+    assert.equal(ResolvedPostureSchema.safeParse(wildcard).success, true);
+    assert.equal(ResolvedPostureSchema.safeParse(named).success, true);
+    // The two must be distinguishable on the wire, or a browser would have to
+    // infer "unrestricted" from a grant list and could get it wrong.
+    assert.notDeepEqual(
+      ResolvedPostureSchema.parse(wildcard).grants,
+      ResolvedPostureSchema.parse(named).grants,
+    );
+  });
+
+  it("keeps the pattern, because the scope is the point", () => {
+    // `external_directory` allowed only under /tmp is a materially different
+    // fact from the same permission allowed everywhere, and collapsing the two
+    // is what made the permissions pill a claim instead of a report.
+    const parsed = ResolvedPostureSchema.parse({
+      ...named,
+      grants: [{ permission: "edit", pattern: ".opencode/plans/*.md" }],
+    });
+    assert.equal(parsed.grants[0]?.pattern, ".opencode/plans/*.md");
+  });
+
+  it("refuses an over-long permission or pattern", () => {
+    assert.equal(
+      ResolvedPostureSchema.safeParse({
+        ...named,
+        grants: [{ permission: "x".repeat(65), pattern: "*" }],
+      }).success,
+      false,
+      "a harness must not be able to push an unbounded permission name",
+    );
+    assert.equal(
+      ResolvedPostureSchema.safeParse({
+        ...named,
+        grants: [{ permission: "read", pattern: "y".repeat(1025) }],
+      }).success,
+      false,
+      "a harness must not be able to push an unbounded pattern",
+    );
+    assert.equal(
+      ResolvedPostureSchema.safeParse({
+        ...named,
+        grants: Array.from({ length: MAX_POSTURE_GRANTS + 1 }, () => ({
+          permission: "read",
+          pattern: "*",
+        })),
+      }).success,
+      false,
+      "the grant list is bounded like every other list on the wire",
+    );
+  });
+
+  it("refuses a posture missing a field the viewer needs to tell it apart", () => {
+    // Without `verified` a viewer cannot distinguish an observed wildcard from
+    // the placeholder an unreadable posture arrives as, which is the whole
+    // reason the field is on the wire at all.
+    const { verified: _dropped, ...withoutVerified } = wildcard;
+    assert.equal(ResolvedPostureSchema.safeParse(withoutVerified).success, false);
+    assert.equal(
+      ServerEventSchema.safeParse({ type: "session.posture", sessionId: "s-1", posture: named }).success,
+      true,
+    );
+    assert.equal(
+      ServerEventSchema.safeParse({ type: "session.posture", sessionId: "s-1" }).success,
+      false,
+      "a posture event with no posture claims nothing and must not parse",
+    );
+  });
+
+  it("scopes the event to a session so a stale report has somewhere to be rejected", () => {
+    const event = { type: "session.posture", sessionId: "s-1", posture: named };
+    assert.equal(SessionPostureEventSchema.safeParse(event).success, true);
+    assert.equal(
+      SessionPostureEventSchema.safeParse({ ...event, sessionId: "" }).success,
+      false,
+    );
+    // Strict, like every other member: an unknown key is drift, not a hint.
+    assert.equal(
+      SessionPostureEventSchema.safeParse({ ...event, surprise: true }).success,
+      false,
+    );
   });
 });

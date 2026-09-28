@@ -475,6 +475,74 @@ export const SessionUpdatedEventSchema = z
   .strict();
 export type SessionUpdatedEvent = z.infer<typeof SessionUpdatedEventSchema>;
 
+/**
+ * One `allow` rule the harness's own resolver reported, with the scope it was
+ * scoped to.
+ *
+ * The pattern is carried because the scope is the whole point: a permission
+ * allowed only for `.opencode/plans/*.md` is a materially different fact from
+ * one allowed everywhere, and a list of bare permission names would collapse
+ * two very different postures into one.
+ */
+export const PostureGrantSchema = z
+  .object({
+    permission: z.string().min(1).max(64),
+    pattern: z.string().min(1).max(1024),
+  })
+  .strict();
+export type PostureGrant = z.infer<typeof PostureGrantSchema>;
+
+/** How many grants one event may carry, so a hostile rule list stays bounded. */
+export const MAX_POSTURE_GRANTS = 256;
+
+/**
+ * What the harness actually resolved, so the browser can report it instead of
+ * asserting a profile it cannot see.
+ *
+ * `verified` is separate from the counts because "the resolver reported a blanket
+ * `*: allow`" and "the resolver could not be read and `full` tolerated it" both
+ * arrive as `wildcardAllow: true` with nothing to back it up. A viewer that only
+ * had the counts would have to render the second as the first, which is the same
+ * unsupported claim this record exists to remove.
+ */
+export const ResolvedPostureSchema = z
+  .object({
+    verified: z.boolean(),
+    /** Named permissions the harness resolves to `allow`. */
+    allowedTools: z.array(z.string().min(1).max(64)).max(MAX_POSTURE_GRANTS),
+    /** True when the harness resolves a blanket `*: allow`. */
+    wildcardAllow: z.boolean(),
+    /** How many permission rules the resolver read. Zero means it read none. */
+    ruleCount: z.number().int().nonnegative(),
+    grants: z.array(PostureGrantSchema).max(MAX_POSTURE_GRANTS),
+  })
+  .strict();
+export type ResolvedPostureReport = z.infer<typeof ResolvedPostureSchema>;
+
+/**
+ * The resolved posture, republished.
+ *
+ * A NEW event rather than a field on `session.opened`, for two reasons. It is
+ * republished on its own when the posture is re-resolved, and adding a required
+ * field to an existing event would break every older stored record and every
+ * hand-written test literal the moment it landed.
+ *
+ * Deliberately NOT in `PERSISTED_EVENT_TYPES`. A posture is a property of the
+ * seat, not of the conversation: it is identical for every turn, so storing it
+ * repeats one unchanging value across the whole log, and a rehydrated
+ * transcript would display the permissions of a harness that has since been
+ * reaped. The live seat reports its own posture, and a view with no live seat
+ * correctly says the posture is unverified.
+ */
+export const SessionPostureEventSchema = z
+  .object({
+    type: z.literal("session.posture"),
+    sessionId: SessionIdSchema,
+    posture: ResolvedPostureSchema,
+  })
+  .strict();
+export type SessionPostureEvent = z.infer<typeof SessionPostureEventSchema>;
+
 // What the harness reports for a project, from a short-lived read. Distinct from
 // a stored session on purpose: these are sessions k5 has no record of, and the
 // sidebar shows them differently rather than pretending they are history.
@@ -548,6 +616,7 @@ export const ServerEventSchema = z.discriminatedUnion("type", [
   SessionLoadedEventSchema,
   SeatReapedEventSchema,
   SessionUpdatedEventSchema,
+  SessionPostureEventSchema,
   ErrorEventSchema,
 ]);
 export type ServerEvent = z.infer<typeof ServerEventSchema>;

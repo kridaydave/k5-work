@@ -17,7 +17,7 @@ import type { TurnCompletedEvent } from "@k5-work/shared";
 type TurnStopReason = TurnCompletedEvent["stopReason"];
 import type { AcpChild } from "./spawn.js";
 import type { Seat, SeatPool } from "./seat-pool.js";
-import type { ResolvedPosture } from "./posture.js";
+import { reportPosture, type ResolvedPosture } from "./posture.js";
 
 /**
  * A well-formed id for "this session is not being recorded". The contract requires
@@ -226,6 +226,25 @@ export function createSessionHandlers(
     const sessionId = state.sessionId;
     if (sessionId === null) return false;
     return emit({ type: "session.configured", sessionId, configOptions: options });
+  };
+
+  /**
+   * Publishes what the harness's own resolver reported for this seat.
+   *
+   * Sent after `session.opened` and never before, because a posture named after
+   * a session the browser has not been told about is a report of nothing. Not
+   * persisted: the recorder filters it out, and a transcript is the wrong home
+   * for a property of the seat. `emit` already swallows a delivery failure, so
+   * this can never fail the open that produced it.
+   *
+   * A null posture means the resolver was skipped for a read that runs no agent
+   * code, so there is nothing to report. It is not turned into a placeholder:
+   * claiming a posture nobody resolved is the failure this whole path guards.
+   */
+  const publishPosture = (posture: ResolvedPosture | null): boolean => {
+    const sessionId = state.sessionId;
+    if (sessionId === null || posture === null) return false;
+    return emit({ type: "session.posture", sessionId, posture: reportPosture(posture) });
   };
 
   const fail = (command: BrowserCommand, err: SeatOpenError): void => {
@@ -510,6 +529,7 @@ export function createSessionHandlers(
         cwd: projectPath,
         configOptions: opened.info.configOptions,
       });
+      publishPosture(opened.posture);
       options.onAudit?.({
         sessionId: state.sessionId,
         action: "session.open",
@@ -1008,7 +1028,7 @@ export function createSessionHandlers(
     }
 
     state.opening = true;
-    let headless: { child: AcpChild; acp: AcpSeat } | null = null;
+    let headless: { child: AcpChild; acp: AcpSeat; posture: ResolvedPosture | null } | null = null;
     try {
       headless = await options.runner.openHeadless({
         projectId: stored.projectId,
@@ -1033,6 +1053,9 @@ export function createSessionHandlers(
       state.acp = headless.acp;
       state.sessionId = info.sessionId;
       state.storeId = command.storeId;
+      // Captured before the handoff below nulls `headless`, so the report is the
+      // one this harness resolved rather than a re-resolution later.
+      const headlessPosture = headless.posture;
       // Ownership has moved to the connection, so neither the finally block nor a
       // later throw may reap a seat the pool now counts as active.
       headless = null;
@@ -1056,6 +1079,10 @@ export function createSessionHandlers(
         cwd: projectPath,
         configOptions: info.configOptions,
       });
+      // A continuation attaches to a harness that resolved its permissions a
+      // moment ago, so the browser is told what that harness actually allows
+      // rather than inheriting the claim from whatever seat it had before.
+      publishPosture(headlessPosture);
       // After the ownership move and wrapped, because a throwing audit sink would
       // otherwise be caught as a load failure while the connection already holds a
       // live seat and the browser has already been told it opened.

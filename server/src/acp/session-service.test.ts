@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { once } from "node:events";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -67,6 +67,12 @@ async function start(options: {
   idleTtlMs?: number;
   /** Wires a real durable store, so recording is exercised end to end. */
   record?: boolean;
+  /**
+   * The rule list a real resolver reports. Omitted means the resolver cannot be
+   * read at all, which is the state every other scenario in this file is already
+   * in: `node debug agent build` is not a thing node does.
+   */
+  postureRules?: unknown;
 } = {}): Promise<Harness> {
   const projectDir = mkdtempSync(path.join(tmpdir(), "k5-session-"));
   if (options.pluginBearing) {
@@ -78,13 +84,17 @@ async function start(options: {
     maxSeats: 4,
     idleTtlMs: options.idleTtlMs ?? 60_000,
   });
+  // A real command string, quoted as the parser expects: ACP_COMMAND is
+  // tokenised shell-style and spawned without a shell, never JSON.
+  const plainHarness = `${JSON.stringify(process.execPath)} ${JSON.stringify(FAKE_AGENT)} ${options.scenario ?? "ok"}`;
+  const acpCommand = options.missingHarness
+    ? "definitely-not-a-real-harness-xyz"
+    : options.postureRules === undefined
+      ? plainHarness
+      : harnessWithResolver(projectDir, options.postureRules, plainHarness);
   const runner = new SeatRunner({
     pool,
-    // A real command string, quoted as the parser expects: ACP_COMMAND is
-    // tokenised shell-style and spawned without a shell, never JSON.
-    acpCommand: options.missingHarness
-      ? "definitely-not-a-real-harness-xyz"
-      : `${JSON.stringify(process.execPath)} ${JSON.stringify(FAKE_AGENT)} ${options.scenario ?? "ok"}`,
+    acpCommand,
     disableLiveSeats: options.disableLiveSeats ?? false,
   });
 
@@ -167,6 +177,32 @@ async function start(options: {
     store,
     children,
   };
+}
+
+/**
+ * A harness command that answers both questions the seat runner asks of it.
+ *
+ * The seat is spawned as the whole argv, and the resolver is spawned as
+ * `argv[0]` with `debug agent build` — one binary, two jobs, so a stand-in has
+ * to be both. `exec` on the seat path means the seat's pid is still the agent's,
+ * so a reap asserted by pid is a reap of the harness and not of a wrapper.
+ */
+function harnessWithResolver(dir: string, rules: unknown, seatArgv: string): string {
+  const fixture = path.join(dir, "resolved-posture.json");
+  const script = path.join(dir, "harness-with-resolver.sh");
+  writeFileSync(fixture, JSON.stringify(rules), "utf8");
+  writeFileSync(
+    script,
+    `#!/bin/sh
+if [ "$1" = "debug" ]; then
+  cat ${JSON.stringify(fixture)}
+  exit 0
+fi
+exec ${seatArgv} "$@"
+`,
+    { mode: 0o755 },
+  );
+  return JSON.stringify(script);
 }
 
 function openCommand(commandId = "c-1") {
@@ -1284,3 +1320,113 @@ async function fspWriteMeta(
   void entries;
   await writeFile(path.join(dir, "meta.json"), `${JSON.stringify(meta)}\n`, "utf8");
 }
+
+describe("the seat's resolved posture reaches the browser", () => {
+  // The OpenCode 1.18.31 shape, minus the wildcard: a named allow list with one
+  // capability scoped to a subtree, which is the case a list of bare permission
+  // names cannot express.
+  const namedRules = {
+    permission: [
+      { permission: "read", action: "allow", pattern: "*" },
+      { permission: "bash", action: "deny", pattern: "*" },
+      { permission: "external_directory", action: "allow", pattern: "/tmp/*" },
+      { permission: "question", action: "ask", pattern: "*" },
+    ],
+  };
+
+  it("publishes the values the resolver actually read", async () => {
+    const h = await start({ postureRules: namedRules });
+    try {
+      const ws = await h.connect("http://127.0.0.1:5173");
+      ws.send(openCommand());
+      const opened = await waitFor(h.events, "session.opened");
+      const posture = await waitFor(h.events, "session.posture");
+      if (opened.type !== "session.opened" || posture.type !== "session.posture") {
+        throw new Error("unreachable");
+      }
+      assert.equal(posture.sessionId, opened.sessionId);
+      // The event must follow the session it describes, or a browser that has not
+      // been told the session exists has nothing to attach the report to.
+      assert.ok(
+        h.events.indexOf(posture) > h.events.indexOf(opened),
+        "the posture report must not precede session.opened",
+      );
+      assert.equal(posture.posture.verified, true);
+      assert.equal(posture.posture.ruleCount, 4, "every rule is counted, allow or not");
+      assert.equal(posture.posture.wildcardAllow, false);
+      // A deny and an ask are not grants, so naming them as permissions the
+      // harness may use would be the opposite of what the resolver said.
+      assert.deepEqual(posture.posture.allowedTools, ["read", "external_directory"]);
+      assert.deepEqual(posture.posture.grants, [
+        { permission: "read", pattern: "*" },
+        { permission: "external_directory", pattern: "/tmp/*" },
+      ]);
+      ws.close();
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("reports a blanket wildcard as its own fact", async () => {
+    const h = await start({
+      postureRules: { permission: [{ permission: "*", action: "allow", pattern: "*" }] },
+    });
+    try {
+      const ws = await h.connect("http://127.0.0.1:5173");
+      ws.send(openCommand());
+      const posture = await waitFor(h.events, "session.posture");
+      if (posture.type !== "session.posture") throw new Error("unreachable");
+      assert.equal(posture.posture.verified, true);
+      assert.equal(posture.posture.wildcardAllow, true);
+      assert.deepEqual(posture.posture.grants, []);
+      ws.close();
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("claims nothing when the resolver could not be read", async () => {
+    // The default harness here is `node`, and `node debug agent build` fails, so
+    // the seat is accepted on `full`'s tolerance of an unreadable posture. That
+    // tolerance hands back `wildcardAllow: true` with nothing behind it, which is
+    // exactly why the wire carries `verified`.
+    const h = await start();
+    try {
+      const ws = await h.connect("http://127.0.0.1:5173");
+      ws.send(openCommand());
+      await waitFor(h.events, "session.opened");
+      const posture = await waitFor(h.events, "session.posture");
+      if (posture.type !== "session.posture") throw new Error("unreachable");
+      assert.equal(posture.posture.verified, false);
+      assert.equal(posture.posture.ruleCount, 0, "no rule was read, so none may be claimed");
+      assert.deepEqual(posture.posture.grants, []);
+      assert.deepEqual(posture.posture.allowedTools, []);
+      ws.close();
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("does not put a seat property in the conversation transcript", async () => {
+    // Deliberate, not an oversight. A posture is identical for every turn, so
+    // storing it repeats one unchanging value across the whole log, and a
+    // rehydrated task would show the permissions of a harness that has since been
+    // reaped. The live seat reports its own; a view with no seat has none.
+    const h = await start({ record: true, postureRules: namedRules });
+    try {
+      const ws = await h.connect("http://127.0.0.1:5173");
+      ws.send(openCommand());
+      await waitFor(h.events, "session.posture");
+      const store = h.store;
+      assert.ok(store !== null);
+      await store.flushMeta(store.list()[0]!.storeId);
+      const page = await store.read(store.list()[0]!.storeId, null);
+      const types = page.events.map((e) => e.event.type);
+      assert.ok(!types.includes("session.posture"), `recorded: ${types.join(", ")}`);
+      assert.ok(types.includes("session.opened"), "the session itself is still durable");
+      ws.close();
+    } finally {
+      await h.close();
+    }
+  });
+});

@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import type { AccessProfile } from "@k5-work/shared";
+import type { AccessProfile, ResolvedPostureReport } from "@k5-work/shared";
 import { isPostureAcceptable } from "@k5-work/shared";
 
 export class PostureUnverifiableError extends Error {
@@ -24,24 +24,32 @@ export class PostureTooWeakError extends Error {
   }
 }
 
-export interface AllowedGrant {
-  permission: string;
-  pattern: string;
-}
+/**
+ * The resolver's own result, derived from the wire schema rather than restated
+ * beside it.
+ *
+ * Two independent declarations of the same record would drift the first time a
+ * field was added on one side, and the drift would be silent: the wire is
+ * validated by Zod, so a stale copy would fail at the boundary and the report
+ * the operator sees would just stop arriving. Deriving makes that impossible.
+ * The wire adds `verified`, which is not the resolver's business to decide.
+ */
+export type ResolvedPosture = Omit<ResolvedPostureReport, "verified">;
 
-export interface ResolvedPosture {
-  /** Named permissions the harness resolves to `allow`. */
-  allowedTools: string[];
-  /** True when the harness resolves a blanket `*: allow`. */
-  wildcardAllow: boolean;
-  ruleCount: number;
-  /**
-   * The allow rules with their patterns, so a refusal can name the scope that
-   * caused it. A permission allowed only for `.opencode/plans/*.md` is a very
-   * different fact from one allowed everywhere, and the operator needs to see
-   * which one was actually resolved.
-   */
-  grants: AllowedGrant[];
+export type AllowedGrant = ResolvedPosture["grants"][number];
+
+/**
+ * The reportable form of a resolved posture.
+ *
+ * `ruleCount === 0` is the honest discriminator between "resolved" and
+ * "assumed": `resolvePosture` refuses a rule list with no readable allow grant,
+ * so every posture it returns counted at least one rule, and the only zero-count
+ * posture in existence is the one `verifyPosture` substitutes for `full` when the
+ * resolver could not be read at all. Its `wildcardAllow: true` is a promise to
+ * paper over the gap, and a viewer must not be shown it as an observed grant.
+ */
+export function reportPosture(posture: ResolvedPosture): ResolvedPostureReport {
+  return { ...posture, verified: posture.ruleCount > 0 };
 }
 
 export interface ResolvePostureOptions {

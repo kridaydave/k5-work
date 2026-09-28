@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import type { ServerEvent } from "./contracts.js";
+import type { ResolvedPostureReport, ServerEvent } from "./contracts.js";
 import {
   INITIAL_VIEW_STATE,
   applyServerEvent,
@@ -384,4 +384,65 @@ it("a title does not leak from one session into the next", () => {
   });
   state = applyServerEvent(state, { type: "session.closed", sessionId: "s-2", reason: "client-request" });
   assert.equal(state.sessionTitle, null, "a closed session drops its title");
+});
+
+describe("the resolved posture follows the session it belongs to", () => {
+  const reported: ResolvedPostureReport = {
+    verified: true,
+    allowedTools: ["read"],
+    wildcardAllow: false,
+    ruleCount: 4,
+    grants: [{ permission: "read", pattern: "*" }],
+  };
+  const postureEvent: ServerEvent = { type: "session.posture", sessionId: "s-1", posture: reported };
+
+  it("lands in view state when the report is for the live session", () => {
+    const state = applyServerEvent(applyServerEvent(INITIAL_VIEW_STATE, opened), postureEvent);
+    assert.deepEqual(state.posture, reported);
+  });
+
+  it("rejects a report for a different session instead of overwriting", () => {
+    // The dangerous half: a report for a reaped seat landing after a new one
+    // opened would otherwise be shown as the new session's permissions, which is
+    // the same unevidenced claim this feature exists to remove.
+    let state = applyServerEvent(INITIAL_VIEW_STATE, opened);
+    state = applyServerEvent(state, postureEvent);
+    const stale = applyServerEvent(state, {
+      type: "session.posture",
+      sessionId: "s-0",
+      posture: { ...reported, verified: false, wildcardAllow: true, grants: [], allowedTools: [] },
+    });
+    assert.deepEqual(stale.posture, reported, "a stale posture must not overwrite a newer one");
+    assert.equal(stale, state, "and it must not even produce a new state object");
+  });
+
+  it("drops it when the session closes and when the seat is reaped", () => {
+    let state = applyServerEvent(INITIAL_VIEW_STATE, opened);
+    state = applyServerEvent(state, postureEvent);
+    assert.deepEqual(applyServerEvent(state, { type: "session.closed", sessionId: "s-1", reason: "client-request" }).posture, null);
+    state = applyServerEvent(applyServerEvent(INITIAL_VIEW_STATE, opened), postureEvent);
+    assert.deepEqual(applyServerEvent(state, { type: "seat.reaped", sessionId: "s-1", reason: "child-failure" }).posture, null);
+  });
+
+  it("does not survive into the next session", () => {
+    let state = applyServerEvent(INITIAL_VIEW_STATE, opened);
+    state = applyServerEvent(state, postureEvent);
+    state = applyServerEvent(state, {
+      type: "session.opened",
+      commandId: "c-2",
+      sessionId: "s-2",
+      storeId: "11111111-1111-4111-8111-111111111111",
+      projectId: "p-1",
+      cwd: "/tmp/p",
+      configOptions: [],
+    });
+    assert.equal(state.posture, null, "a new session must not inherit a posture");
+    // And a new task clears it too, which is where a user watches for it.
+    assert.equal(resetSession(state).posture, null);
+  });
+
+  it("has nothing to show for a session that never reported one", () => {
+    assert.equal(INITIAL_VIEW_STATE.posture, null);
+    assert.equal(applyServerEvent(INITIAL_VIEW_STATE, opened).posture, null);
+  });
 });

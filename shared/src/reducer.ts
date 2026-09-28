@@ -2,6 +2,7 @@ import type {
   BrowserCommand,
   CommandFailureReason,
   ConfigOptionSummary,
+  ResolvedPostureReport,
   ServerEvent,
   ToolLifecycle,
   ToolStatus,
@@ -60,6 +61,13 @@ export interface K5ViewState {
    * not recording, which the browser must not try to fetch.
    */
   storeId: string | null;
+  /**
+   * What the live seat's harness actually resolved for permissions, or null when
+   * no seat has reported one. Null is the honest answer for a view with no live
+   * seat: the transcript is not a record of the posture, so a rehydrated task has
+   * none and must say so rather than fall back to a hardcoded label.
+   */
+  posture: ResolvedPostureReport | null;
   /** The reason a session failed or closed, for a visible reverse state. */
   sessionReason: CommandFailureReason | null;
   sessionMessage: string | null;
@@ -79,6 +87,7 @@ export const INITIAL_VIEW_STATE: K5ViewState = {
   sessionId: null,
   sessionTitle: null,
   storeId: null,
+  posture: null,
   sessionReason: null,
   sessionMessage: null,
   activeTurnId: null,
@@ -271,10 +280,21 @@ export function applyServerEvent(
         // session showed the previous one's name until that update arrived, and
         // forever if the harness never sends one.
         sessionTitle: null,
+        // A posture belongs to the seat that resolved it, exactly as the title
+        // does. Cleared rather than held, because the new seat's own report
+        // arrives on its own event and a stale grant list would otherwise be
+        // shown as this session's permissions.
+        posture: null,
         sessionReason: null,
         sessionMessage: null,
         configOptions: event.configOptions,
       };
+
+    case "session.posture":
+      // Scoped like every other session event, and this is what stops a late
+      // report for a reaped seat from becoming the new session's permissions.
+      if (state.sessionId !== event.sessionId) return state;
+      return { ...state, posture: event.posture };
 
     case "session.configured":
       if (state.sessionId !== event.sessionId) return state;
@@ -287,6 +307,7 @@ export function applyServerEvent(
         sessionId: null,
         sessionTitle: null,
         storeId: null,
+        posture: null,
         turnStatus: isTurnTerminal(state.turnStatus) ? state.turnStatus : "idle",
         turnReason: null,
         thinking: "",
@@ -326,6 +347,7 @@ export function applyServerEvent(
         sessionId: null,
         sessionTitle: null,
         storeId: null,
+        posture: null,
         turnStatus: isTurnTerminal(state.turnStatus) ? state.turnStatus : "idle",
         turnReason: null,
         thinking: "",

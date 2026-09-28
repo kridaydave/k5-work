@@ -17,6 +17,7 @@ import {
   PostureTooWeakError,
   PostureUnverifiableError,
   verifyPosture,
+  type ResolvedPosture,
 } from "./posture.js";
 import { describeFinding, findPluginSignals } from "./plugin-guard.js";
 import { AcpSeat, type AcpSeatInfo, type SeatStreamEvent } from "./acp-seat.js";
@@ -74,6 +75,8 @@ export interface OpenSeatResult {
   acp: AcpSeat;
   info: AcpSeatInfo;
   profile: AccessProfile;
+  /** What the resolver reported for this seat, so it can be published. */
+  posture: ResolvedPosture;
 }
 
 export interface SeatRunnerOptions {
@@ -126,7 +129,13 @@ export class SeatRunner {
     access: AccessProfile["label"];
     /** Skips the posture resolver, for a read that runs no agent code. */
     skipPosture?: boolean;
-  }): Promise<{ profile: AccessProfile; argv: string[]; env: NodeJS.ProcessEnv }> {
+  }): Promise<{
+    profile: AccessProfile;
+    argv: string[];
+    env: NodeJS.ProcessEnv;
+    /** What the resolver reported, or null only when it was skipped. */
+    posture: ResolvedPosture | null;
+  }> {
     if (this.options.disableLiveSeats) {
       throw new SeatOpenError(
         "live-seats-disabled",
@@ -165,10 +174,14 @@ export class SeatRunner {
 
     const env = this.options.env ?? process.env;
     if (input.skipPosture === true) {
-      return { profile, argv, env };
+      return { profile, argv, env, posture: null };
     }
+    // Kept, not merely checked: the service has to report what was actually
+    // resolved, and re-resolving here would be a second subprocess answering a
+    // question the seat was already accepted on.
+    let posture: ResolvedPosture;
     try {
-      await verifyPosture({
+      posture = await verifyPosture({
         command: argv[0],
         cwd: input.projectPath,
         env,
@@ -187,17 +200,27 @@ export class SeatRunner {
       }
       throw err;
     }
-    return { profile, argv, env };
+    return { profile, argv, env, posture };
   }
 
   async open(
     request: OpenSeatOptions,
     onEvent: ((turnId: string, event: SeatStreamEvent) => void) | null = null,
   ): Promise<OpenSeatResult> {
-    const { profile, argv, env } = await this.gate({
+    const { profile, argv, env, posture } = await this.gate({
       projectPath: request.projectPath,
       access: request.access,
     });
+    // Unreachable while `gate` is the only producer, and refused rather than
+    // tolerated if that ever stops being true: a seat with no resolved posture is
+    // a seat whose permissions nobody read, which is the one thing this whole
+    // path exists to prevent.
+    if (posture === null) {
+      throw new SeatOpenError(
+        "posture-unverifiable",
+        "the seat opened without a resolved permission posture",
+      );
+    }
     const key = {
       harness: request.harness,
       projectId: request.projectId,
@@ -241,6 +264,7 @@ export class SeatRunner {
           capabilities: acp.capabilities,
         },
         profile,
+        posture,
       };
     } catch (err) {
       // Release the reservation *and* reap the child on every failure path, or
@@ -275,7 +299,13 @@ export class SeatRunner {
      * false, because from that point the harness will run a prompt.
      */
     readOnly?: boolean;
-  }): Promise<{ child: AcpChild; acp: AcpSeat; profile: AccessProfile }> {
+  }): Promise<{
+    child: AcpChild;
+    acp: AcpSeat;
+    profile: AccessProfile;
+    /** Null only for a read that skipped the resolver; a live seat has one. */
+    posture: ResolvedPosture | null;
+  }> {
     if (this.headlessInFlight >= MAX_INFLIGHT_HEADLESS) {
       throw new SeatOpenError(
         "seat-cap",
@@ -284,7 +314,7 @@ export class SeatRunner {
     }
     this.headlessInFlight += 1;
     try {
-      const { profile, argv, env } = await this.gate({
+      const { profile, argv, env, posture } = await this.gate({
         projectPath: input.projectPath,
         access: input.access ?? "full",
         // The posture resolver is a subprocess that measured 3.5 s on this
@@ -307,7 +337,7 @@ export class SeatRunner {
           },
           null,
         );
-        return { child, acp, profile };
+        return { child, acp, profile, posture };
       } catch (err) {
         // The child is the only thing that can leak; there is no reservation.
         await child.close();

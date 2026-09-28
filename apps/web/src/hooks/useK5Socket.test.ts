@@ -1,7 +1,7 @@
 import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MAX_ATTACHMENTS } from "@k5-work/shared";
-import type { ServerEvent } from "@k5-work/shared";
+import type { ResolvedPostureReport, ServerEvent } from "@k5-work/shared";
 import type { Scheduler } from "@k5-work/shared";
 import { useK5Socket } from "./useK5Socket";
 
@@ -395,6 +395,82 @@ describe("useK5Socket", () => {
       });
     });
     expect(result.current.state.configOptions[0].current).toBe("opencode/space-bunny-free");
+  });
+});
+
+describe("the resolved posture on the socket", () => {
+  const posture: ResolvedPostureReport = {
+    verified: true,
+    allowedTools: ["read"],
+    wildcardAllow: false,
+    ruleCount: 4,
+    grants: [{ permission: "read", pattern: "/tmp/*" }],
+  };
+
+  async function openSeat() {
+    const view = await mount();
+    const socket = view.sockets.at(-1)!;
+    act(() => {
+      socket.receive({
+        type: "session.opened",
+        commandId: "c-1",
+        sessionId: "s-1",
+        storeId: "11111111-1111-4111-8111-111111111111",
+        projectId: "p-1",
+        cwd: "/tmp/p",
+        configOptions: [],
+      });
+    });
+    return { ...view, socket };
+  }
+
+  it("lands in view state with the scope intact", async () => {
+    const { result, socket } = await openSeat();
+    act(() => socket.receive({ type: "session.posture", sessionId: "s-1", posture }));
+    // The pattern has to survive the wire: `read` allowed only under /tmp is a
+    // different fact from `read` allowed everywhere, and the browser cannot
+    // recover it from a bare permission list.
+    expect(result.current.state.posture).toEqual(posture);
+  });
+
+  it("clears it when the session closes", async () => {
+    const { result, socket } = await openSeat();
+    act(() => socket.receive({ type: "session.posture", sessionId: "s-1", posture }));
+    act(() => socket.receive({ type: "session.closed", sessionId: "s-1", reason: "client-request" }));
+    expect(result.current.state.posture).toBeNull();
+  });
+
+  it("does not let a new session inherit the previous one", async () => {
+    const { result, socket } = await openSeat();
+    act(() => socket.receive({ type: "session.posture", sessionId: "s-1", posture }));
+    act(() => {
+      socket.receive({
+        type: "session.opened",
+        commandId: "c-2",
+        sessionId: "s-2",
+        storeId: "11111111-1111-4111-8111-111111111111",
+        projectId: "p-1",
+        cwd: "/tmp/p",
+        configOptions: [],
+      });
+    });
+    // The second seat has reported nothing yet, and the honest answer to that is
+    // "unknown" — not the previous harness's grant list.
+    expect(result.current.state.posture).toBeNull();
+  });
+
+  it("ignores a report that arrives for a seat the browser is not on", async () => {
+    const { result, socket } = await openSeat();
+    act(() => socket.receive({ type: "session.posture", sessionId: "s-1", posture }));
+    act(() => {
+      socket.receive({ type: "seat.reaped", sessionId: "s-1", reason: "child-failure" });
+      socket.receive({
+        type: "session.posture",
+        sessionId: "s-1",
+        posture: { ...posture, verified: false, wildcardAllow: true },
+      });
+    });
+    expect(result.current.state.posture).toBeNull();
   });
 });
 
