@@ -87,6 +87,43 @@ const DEFAULT_TURN_TIMEOUT_MS = 30 * 60_000;
 // so without a local escape and this bound a cancel would hang forever.
 const CANCEL_DRAIN_MS = 5_000;
 
+/**
+ * Arms the drain bound the moment this turn's signal aborts, and disarms it
+ * again if the turn finishes on its own.
+ *
+ * The signal fires for a user cancel and for the turn timeout, and in both cases
+ * the SDK has only *sent* `$/cancelRequest` — it never settles the local request,
+ * so without a local escape the promise hangs and the seat is pinned open
+ * forever. The bound therefore has to start at the abort, not at the prompt.
+ */
+function armDrainOnAbort(turn: ActiveTurn, onDrain: () => void): void {
+  let timer: NodeJS.Timeout | null = null;
+  const arm = (): void => {
+    if (timer !== null) return;
+    timer = setTimeout(() => {
+      if (turn.settled) return;
+      onDrain();
+    }, CANCEL_DRAIN_MS);
+    timer.unref();
+  };
+  if (turn.controller.signal.aborted) {
+    arm();
+    return;
+  }
+  turn.controller.signal.addEventListener("abort", arm, { once: true });
+  // A turn that ends normally must not leave a timer holding the loop open.
+  // `finished` rejects when the turn fails, so both outcomes are handled: a bare
+  // `finally` here would manufacture a second rejected promise with no handler.
+  const disarm = (): void => {
+    if (timer !== null) {
+      clearTimeout(timer);
+      return;
+    }
+    turn.controller.signal.removeEventListener("abort", arm);
+  };
+  void turn.finished.then(disarm, disarm);
+}
+
 interface ActiveTurn {
   turnId: string;
   controller: AbortController;
@@ -111,6 +148,19 @@ export class AcpSeat {
   private session: ActiveSession | null = null;
   private info: AcpSeatInfo | null = null;
   private activeTurn: ActiveTurn | null = null;
+  /**
+   * Turn ids that were cancelled and may still owe the harness a `stop`.
+   *
+   * Ordered by cancellation, which is the order the harness's stops will arrive
+   * in. A stop is matched from the front of this list rather than settled against
+   * the live turn, which is what stops a cancelled turn's completion from ending
+   * the turn that came after it.
+   */
+  private readonly abandonedTurns: string[] = [];
+  /** True while the seat's one pump is consuming the session's update stream. */
+  private pumpRunning = false;
+  /** Why the stream broke, kept so the next turn can be refused with the reason. */
+  private streamFailure: unknown = null;
   /** Outstanding update pump, awaited so a new turn never steals stale updates. */
   private pumpDone: Promise<void> = Promise.resolve();
   private poisonReason: string | null = null;
@@ -455,32 +505,56 @@ export class AcpSeat {
    * drops the last chunks. The SDK's `nextUpdate()` is the documented source of
    * truth, yielding updates until a `stop` message carrying the response.
    */
-  private async pumpUpdates(turn: ActiveTurn): Promise<void> {
+  /**
+   * The seat's single consumer of the harness's update stream.
+   *
+   * One pump for the seat's lifetime, not one per turn. `nextUpdate()` reads a
+   * queue that belongs to the ACP *session*, so a pump per turn means a cancelled
+   * turn's pump is still waiting when the next turn begins, receives that turn's
+   * first updates, drops them, and poisons the seat. This was masked by a
+   * force-settle timer; with the timer fixed, the misrouting showed up as a
+   * second turn that streamed a few deltas and never finished.
+   *
+   * Routing is by arrival order, which is the only correlation ACP gives us: the
+   * SDK enqueues a `stop` for each prompt in the order the prompts were sent, so
+   * a stop still owed to a cancelled turn is matched to that turn from the front
+   * of the abandoned list rather than settled against whichever turn is live.
+   */
+  private async pumpUpdates(): Promise<void> {
     const session = this.session;
     if (!session) {
-      turn.fail(new AcpSeatError("seat has no ACP session"));
-      return;
+      throw new AcpSeatError("seat has no ACP session");
     }
     for (;;) {
       let message: Awaited<ReturnType<ActiveSession["nextUpdate"]>>;
       try {
         message = await session.nextUpdate();
       } catch (err) {
-        turn.fail(err);
+        // The stream broke. Whoever is live owns the failure; a seat with no live
+        // turn has nothing to settle, so the reason is kept for the next opener.
+        this.streamFailure = err;
+        this.activeTurn?.fail(err);
         return;
       }
       if (message.kind === "stop") {
-        turn.settle(normalizeStopReason(message.response?.stopReason));
-        return;
+        // The pump does NOT settle on `stop`. The SDK correlates a prompt's
+        // response to that prompt, so `session.prompt()` resolving is the only
+        // trustworthy terminal signal. A `stop` read here is unattributable: a
+        // harness that ignores `$/cancelRequest` never sends one for the
+        // cancelled turn, so the next `stop` on the wire belongs to the live turn
+        // and matching it against a list of abandoned turns would swallow the
+        // live turn's completion and leave the browser spinning.
+        continue;
       }
-      // Once the turn is settled, further updates belong to a harness that did
-      // not honour the cancel. The pump keeps draining so the queue is not
-      // misattributed, but it stops forwarding and poisons the seat if the
-      // harness never stops.
-      if (turn.settled) {
-        this.poisonReason = "harness kept streaming after a cancel";
-        turn.settle = () => {};
-        return;
+      const turn = this.activeTurn;
+      if (turn === null || turn.settled) {
+        // A straggler for a turn that has ended. Dropped rather than forwarded,
+        // and forgiven while a cancelled turn is still inside its drain window:
+        // the harness is entitled a few seconds to finish what it already sent.
+        if (this.abandonedTurns.length === 0) {
+          this.poisonReason = "harness kept streaming after a cancel";
+        }
+        continue;
       }
       const verdict = classifySessionUpdate(message.update);
       try {
@@ -507,7 +581,7 @@ export class AcpSeat {
         // An emit that throws must end the turn, not wedge the pump: otherwise
         // the browser's working dots spin forever with no terminal event.
         turn.fail(err);
-        return;
+        continue;
       }
       // ignore and suppress verdicts carry no browser-visible state by design.
     }
@@ -527,9 +601,10 @@ export class AcpSeat {
       throw new AcpSeatError(`seat is unusable: ${this.poisonReason}`);
     }
     if (this.activeTurn) throw new AcpSeatError("a turn is already running on this seat");
-    // A previous turn's pump may still be draining; a new turn must not steal
-    // its updates.
-    await this.pumpDone.catch(() => undefined);
+    // No await on the previous pump here. The pump now runs for the seat's whole
+    // lifetime, so waiting for it to finish would hang every prompt after the
+    // first. Updates are routed to whichever turn is active, so a new turn does
+    // not need the old pump to be done; it needs it to be the same pump.
     const session = this.session;
     if (this.context === null || session === null) {
       throw new AcpSeatError("seat has no ACP context");
@@ -582,34 +657,55 @@ export class AcpSeat {
       originalFail(err);
     };
 
-    this.pumpDone = this.pumpUpdates(turn);
-    // Bound the wait so a harness that never acknowledges a cancel cannot pin
-    // the seat open forever.
-    const drainTimer = setTimeout(() => {
-      if (turn.settled) return;
+    // Started once for the seat, not per turn: `nextUpdate()` reads a queue that
+    // belongs to the session, so a second pump would race the first for messages
+    // and a cancelled turn's pump would eat the next turn's opening deltas.
+    if (!this.pumpRunning) {
+      this.pumpRunning = true;
+      this.pumpDone = this.pumpUpdates().catch((err: unknown) => {
+        this.streamFailure = err;
+      });
+    } else if (this.streamFailure !== null) {
+      // The stream died while this seat sat idle. Refusing here beats opening a
+      // turn that can never receive a completion.
+      throw new AcpSeatError(`the harness update stream ended: ${String(this.streamFailure)}`);
+    }
+    // NO drain timer here. This one was armed at the start of every turn, so any
+    // turn slower than 5s was force-settled as "cancelled" with its answer
+    // truncated mid-word, and the seat was poisoned for good. It only ever
+    // belonged after an abort.
+    armDrainOnAbort(turn, () => {
       this.poisonReason = "harness did not stop after a cancel";
       turn.settle("cancelled");
-    }, CANCEL_DRAIN_MS);
-    drainTimer.unref();
+    });
 
     try {
       // Must go through ActiveSession.prompt, not a raw request: that is what
-      // registers the turn with the SDK's update router and queues the `stop`
-      // message the pump above is waiting for. A raw ctx.request would leave
-      // nextUpdate() hanging forever.
+      // registers the turn with the SDK's update router. A raw ctx.request would
+      // leave nextUpdate() hanging forever.
+      //
+      // The response is the terminal signal, not the pump's `stop` message. The
+      // SDK matches a prompt's response to that prompt, so this is the only
+      // correlation available; a `stop` read off the shared queue could belong to
+      // a turn that was already cancelled.
       void session
         .prompt(blocks, { cancellationSignal: controller.signal })
-        .catch((err: unknown) => {
-          if (err instanceof RequestError && err.code === -32800) {
-            settle("cancelled");
-            return;
-          }
-          if (controller.signal.aborted) {
-            settle("cancelled");
-            return;
-          }
-          fail(err);
-        });
+        .then(
+          (response) => {
+            settle(normalizeStopReason(response?.stopReason));
+          },
+          (err: unknown) => {
+            if (err instanceof RequestError && err.code === -32800) {
+              settle("cancelled");
+              return;
+            }
+            if (controller.signal.aborted) {
+              settle("cancelled");
+              return;
+            }
+            fail(err);
+          },
+        );
       return await finished;
     } catch (err) {
       if (err instanceof RequestError && err.code === -32000) {
@@ -619,7 +715,6 @@ export class AcpSeat {
       throw err;
     } finally {
       clearTimeout(timer);
-      clearTimeout(drainTimer);
       if (this.activeTurn === turn) this.activeTurn = null;
     }
   }
@@ -634,6 +729,9 @@ export class AcpSeat {
   cancel(): boolean {
     const turn = this.activeTurn;
     if (!turn || turn.settled) return false;
+    // Recorded before the abort, so the pump can match this turn's eventual stop
+    // to this turn rather than settling the live one that replaced it.
+    this.abandonedTurns.push(turn.turnId);
     turn.controller.abort();
     turn.settle("cancelled");
     return true;
