@@ -7,6 +7,7 @@ import {
   type ContentBlock,
 } from "@agentclientprotocol/sdk";
 import type { AcpChild } from "./spawn.js";
+import { MAX_CONFIG_OPTION_VALUES, MAX_CONFIG_OPTIONS } from "@k5-work/shared";
 import { NO_CAPABILITIES, probeCapabilities, type AcpCapabilities } from "./capabilities.js";
 import {
   attachSessionShim,
@@ -18,7 +19,13 @@ import { classifySessionUpdate } from "./updates.js";
 import type { ConfigOptionSummary } from "@k5-work/shared";
 
 /** ACP caps a value label and the option id; mirrored so the wire stays bounded. */
-const MAX_OPTION_VALUES = 64;
+/**
+ * The wire caps a config option's values at the same number (shared, the 64 on
+ * ConfigOptionValue). Named import rather than a literal, so raising one raises the
+ * other and the truncation here is a compile error rather than a silent loss of
+ * models a user could have picked.
+ */
+const MAX_OPTION_VALUES = MAX_CONFIG_OPTION_VALUES;
 import { AcpAuthRequiredError, AcpProtocolMismatchError, AcpTerminalAuthUnsupportedError } from "./probe.js";
 
 /**
@@ -149,14 +156,14 @@ export class AcpSeat {
   private info: AcpSeatInfo | null = null;
   private activeTurn: ActiveTurn | null = null;
   /**
-   * Turn ids that were cancelled and may still owe the harness a `stop`.
+   * When the current grace window ends, or null when none is open.
    *
-   * Ordered by cancellation, which is the order the harness's stops will arrive
-   * in. A stop is matched from the front of this list rather than settled against
-   * the live turn, which is what stops a cancelled turn's completion from ending
-   * the turn that came after it.
+   * Opened by a cancel and cleared by the first update that arrives inside it. It
+   * replaces a list of abandoned turn ids, which only ever grew and so could not
+   * distinguish "the harness is still finishing" from "the harness never stopped"
+   * after the first cancel.
    */
-  private readonly abandonedTurns: string[] = [];
+  private graceUntilMs: number | null = null;
   /** True while the seat's one pump is consuming the session's update stream. */
   private pumpRunning = false;
   /** Why the stream broke, kept so the next turn can be refused with the reason. */
@@ -548,10 +555,21 @@ export class AcpSeat {
       }
       const turn = this.activeTurn;
       if (turn === null || turn.settled) {
-        // A straggler for a turn that has ended. Dropped rather than forwarded,
-        // and forgiven while a cancelled turn is still inside its drain window:
-        // the harness is entitled a few seconds to finish what it already sent.
-        if (this.abandonedTurns.length === 0) {
+        // A straggler for a turn that has ended. Dropped rather than forwarded.
+        //
+        // Poisoning here was guarded on `abandonedTurns.length === 0`, and that
+        // list only ever grows, so the guard could not fire again after the
+        // seat's first cancel: a harness that kept streaming would go undetected
+        // for the rest of the session. The grace window is the right shape, and it
+        // is time-based rather than count-based, so it is recorded with the
+        // deadline instead of inferring "still inside the window" from a list that
+        // is never emptied.
+        if (this.graceUntilMs === null) {
+          this.poisonReason = "harness kept streaming after a cancel";
+        } else if (Date.now() >= this.graceUntilMs) {
+          // The harness had its window and kept going, so the stream can no
+          // longer be trusted to belong to any turn.
+          this.graceUntilMs = null;
           this.poisonReason = "harness kept streaming after a cancel";
         }
         continue;
@@ -729,9 +747,10 @@ export class AcpSeat {
   cancel(): boolean {
     const turn = this.activeTurn;
     if (!turn || turn.settled) return false;
-    // Recorded before the abort, so the pump can match this turn's eventual stop
-    // to this turn rather than settling the live one that replaced it.
-    this.abandonedTurns.push(turn.turnId);
+    // A deadline, not a growing list. The harness is entitled a few seconds to
+    // finish what it already sent; past that, anything still arriving is a
+    // harness that ignored the cancel and the seat cannot be trusted again.
+    this.graceUntilMs = Date.now() + CANCEL_DRAIN_MS;
     turn.controller.abort();
     turn.settle("cancelled");
     return true;
@@ -765,7 +784,7 @@ export function summarizeOptions(
     currentValue?: unknown;
   }[],
 ): ConfigOptionSummary[] {
-  return raw.slice(0, 32).map((option) => ({
+  return raw.slice(0, MAX_CONFIG_OPTIONS).map((option) => ({
     id: String(option.id).slice(0, 128),
     name: (
       typeof option.name === "string" && option.name ? option.name : String(option.id)

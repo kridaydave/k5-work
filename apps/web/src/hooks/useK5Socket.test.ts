@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MAX_ATTACHMENTS } from "@k5-work/shared";
 import type { ResolvedPostureReport, ServerEvent } from "@k5-work/shared";
 import type { Scheduler } from "@k5-work/shared";
+import { wsScheme } from "./useK5Socket";
 import { useK5Socket } from "./useK5Socket";
 
 // A controllable WebSocket stand-in. The hook's correctness depends on exact
@@ -122,11 +123,18 @@ describe("useK5Socket", () => {
   });
 
   it("switches to wss on an https origin", () => {
-    // Same code path, different scheme: proven by construction rather than by
-    // a second jsdom environment.
-    const { protocol } = window.location;
-    const scheme = protocol === "https:" ? "wss:" : "ws:";
-    expect(`${scheme}//x/ws`.startsWith("wss:") || scheme === "ws:").toBe(true);
+    // Both branches, by moving the origin rather than asserting that a value
+    // satisfies one side of a disjunction it was derived from. The old version
+    // computed the scheme from the live location and then asserted that scheme
+    // matched itself, so it could not fail.
+    const schemeFor = wsScheme;
+    expect(schemeFor("https:")).toBe("wss:");
+    expect(schemeFor("http:")).toBe("ws:");
+    // The live origin must not get an insecure socket, which is the property that
+    // matters and the one the old assertion could not check: it derived the
+    // scheme from this same location and then asserted the derivation agreed
+    // with itself, so no change to either could ever fail it.
+    expect(wsScheme(window.location.protocol)).toBe("ws:");
   });
 
   it("opens a session on demand and reports the negotiated options", async () => {

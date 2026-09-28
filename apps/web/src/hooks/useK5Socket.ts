@@ -23,9 +23,12 @@ import {
 // One socket per tab. The URL is same-origin and relative on purpose: a
 // hardcoded host breaks immediately under a tunnel or a remote origin, which is
 // the mistake AGENTS.md calls out for frontend origins.
-function socketUrl(): string {
-  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-  return `${protocol}//${window.location.host}/ws`;
+export function wsScheme(originProtocol: string): "wss:" | "ws:" {
+  return originProtocol === "https:" ? "wss:" : "ws:";
+}
+
+export function socketUrl(): string {
+  return `${wsScheme(window.location.protocol)}//${window.location.host}/ws`;
 }
 
 /** How long a socket must stay open before it counts as a working connection. */

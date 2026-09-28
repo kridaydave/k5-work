@@ -102,7 +102,7 @@ export default function App() {
   }, []);
   const [rehydrated, setRehydrated] = useState<ProjectedTranscript | null>(null);
   const k5 = useK5Socket({ rehydrate });
-  const { state } = k5;
+  const { state, adoptTranscript } = k5;
   // The Composer clears its textarea and its chips once the parent confirms the
   // submission went out. On the lazy-open path that confirmation cannot happen
   // inline — the seat is still opening when onSend returns — so the whole
@@ -126,10 +126,17 @@ export default function App() {
   // A stored transcript replaces the visible entries until the live socket takes
   // over. Hydrated through the reducer so the shape the socket appends to is the
   // one the store produced.
+  //
+  // `adoptTranscript` is destructured out and depended on directly. Depending on
+  // the whole `k5` object was an unbounded render loop: the hook returns a bare
+  // object literal, so it is a new identity every render, and `hydrateTranscript`
+  // always returns a fresh state, so the call is never a referential no-op. The
+  // effect re-fired, re-rendered, and spun the tab's CPU until React tore it down.
+  // `adoptTranscript` is a `useCallback` with no dependencies, so it is stable.
   useEffect(() => {
     if (rehydrated === null) return;
-    k5.adoptTranscript(rehydrated);
-  }, [rehydrated, k5]);
+    adoptTranscript(rehydrated);
+  }, [rehydrated, adoptTranscript]);
 
   /**
    * Puts a submission the parent could not deliver back into the Composer.

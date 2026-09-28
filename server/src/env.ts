@@ -2,6 +2,17 @@ import path from "node:path";
 import os from "node:os";
 import { isIP } from "node:net";
 
+/**
+ * The server-wide ceiling on how long one request may take.
+ *
+ * Shared rather than repeated: the attachment upload answers a stalled client with
+ * its own 408 after this long, and the ordering is load-bearing. Node kills the
+ * socket at `requestTimeout`, so a shorter upload timer would never fire and a
+ * clean 408 would become a truncated connection instead. Two files holding the
+ * same number with only a comment tying them together is a cap that drifts.
+ */
+export const REQUEST_TIMEOUT_MS = 30_000;
+
 export class ServerConfigError extends Error {
   constructor(message: string) {
     super(message);

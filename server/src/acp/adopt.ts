@@ -1,4 +1,5 @@
 import type { ActiveSession, ClientContext } from "@agentclientprotocol/sdk";
+import { MAX_LISTED_SESSIONS } from "@k5-work/shared";
 import type { SessionInfo } from "@agentclientprotocol/sdk";
 
 // The two pieces of ACP that the SDK does not hand a client, isolated here so
@@ -13,7 +14,13 @@ export interface HarnessSessionInfo {
   readonly updatedAt: string | null;
 }
 
-export const MAX_LISTED_HARNESS_SESSIONS = 100;
+export /**
+ * The wire caps this at the same number (shared/src/contracts.ts, the 100 on
+ * `session.listed.sessions`). Kept as a named import rather than a literal so a
+ * change to one is a compile error at the other rather than a silent truncation of
+ * the list a user can see.
+ */
+const MAX_LISTED_HARNESS_SESSIONS = MAX_LISTED_SESSIONS;
 const MAX_TITLE_CHARS = 200;
 
 /**

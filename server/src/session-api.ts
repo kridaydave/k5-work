@@ -13,6 +13,7 @@ import {
 import { SessionStoreError, type SessionStoreErrorCode } from "./store/errors.js";
 import { isSafeNameSegment } from "./store/safe-name.js";
 import { SessionStore } from "./store/session-store.js";
+import { REQUEST_TIMEOUT_MS } from "./env.js";
 
 // Read side of the durable store, over HTTP. Bulk history does not belong on the
 // websocket: that channel caps a frame at 64 KiB, and a transcript is bulk data.
@@ -133,11 +134,11 @@ const UploadQuerySchema = z.object({
 });
 
 /**
- * How long an upload may take end to end. Matches the app's own requestTimeout so
- * a stalled client is answered rather than left holding a connection, and a
- * stalled socket cannot pin a store handle either.
+ * How long an upload may take end to end. Must not exceed the app's own
+ * `requestTimeout`, or Node closes the socket before this timer fires and the
+ * client sees a truncated connection rather than the 408 below.
  */
-const UPLOAD_TIMEOUT_MS = 30_000;
+const UPLOAD_TIMEOUT_MS = REQUEST_TIMEOUT_MS;
 
 /**
  * Reads the body, refusing the moment it is over the cap rather than after it has

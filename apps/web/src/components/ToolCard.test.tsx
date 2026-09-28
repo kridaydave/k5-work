@@ -101,7 +101,13 @@ describe("a tool card states what happened", () => {
 
 // The transcript renders the live turn's rail, so the wiring is proven against
 // what the reducer really produces rather than a hand-built state object.
-const socket: { current: K5Socket | null } = { current: null };
+//
+// A fresh object on every call, deliberately. The real hook returns a bare object
+// literal, so it has a new identity each render, and returning one stable object
+// here hid an unbounded render loop in App: an effect depending on the hook's
+// return re-fires forever, because the call it makes is never a referential
+// no-op. A mock with stable identity makes that class of bug impossible to see.
+const socket = vi.hoisted(() => ({ current: null as K5Socket | null }));
 
 vi.mock("@/hooks/useK5Socket", () => ({ useK5Socket: () => socket.current }));
 vi.mock("@/hooks/useProjects", () => ({

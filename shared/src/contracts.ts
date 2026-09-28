@@ -12,6 +12,15 @@ export type CommandId = z.infer<typeof CommandIdSchema>;
 // k5-minted identity for a stored transcript. The harness session id is opaque,
 // harness-controlled and up to 256 chars, so it is never an addressable
 // identity on the wire: two harnesses can return the same one.
+/**
+ * The wire cap on a config option's values, exported so the seat that assembles
+ * them cannot hold a different number. The store already does this for its list cap.
+ */
+export const MAX_CONFIG_OPTION_VALUES = 64;
+
+/** The wire cap on config options in one event, exported for the same reason. */
+export const MAX_CONFIG_OPTIONS = 32;
+
 export const StoreIdSchema = z.string().min(1).max(64);
 export type StoreId = z.infer<typeof StoreIdSchema>;
 
@@ -313,7 +322,7 @@ export const ConfigOptionSummarySchema = z
     name: z.string().max(200),
     type: z.enum(["select", "boolean"]),
     current: z.string().max(256).nullable(),
-    values: z.array(ConfigOptionValueSchema).max(64),
+    values: z.array(ConfigOptionValueSchema).max(MAX_CONFIG_OPTION_VALUES),
   })
   .strict();
 export type ConfigOptionSummary = z.infer<typeof ConfigOptionSummarySchema>;
@@ -340,7 +349,7 @@ export const SessionOpenedEventSchema = z
     storeId: StoreIdSchema,
     projectId: z.string().min(1).max(256),
     cwd: z.string().min(1).max(4096),
-    configOptions: z.array(ConfigOptionSummarySchema).max(32),
+    configOptions: z.array(ConfigOptionSummarySchema).max(MAX_CONFIG_OPTIONS),
   })
   .strict();
 export type SessionOpenedEvent = z.infer<typeof SessionOpenedEventSchema>;
@@ -351,7 +360,7 @@ export const SessionConfiguredEventSchema = z
   .object({
     type: z.literal("session.configured"),
     sessionId: SessionIdSchema,
-    configOptions: z.array(ConfigOptionSummarySchema).max(32),
+    configOptions: z.array(ConfigOptionSummarySchema).max(MAX_CONFIG_OPTIONS),
   })
   .strict();
 export type SessionConfiguredEvent = z.infer<typeof SessionConfiguredEventSchema>;
@@ -576,7 +585,7 @@ export const SessionLoadedEventSchema = z
     sessionId: SessionIdSchema,
     projectId: z.string().min(1).max(256),
     cwd: z.string().min(1).max(4096),
-    configOptions: z.array(ConfigOptionSummarySchema).max(32),
+    configOptions: z.array(ConfigOptionSummarySchema).max(MAX_CONFIG_OPTIONS),
   })
   .strict();
 export type SessionLoadedEvent = z.infer<typeof SessionLoadedEventSchema>;

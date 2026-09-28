@@ -3,7 +3,7 @@ import type { Duplex } from "node:stream";
 import { handleProjectApiRequest } from "./project-api.js";
 import { handleSessionApiRequest, isSessionApiPath } from "./session-api.js";
 import type { SessionStore } from "./store/session-store.js";
-import { isAllowedHostHeader, type ServerConfig } from "./env.js";
+import { isAllowedHostHeader, REQUEST_TIMEOUT_MS, type ServerConfig } from "./env.js";
 import {
   createGateway,
   type AcceptedConnection,
@@ -43,6 +43,7 @@ export interface CreateAppOptions {
 // phase is zero-length and `clean` becomes a coin flip on timer ordering.
 export const SHUTDOWN_GRACE_MS = 2_000;
 export const SHUTDOWN_HARD_MS = 8_000;
+
 
 export function createApp(options: CreateAppOptions): K5App {
   const { config } = options;
@@ -104,7 +105,7 @@ export function createApp(options: CreateAppOptions): K5App {
     });
   });
   server.headersTimeout = 10_000;
-  server.requestTimeout = 30_000;
+  server.requestTimeout = REQUEST_TIMEOUT_MS;
   server.keepAliveTimeout = 5_000;
 
   // Tracking here rather than in the gateway: teardown must see upgraded
