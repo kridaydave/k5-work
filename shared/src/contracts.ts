@@ -9,6 +9,12 @@ import { z } from "zod";
 export const CommandIdSchema = z.string().min(1).max(128);
 export type CommandId = z.infer<typeof CommandIdSchema>;
 
+// k5-minted identity for a stored transcript. The harness session id is opaque,
+// harness-controlled and up to 256 chars, so it is never an addressable
+// identity on the wire: two harnesses can return the same one.
+export const StoreIdSchema = z.string().min(1).max(64);
+export type StoreId = z.infer<typeof StoreIdSchema>;
+
 export const TurnIdSchema = z.string().min(1).max(128);
 export type TurnId = z.infer<typeof TurnIdSchema>;
 
@@ -39,6 +45,9 @@ export const CommandFailureReasonSchema = z.enum([
   "auth-required",
   "terminal-auth-unsupported",
   "session-new-failed",
+  "capability-unsupported",
+  "cwd-mismatch",
+  "session-unknown",
   "timeout",
   "seat-reaped",
   "not-sent",
@@ -100,12 +109,42 @@ export const SessionCloseCommandSchema = z
   .strict();
 export type SessionCloseCommand = z.infer<typeof SessionCloseCommandSchema>;
 
+/**
+ * Asks the harness what sessions it knows about for a project. The server opens
+ * a short-lived headless seat for the read, so a list never creates a session
+ * and never holds a pool slot.
+ */
+export const SessionListCommandSchema = z
+  .object({
+    ...commandBase,
+    type: z.literal("session.list"),
+    projectId: z.string().min(1).max(256),
+  })
+  .strict();
+export type SessionListCommand = z.infer<typeof SessionListCommandSchema>;
+
+/**
+ * Continues a stored session on the harness. The browser names a k5 store id,
+ * never a harness session id: the harness id is opaque, harness-controlled, and
+ * up to 256 chars, so it never crosses the wire as an addressable identity.
+ */
+export const SessionLoadCommandSchema = z
+  .object({
+    ...commandBase,
+    type: z.literal("session.load"),
+    storeId: StoreIdSchema,
+  })
+  .strict();
+export type SessionLoadCommand = z.infer<typeof SessionLoadCommandSchema>;
+
 export const BrowserCommandSchema = z.discriminatedUnion("type", [
   SessionOpenCommandSchema,
   SessionConfigureCommandSchema,
   SessionPromptCommandSchema,
   SessionCancelCommandSchema,
   SessionCloseCommandSchema,
+  SessionListCommandSchema,
+  SessionLoadCommandSchema,
 ]);
 export type BrowserCommand = z.infer<typeof BrowserCommandSchema>;
 
@@ -168,6 +207,13 @@ export const SessionOpenedEventSchema = z
     type: z.literal("session.opened"),
     commandId: CommandIdSchema,
     sessionId: SessionIdSchema,
+    /**
+     * The durable record this session is being written to, so the browser can
+     * rehydrate from the store after a reconnect. The harness session id cannot
+     * serve that purpose: it is opaque and the browser has no way to address a
+     * store by it.
+     */
+    storeId: StoreIdSchema,
     projectId: z.string().min(1).max(256),
     cwd: z.string().min(1).max(4096),
     configOptions: z.array(ConfigOptionSummarySchema).max(32),
@@ -211,6 +257,11 @@ export const TurnStartedEventSchema = z
     type: z.literal("turn.started"),
     sessionId: SessionIdSchema,
     turnId: TurnIdSchema,
+    // The prompt that opened the turn. The browser already has this text and
+    // shows it optimistically, so the live reducer ignores it; it is here
+    // because a reloaded transcript is read from the store, and without it a
+    // stored session shows only the assistant's half of every exchange.
+    userText: z.string().min(1).max(20_000),
   })
   .strict();
 export type TurnStartedEvent = z.infer<typeof TurnStartedEventSchema>;
@@ -252,24 +303,87 @@ export const ToolUpdatedEventSchema = z
   .strict();
 export type ToolUpdatedEvent = z.infer<typeof ToolUpdatedEventSchema>;
 
+// The four reasons ACP reports, plus the three k5 produces locally when a turn
+// is bounded, refused, or fails. Named so the store's projection and the live
+// reducer cannot disagree about what a terminal turn looks like.
+export const StopReasonSchema = z.enum([
+  "end_turn",
+  "max_tokens",
+  "max_turn_requests",
+  "refusal",
+  "cancelled",
+  "k5-timeout",
+  "k5-cancelled",
+  "k5-error",
+]);
+export type StopReason = z.infer<typeof StopReasonSchema>;
+
 export const TurnCompletedEventSchema = z
   .object({
     type: z.literal("turn.completed"),
     sessionId: SessionIdSchema,
     turnId: TurnIdSchema,
-    stopReason: z.enum([
-      "end_turn",
-      "max_tokens",
-      "max_turn_requests",
-      "refusal",
-      "cancelled",
-      "k5-timeout",
-      "k5-cancelled",
-      "k5-error",
-    ]),
+    stopReason: StopReasonSchema,
   })
   .strict();
 export type TurnCompletedEvent = z.infer<typeof TurnCompletedEventSchema>;
+
+// The harness's own view of the session's metadata. ACP's session_info_update
+// exists so an agent can auto-generate a title after the first exchange, and a
+// stored session with no title is a blank row in the sidebar forever.
+//
+// Deliberately NOT the ACP "null clears the title" semantic. k5 never blanks a
+// title it already has: a stored session that loses its name falls back to its
+// opening prompt, which is more useful than an empty row. So null here means
+// "this update carried no title", and title and updatedAt are independently
+// optional.
+export const SessionUpdatedEventSchema = z
+  .object({
+    type: z.literal("session.updated"),
+    sessionId: SessionIdSchema,
+    title: z.string().min(1).max(200).nullable(),
+    updatedAt: z.string().min(1).max(64).nullable(),
+  })
+  .strict();
+export type SessionUpdatedEvent = z.infer<typeof SessionUpdatedEventSchema>;
+
+// What the harness reports for a project, from a short-lived read. Distinct from
+// a stored session on purpose: these are sessions k5 has no record of, and the
+// sidebar shows them differently rather than pretending they are history.
+export const HarnessSessionSchema = z
+  .object({
+    sessionId: z.string().min(1).max(256),
+    cwd: z.string().min(1).max(4096),
+    title: z.string().min(1).max(200).nullable(),
+    updatedAt: z.string().min(1).max(64).nullable(),
+  })
+  .strict();
+export type HarnessSession = z.infer<typeof HarnessSessionSchema>;
+
+export const SessionListedEventSchema = z
+  .object({
+    type: z.literal("session.listed"),
+    commandId: CommandIdSchema,
+    projectId: z.string().min(1).max(256),
+    sessions: z.array(HarnessSessionSchema).max(100),
+    /** True when the harness does not offer session/list at all. */
+    unsupported: z.boolean(),
+  })
+  .strict();
+export type SessionListedEvent = z.infer<typeof SessionListedEventSchema>;
+
+export const SessionLoadedEventSchema = z
+  .object({
+    type: z.literal("session.loaded"),
+    commandId: CommandIdSchema,
+    storeId: StoreIdSchema,
+    sessionId: SessionIdSchema,
+    projectId: z.string().min(1).max(256),
+    cwd: z.string().min(1).max(4096),
+    configOptions: z.array(ConfigOptionSummarySchema).max(32),
+  })
+  .strict();
+export type SessionLoadedEvent = z.infer<typeof SessionLoadedEventSchema>;
 
 export const SeatReapedEventSchema = z
   .object({
@@ -302,7 +416,10 @@ export const ServerEventSchema = z.discriminatedUnion("type", [
   TurnDeltaEventSchema,
   ToolUpdatedEventSchema,
   TurnCompletedEventSchema,
+  SessionListedEventSchema,
+  SessionLoadedEventSchema,
   SeatReapedEventSchema,
+  SessionUpdatedEventSchema,
   ErrorEventSchema,
 ]);
 export type ServerEvent = z.infer<typeof ServerEventSchema>;

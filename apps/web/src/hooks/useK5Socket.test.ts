@@ -143,6 +143,7 @@ describe("useK5Socket", () => {
         type: "session.opened",
         commandId: "c-1",
         sessionId: "s-1",
+        storeId: '11111111-1111-4111-8111-111111111111',
         projectId: "p-1",
         cwd: "/tmp/p",
         configOptions: [
@@ -171,6 +172,7 @@ describe("useK5Socket", () => {
         type: "session.opened",
         commandId: "c-1",
         sessionId: "s-1",
+        storeId: '11111111-1111-4111-8111-111111111111',
         projectId: "p-1",
         cwd: "/tmp/p",
         configOptions: [],
@@ -223,6 +225,7 @@ describe("useK5Socket", () => {
         type: "session.opened",
         commandId: "c-1",
         sessionId: "s-1",
+        storeId: '11111111-1111-4111-8111-111111111111',
         projectId: "p-1",
         cwd: "/tmp/p",
         configOptions: [],
@@ -247,6 +250,7 @@ describe("useK5Socket", () => {
         type: "session.opened",
         commandId: "c-1",
         sessionId: "s-1",
+        storeId: '11111111-1111-4111-8111-111111111111',
         projectId: "p-1",
         cwd: "/tmp/p",
         configOptions: [],
@@ -264,6 +268,7 @@ describe("useK5Socket", () => {
         type: "session.opened",
         commandId: "c-1",
         sessionId: "s-1",
+        storeId: '11111111-1111-4111-8111-111111111111',
         projectId: "p-1",
         cwd: "/tmp/p",
         configOptions: [],
@@ -313,6 +318,7 @@ describe("useK5Socket", () => {
         type: "session.opened",
         commandId: "c-1",
         sessionId: "s-1",
+        storeId: '11111111-1111-4111-8111-111111111111',
         projectId: "p-1",
         cwd: "/tmp/p",
         configOptions: [],
@@ -347,6 +353,7 @@ describe("useK5Socket", () => {
         type: "session.opened",
         commandId: "c-1",
         sessionId: "s-1",
+        storeId: '11111111-1111-4111-8111-111111111111',
         projectId: "p-1",
         cwd: "/tmp/p",
         configOptions: [],
@@ -372,6 +379,7 @@ describe("useK5Socket", () => {
         type: "session.opened",
         commandId: "c-1",
         sessionId: "s-1",
+        storeId: '11111111-1111-4111-8111-111111111111',
         projectId: "p-1",
         cwd: "/tmp/p",
         configOptions: [
@@ -386,5 +394,232 @@ describe("useK5Socket", () => {
       });
     });
     expect(result.current.state.configOptions[0].current).toBe("opencode/space-bunny-free");
+  });
+});
+
+describe("reconnection", () => {
+  /** Collects scheduled retries so a test runs them deliberately, not on a timer. */
+  function mountReconnecting(
+    rehydrate?: (storeId: string) => Promise<void>,
+    rehydrateBudgetMs = 20,
+  ): {
+    view: ReturnType<typeof renderHook<ReturnType<typeof useK5Socket>, unknown>>;
+    runRetry: () => void;
+    delays: number[];
+  } {
+    const delays: number[] = [];
+    let pending: (() => void)[] = [];
+    // Both collaborators are hoisted. An inline arrow would give them a new
+    // identity every render, and the socket effect depends on the coalescer, which
+    // is memoised on the scheduler — the exact trap the module documents.
+    const scheduler: Scheduler = (run) => run();
+    const schedule = (run: () => void, delay: number): (() => void) => {
+      delays.push(delay);
+      pending.push(run);
+      return () => {
+        pending = pending.filter((entry) => entry !== run);
+      };
+    };
+    const view = renderHook(() =>
+      useK5Socket({
+        scheduler,
+        schedule,
+        rehydrateBudgetMs,
+        ...(rehydrate === undefined ? {} : { rehydrate }),
+      }),
+    );
+    return {
+      view,
+      delays,
+      runRetry: () => {
+        const queued = pending;
+        pending = [];
+        act(() => {
+          queued.forEach((run) => run());
+        });
+      },
+    };
+  }
+
+  it("reconnects after a close instead of leaving a dead tab", () => {
+    // The server restarts during development and a dropped network is not a reason
+    // the workspace stops working.
+    const { view, runRetry, delays } = mountReconnecting();
+    act(() => FakeSocket.instances[0]!.open());
+    expect(view.result.current.state.connection).toBe("open");
+    expect(FakeSocket.instances).toHaveLength(1);
+
+    act(() => {
+      FakeSocket.instances[0]!.drop();
+      FakeSocket.instances[0]!.settleClose();
+    });
+    expect(view.result.current.state.connection).toBe("closed");
+
+    runRetry();
+    expect(FakeSocket.instances).toHaveLength(2);
+    act(() => FakeSocket.instances[1]!.open());
+    expect(view.result.current.state.connection).toBe("open");
+    expect(delays[0]).toBeGreaterThan(0);
+  });
+
+  it("backs off further with each failed attempt", () => {
+    const { view, runRetry, delays } = mountReconnecting();
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const current = FakeSocket.instances.at(-1)!;
+      act(() => {
+        current.drop();
+        current.settleClose();
+      });
+      runRetry();
+    }
+    // Strictly increasing until the cap, and never unbounded.
+    expect(delays[0]).toBeLessThan(delays[1]!);
+    expect(delays[1]).toBeLessThan(delays[2]!);
+    expect(delays.at(-1)).toBeLessThanOrEqual(15_000);
+    void view;
+  });
+
+  it("re-reads the stored transcript before reconnecting, so a finished turn is not lost", async () => {
+    const seen: string[] = [];
+    const { view, runRetry } = mountReconnecting(async (storeId) => {
+      seen.push(storeId);
+    });
+    act(() => FakeSocket.instances[0]!.open());
+    // Give the connection a durable record to rehydrate from.
+    act(() =>
+      FakeSocket.instances[0]!.receive({
+        type: "session.opened",
+        commandId: "c-1",
+        sessionId: "ses-1",
+        storeId: "11111111-1111-4111-8111-111111111111",
+        projectId: "p-1",
+        cwd: "/tmp/p",
+        configOptions: [],
+      } as ServerEvent),
+    );
+    expect(view.result.current.state.storeId).toBe("11111111-1111-4111-8111-111111111111");
+
+    act(() => {
+      FakeSocket.instances[0]!.drop();
+      FakeSocket.instances[0]!.settleClose();
+    });
+    // The new socket is not opened until the transcript has been re-read.
+    expect(FakeSocket.instances).toHaveLength(1);
+    await act(async () => {
+      runRetry();
+      await Promise.resolve();
+    });
+    expect(seen).toEqual(["11111111-1111-4111-8111-111111111111"]);
+    expect(FakeSocket.instances).toHaveLength(2);
+  });
+
+  it("still reconnects when there is nothing recorded to re-read", () => {
+    const { runRetry } = mountReconnecting(async () => {
+      throw new Error("should not be called");
+    });
+    act(() => FakeSocket.instances[0]!.open());
+    act(() => {
+      FakeSocket.instances[0]!.drop();
+      FakeSocket.instances[0]!.settleClose();
+    });
+    act(() => runRetry());
+    expect(FakeSocket.instances).toHaveLength(2);
+  });
+
+  it("reconnects even when rehydrating never settles", async () => {
+    // An unbounded rehydrate left the workspace closed for ever: there was no next
+    // attempt scheduled, so the backoff cap was irrelevant.
+    const { view, runRetry } = mountReconnecting(() => new Promise<void>(() => {}));
+    act(() => FakeSocket.instances[0]!.open());
+    act(() =>
+      FakeSocket.instances[0]!.receive({
+        type: "session.opened",
+        commandId: "c-1",
+        sessionId: "ses-1",
+        storeId: "11111111-1111-4111-8111-111111111111",
+        projectId: "p-1",
+        cwd: "/tmp/p",
+        configOptions: [],
+      } as ServerEvent),
+    );
+    act(() => {
+      FakeSocket.instances[0]!.drop();
+      FakeSocket.instances[0]!.settleClose();
+    });
+    // The budget is real time, so the reconnect is asserted with a bounded wait
+    // rather than a fixed sleep.
+    await act(async () => {
+      runRetry();
+      await vi.waitFor(() => expect(FakeSocket.instances.length).toBeGreaterThan(1), {
+        timeout: 10_000,
+        interval: 20,
+      });
+    });
+    act(() => FakeSocket.instances[1]!.open());
+    expect(view.result.current.state.connection).toBe("open");
+  });
+
+  it("reconnects when rehydrating throws synchronously", async () => {
+    // A throw before the promise existed escaped the timer callback and wedged the
+    // tab: neither .catch nor .finally ever attached.
+    const { view, runRetry } = mountReconnecting((): Promise<void> => {
+      throw new Error("sync boom");
+    });
+    act(() => FakeSocket.instances[0]!.open());
+    act(() =>
+      FakeSocket.instances[0]!.receive({
+        type: "session.opened",
+        commandId: "c-1",
+        sessionId: "ses-1",
+        storeId: "11111111-1111-4111-8111-111111111111",
+        projectId: "p-1",
+        cwd: "/tmp/p",
+        configOptions: [],
+      } as ServerEvent),
+    );
+    act(() => {
+      FakeSocket.instances[0]!.drop();
+      FakeSocket.instances[0]!.settleClose();
+    });
+    await act(async () => {
+      runRetry();
+      await vi.waitFor(() => expect(FakeSocket.instances.length).toBeGreaterThan(1), {
+        timeout: 10_000,
+        interval: 20,
+      });
+    });
+    act(() => FakeSocket.instances[1]!.open());
+    expect(view.result.current.state.connection).toBe("open");
+  });
+
+  it("a rehydration failure does not strand the socket closed", async () => {
+    // The transcript is a convenience; losing it must not also lose the ability
+    // to work.
+    const { view, runRetry } = mountReconnecting(async () => {
+      throw new Error("the store is unavailable");
+    });
+    act(() => FakeSocket.instances[0]!.open());
+    act(() =>
+      FakeSocket.instances[0]!.receive({
+        type: "session.opened",
+        commandId: "c-1",
+        sessionId: "ses-1",
+        storeId: "11111111-1111-4111-8111-111111111111",
+        projectId: "p-1",
+        cwd: "/tmp/p",
+        configOptions: [],
+      } as ServerEvent),
+    );
+    act(() => {
+      FakeSocket.instances[0]!.drop();
+      FakeSocket.instances[0]!.settleClose();
+    });
+    await act(async () => {
+      runRetry();
+      await Promise.resolve();
+    });
+    expect(FakeSocket.instances).toHaveLength(2);
+    act(() => FakeSocket.instances[1]!.open());
+    expect(view.result.current.state.connection).toBe("open");
   });
 });

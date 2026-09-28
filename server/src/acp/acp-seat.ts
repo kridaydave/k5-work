@@ -6,12 +6,34 @@ import {
   type ClientContext,
 } from "@agentclientprotocol/sdk";
 import type { AcpChild } from "./spawn.js";
+import { NO_CAPABILITIES, probeCapabilities, type AcpCapabilities } from "./capabilities.js";
+import {
+  attachSessionShim,
+  MAX_LISTED_HARNESS_SESSIONS,
+  toHarnessSessionInfo,
+  type HarnessSessionInfo,
+} from "./adopt.js";
 import { classifySessionUpdate } from "./updates.js";
 import type { ConfigOptionSummary } from "@k5-work/shared";
 
 /** ACP caps a value label and the option id; mirrored so the wire stays bounded. */
 const MAX_OPTION_VALUES = 64;
 import { AcpAuthRequiredError, AcpProtocolMismatchError, AcpTerminalAuthUnsupportedError } from "./probe.js";
+
+/**
+ * A capability the harness never advertised, or an SDK that no longer exposes
+ * the pump a feature needs. Distinct from AcpSeatError so the service can map it
+ * to a wire reason the browser can render.
+ */
+export class AcpCapabilityError extends Error {
+  readonly capability: "load" | "resume" | "list" | "pump";
+
+  constructor(capability: AcpCapabilityError["capability"], message: string) {
+    super(message);
+    this.name = "AcpCapabilityError";
+    this.capability = capability;
+  }
+}
 
 export class AcpSeatError extends Error {
   constructor(message: string) {
@@ -35,7 +57,10 @@ export type SeatStreamEvent =
       toolCallId: string;
       title: string;
       status: "pending" | "in_progress" | "completed" | "failed";
-    };
+    }
+  // The harness's own title, which it generates after the first exchange. It is
+  // a session-level fact rather than turn content, so it carries no turnId.
+  | { kind: "session"; title: string | null; updatedAt: string | null };
 
 export interface AcpSeatOptions {
   cwd: string;
@@ -45,9 +70,11 @@ export interface AcpSeatOptions {
 }
 
 export interface AcpSeatInfo {
+  /** Empty on a headless seat, which has no ACP session yet. */
   sessionId: string;
   /** The harness's own options, including each select value and its label. */
   configOptions: ConfigOptionSummary[];
+  capabilities: AcpCapabilities;
 }
 
 const DEFAULT_OPEN_TIMEOUT_MS = 60_000;
@@ -86,6 +113,8 @@ export class AcpSeat {
   /** Outstanding update pump, awaited so a new turn never steals stale updates. */
   private pumpDone: Promise<void> = Promise.resolve();
   private poisonReason: string | null = null;
+  /** Probed from the raw initialize result, leniently. */
+  private caps: AcpCapabilities = NO_CAPABILITIES;
   private closed = false;
   private releaseLifetime!: () => void;
   private readonly lifetime: Promise<void>;
@@ -109,7 +138,25 @@ export class AcpSeat {
     onEvent: ((turnId: string, event: SeatStreamEvent) => void) | null,
   ): Promise<AcpSeat> {
     const seat = new AcpSeat(child, options, onEvent);
-    await seat.handshake();
+    await seat.handshake("new");
+    return seat;
+  }
+
+  /**
+   * Opens a connection with no ACP session.
+   *
+   * `session/list` is a read, and a read must not create a session: a sidebar
+   * that lists tasks would otherwise leave a new harness session behind on every
+   * page load. The same headless seat then adopts an existing session id through
+   * `adopt`, so there is one seat and one turn pump either way.
+   */
+  static async openHeadless(
+    child: AcpChild,
+    options: AcpSeatOptions,
+    onEvent: ((turnId: string, event: SeatStreamEvent) => void) | null,
+  ): Promise<AcpSeat> {
+    const seat = new AcpSeat(child, options, onEvent);
+    await seat.handshake("headless");
     return seat;
   }
 
@@ -117,7 +164,7 @@ export class AcpSeat {
     return this.options.openTimeoutMs ?? DEFAULT_OPEN_TIMEOUT_MS;
   }
 
-  private async handshake(): Promise<void> {
+  private async handshake(mode: "new" | "headless"): Promise<void> {
     const seat = this;
     const app = client({ name: this.options.clientName ?? "k5-work" });
     // There is no permission screen, so a harness that asks is refused rather
@@ -150,6 +197,16 @@ export class AcpSeat {
             if (init.protocolVersion !== PROTOCOL_VERSION) {
               throw new AcpProtocolMismatchError(init.protocolVersion);
             }
+            // Probed leniently and off the raw object: the SDK never validates
+            // this response on the client path, and its generated schema drops a
+            // mis-shaped field silently. A strict parse here would fail the seat
+            // open for a harness that merely spelled a capability differently.
+            seat.caps = probeCapabilities(init);
+            for (const field of seat.caps.mismatches) {
+              process.stderr.write(
+                `k5: the harness advertised ${field} in a shape k5 does not read; treating it as unsupported\n`,
+              );
+            }
 
             const methods = (init.authMethods ?? []) as {
               id: string;
@@ -177,15 +234,28 @@ export class AcpSeat {
               }
             }
 
+            seat.context = ctx;
+            if (mode === "headless") {
+              // No session is created. The connection is still held for the
+              // seat's lifetime so a later adopt, or a list, has a live context.
+              resolve({
+                sessionId: "",
+                configOptions: [],
+                capabilities: seat.caps,
+              });
+              await seat.lifetime;
+              return;
+            }
+
             const active = await ctx.buildSession(seat.options.cwd).start({
               cancellationSignal: AbortSignal.timeout(seat.openTimeoutMs),
             });
             const created = active.newSessionResponse;
-            seat.context = ctx;
             seat.session = active;
             seat.info = {
               sessionId: created.sessionId,
               configOptions: summarizeOptions(created.configOptions ?? []),
+              capabilities: seat.caps,
             };
             resolve(seat.info);
             // Held for the seat's lifetime: connectWith closes the connection
@@ -209,6 +279,107 @@ export class AcpSeat {
   get sessionId(): string {
     if (this.info === null) throw new AcpSeatError("seat has no session");
     return this.info.sessionId;
+  }
+
+  /** What the harness said it supports, probed leniently at handshake. */
+  get capabilities(): AcpCapabilities {
+    return this.caps;
+  }
+
+  /**
+   * `session/list`, for discovering sessions the harness knows about.
+   *
+   * Gated on the advertised capability rather than attempted optimistically: the
+   * spec is explicit that a client MUST NOT call a method the agent did not
+   * advertise, and the failure would otherwise surface as an opaque JSON-RPC
+   * error. Only the first page is taken: k5 shows a bounded list and never
+   * persists a cursor, because the spec forbids storing one.
+   */
+  async listSessions(options: { limit?: number } = {}): Promise<HarnessSessionInfo[]> {
+    if (this.closed) throw new AcpSeatError("seat is closed");
+    if (this.context === null) throw new AcpSeatError("seat has no ACP context");
+    if (!this.capabilities.list) {
+      throw new AcpCapabilityError("list", "this harness does not offer session/list");
+    }
+    // A timeout, because the SDK has no default: it registers a pending response
+    // that only a response or a cancel settles. Without this a harness that never
+    // answers leaves the child alive forever, since the only thing that would tear
+    // it down is the teardown that is itself waiting on this call.
+    const response = (await this.context.request(
+      "session/list",
+      // cwd and cursor are the only members of ListSessionsRequest; mcpServers
+      // belongs to the lifecycle methods, not to this read.
+      { cwd: this.options.cwd },
+      { cancellationSignal: AbortSignal.timeout(this.openTimeoutMs) },
+    )) as { sessions?: unknown; nextCursor?: unknown };
+    const raw = Array.isArray(response.sessions) ? response.sessions : [];
+    // The cap is post-hoc: ACP has no page-size field, only a cursor, and the
+    // spec forbids persisting one. So this bounds what k5 keeps, not the bytes on
+    // the wire.
+    const capped = raw.slice(0, options.limit ?? MAX_LISTED_HARNESS_SESSIONS);
+    return capped
+      .map((entry) => toHarnessSessionInfo(entry))
+      .filter((entry): entry is HarnessSessionInfo => entry !== null);
+  }
+
+  /**
+   * Adopts an existing harness session so this seat can prompt it.
+   *
+   * `session/resume` is the continue path, and `session/load` is deliberately
+   * not used for it. k5 holds the transcript itself, so a replay would be history
+   * it already has; worse, `session/load` streams that replay and then responds,
+   * and the SDK offers no way to tell a drained queue from an empty one. Draining
+   * it would either truncate the replay or leave a task blocked on `nextUpdate()`
+   * that then swallows the next live turn's updates.
+   *
+   * The attach MUST happen before the request is issued. It is the only thing
+   * that gives a session a per-session update queue, and without it every
+   * notification for the adopted session is dropped on the floor.
+   */
+  async adopt(sessionId: string): Promise<AcpSeatInfo> {
+    if (this.closed) throw new AcpSeatError("seat is closed");
+    if (this.session !== null) throw new AcpSeatError("seat already has a session");
+    const context = this.context;
+    if (context === null) throw new AcpSeatError("seat has no ACP context");
+    if (!this.capabilities.resume) {
+      throw new AcpCapabilityError("resume", "this harness does not offer session/resume");
+    }
+
+    // Attached first, before the request, and released again if the request
+    // fails, so a transient refusal does not leave the seat permanently
+    // un-adoptable behind an attached queue nobody reads.
+    const attached = attachSessionShim(context, sessionId);
+    if (attached === null) {
+      throw new AcpCapabilityError(
+        "resume",
+        "the installed ACP SDK does not expose the session pump this seat needs",
+      );
+    }
+
+    let response: { configOptions?: unknown; modes?: unknown };
+    try {
+      response = (await context.request(
+        "session/resume",
+        { sessionId, cwd: this.options.cwd, mcpServers: [] },
+        // Bounded, for the same reason session/list is: an unanswered resume
+        // would hold the child open and wedge the connection that asked.
+        { cancellationSignal: AbortSignal.timeout(this.openTimeoutMs) },
+      )) as { configOptions?: unknown; modes?: unknown };
+    } catch (err) {
+      attached.dispose();
+      throw err;
+    }
+    this.session = attached;
+
+    // The response carries no sessionId, so the id is the one we asked for.
+    this.info = {
+      sessionId,
+      configOptions: summarizeOptions(
+        Array.isArray(response.configOptions) ? (response.configOptions as never[]) : [],
+      ),
+      capabilities: this.capabilities,
+    };
+    return this.info;
   }
 
   get configOptions(): ConfigOptionSummary[] {
@@ -316,6 +487,15 @@ export class AcpSeat {
             toolCallId: verdict.toolCallId,
             title: verdict.title,
             status: verdict.status,
+          });
+        } else if (verdict.kind === "session") {
+          // Forwarded with the turn id it arrived under so the service can route
+          // it to the right connection; the service drops the id because a title
+          // is a session fact, not turn content.
+          this.onEvent?.(turn.turnId, {
+            kind: "session",
+            title: verdict.title,
+            updatedAt: verdict.updatedAt,
           });
         }
       } catch (err) {

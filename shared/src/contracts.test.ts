@@ -9,7 +9,10 @@ import {
 describe("browser command contract", () => {
   const base = { commandId: "c-1" };
 
-  it("accepts every implemented command", () => {
+  it("accepts every command the union declares", () => {
+    // Enumerated from the schema rather than hand-listed, so a new command cannot
+    // be added to the union and left untested.
+    assert.equal(BrowserCommandSchema.options.length, 7, "the browser command union grew");
     const commands = [
       { ...base, type: "session.open", projectId: "p-1" },
       {
@@ -22,6 +25,12 @@ describe("browser command contract", () => {
       { ...base, type: "session.prompt", sessionId: "s-1", turnId: "t-1", text: "hi" },
       { ...base, type: "session.cancel", sessionId: "s-1" },
       { ...base, type: "session.close", sessionId: "s-1" },
+      { ...base, type: "session.list", projectId: "p-1" },
+      {
+        ...base,
+        type: "session.load",
+        storeId: "11111111-1111-4111-8111-111111111111",
+      },
     ];
     for (const command of commands) {
       const parsed = BrowserCommandSchema.safeParse(command);
@@ -143,6 +152,7 @@ describe("server event contract", () => {
         type: "session.opened",
         commandId: "c-1",
         sessionId: "s-1",
+        storeId: "11111111-1111-4111-8111-111111111111",
         projectId: "p-1",
         cwd: "/tmp",
         configOptions: [option],
@@ -154,6 +164,7 @@ describe("server event contract", () => {
         type: "session.opened",
         commandId: "c-1",
         sessionId: "s-1",
+        storeId: "11111111-1111-4111-8111-111111111111",
         projectId: "p-1",
         cwd: "/tmp",
         configOptions: Array.from({ length: 33 }, () => option),
@@ -181,5 +192,34 @@ describe("server event contract", () => {
         `${stopReason} must be a valid stop reason`,
       );
     }
+  });
+
+  it("carries the prompt on turn.started so a turn is durable history", () => {
+    // The browser already holds this text and shows it optimistically, but a
+    // reloaded transcript is read from the store, and without the prompt it
+    // would show only the assistant's half of every exchange.
+    const valid = {
+      type: "turn.started",
+      sessionId: "s-1",
+      turnId: "t-1",
+      userText: "refactor the composer",
+    };
+    assert.equal(ServerEventSchema.safeParse(valid).success, true);
+
+    const { userText: _omitted, ...withoutPrompt } = valid;
+    assert.equal(
+      ServerEventSchema.safeParse(withoutPrompt).success,
+      false,
+      "a turn with no recorded prompt is not durable history",
+    );
+    assert.equal(
+      ServerEventSchema.safeParse({ ...valid, userText: "" }).success,
+      false,
+    );
+    assert.equal(
+      ServerEventSchema.safeParse({ ...valid, userText: "x".repeat(20_001) }).success,
+      false,
+      "bounded by the same cap as session.prompt",
+    );
   });
 });

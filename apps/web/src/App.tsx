@@ -9,8 +9,10 @@ import { PathPromptModal } from "@/components/PathPromptModal";
 import { Sidebar, type Session } from "@/components/Sidebar";
 import { Wallpaper } from "@/components/Wallpaper";
 import { WindowChrome } from "@/components/WindowChrome";
+import type { ProjectedTranscript } from "@k5-work/shared";
 import { useK5Socket } from "@/hooks/useK5Socket";
 import { useProjects } from "@/hooks/useProjects";
+import { readStoredTranscript, useStoredSessions } from "@/hooks/useStoredSessions";
 import { cn } from "@/utils/cn";
 
 // Only `full` is servable: OpenCode 1.18.31 resolves a blanket `*: allow` and
@@ -43,7 +45,19 @@ export default function App() {
     selectProject,
     openPath,
   } = useProjects();
-  const k5 = useK5Socket();
+  // The durable task list, read over HTTP with no harness process involved. The
+  // sidebar is populated from disk, not from the live session alone, so a reload
+  // shows the history that is actually there.
+  const { sessions: storedSessions, remove: removeStored } = useStoredSessions();
+  // Re-read the transcript after a reconnect, before the new socket can deliver
+  // anything: a turn that finished while the socket was down would otherwise be
+  // silently lost, because the socket never replays and the store is the record.
+  const rehydrate = useCallback(async (storeId: string) => {
+    const { transcript } = await readStoredTranscript(storeId);
+    setRehydrated(transcript);
+  }, []);
+  const [rehydrated, setRehydrated] = useState<ProjectedTranscript | null>(null);
+  const k5 = useK5Socket({ rehydrate });
   const { state } = k5;
   // The Composer clears its textarea on send and onSend returns void, so a
   // prompt issued while the seat is still opening must be held here rather than
@@ -57,6 +71,14 @@ export default function App() {
   // the seat is actually running.
   const confirmed = useRef<{ model?: string; mode?: string }>({});
 
+  // A stored transcript replaces the visible entries until the live socket takes
+  // over. Hydrated through the reducer so the shape the socket appends to is the
+  // one the store produced.
+  useEffect(() => {
+    if (rehydrated === null) return;
+    k5.adoptTranscript(rehydrated);
+  }, [rehydrated, k5]);
+
   const messages = state.entries;
   const active = state.entries.length > 0;
   // The existing working dots are reused rather than a new busy prop.
@@ -66,18 +88,32 @@ export default function App() {
   // shows the live session and nothing else rather than plausible-looking rows
   // for work that never happened.
   const sidebarSessions = useMemo<Session[]>(() => {
-    if (state.sessionId === null || activeProject === undefined) return [];
-    const model = state.configOptions.find((o) => o.id === "model")?.current;
-    const title = activeProject.name;
-    return [
-      {
-        id: state.sessionId,
-        title,
-        meta: model ?? "connecting",
-        group: "This task",
-      },
-    ];
-  }, [activeProject, state.sessionId, state.configOptions]);
+    // Real stored tasks, newest first, grouped the way the sidebar already
+    // expects. Nothing here is invented: a task that was never recorded does not
+    // appear, because there is no record of it to show.
+    const stored: Session[] = storedSessions.map((entry) => ({
+      id: entry.storeId,
+      title: entry.title,
+      meta: entry.turnCount === 1 ? "1 turn" : `${String(entry.turnCount)} turns`,
+      group: entry.truncated ? "Incomplete" : "Tasks",
+    }));
+    // The live session is shown only when the store has not caught up with it yet,
+    // so opening a task does not make a duplicate row appear.
+    const live =
+      state.storeId !== null && stored.some((entry) => entry.id === state.storeId)
+        ? []
+        : state.sessionId !== null && activeProject !== undefined
+          ? [
+              {
+                id: state.sessionId,
+                title: activeProject.name,
+                meta: state.configOptions.find((o) => o.id === "model")?.current ?? "connecting",
+                group: "This task",
+              },
+            ]
+          : [];
+    return [...live, ...stored];
+  }, [activeProject, state.sessionId, state.storeId, state.configOptions, storedSessions]);
 
   const handleNewTask = useCallback(() => {
     queuedPrompt.current = null;
@@ -188,16 +224,28 @@ export default function App() {
     [activeProject, k5, state.session, state.sessionId, state.sessionMessage, state.turnStatus],
   );
 
+  const handleRemoveSession = useCallback(
+    (session: Session) => {
+      // A removed task is gone from the store, so the list refreshes on its own
+      // receipt rather than optimistically. Removing the task that is on screen
+      // leaves it there: the live seat is not the store record, and pretending
+      // otherwise would hide work the harness is still running.
+      if (session.id === state.storeId) return;
+      removeStored(session.id);
+    },
+    [removeStored, state.storeId],
+  );
+
   const handleSelectSession = useCallback(
     (session: Session) => {
-      // The sidebar still lists placeholder sessions from the original build.
-      // Selecting one used to fabricate a transcript; now that it would also
-      // close a live seat, it does nothing at all. Durable session history is
-      // Phase 4 work, and a placeholder that destroys real work is worse than
-      // an honest no-op.
-      void session;
+      // Continuing a stored task, rather than fabricating one. The server
+      // re-validates the recorded cwd and refuses if the project has moved, so
+      // this cannot quietly resume a conversation against the wrong directory.
+      if (session.id === state.sessionId) return;
+      setTranscriptNote(null);
+      k5.loadSession(session.id);
     },
-    [],
+    [k5, state.sessionId],
   );
 
   const handleSelectProject = useCallback(
@@ -241,6 +289,7 @@ export default function App() {
           onOpenProject={handleOpenProject}
           onSelectProject={handleSelectProject}
           onSelectSession={handleSelectSession}
+          onRemoveSession={handleRemoveSession}
           sessions={sidebarSessions}
           connection={state.connection}
         />

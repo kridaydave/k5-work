@@ -8,6 +8,7 @@ import {
   isAllowedHostHeader,
   isLoopbackHost,
   loadServerConfig,
+  resolveStoreRoot,
   validateOrigins,
 } from "./env.js";
 
@@ -260,5 +261,97 @@ describe("documented env contract", () => {
     ]) {
       assert.ok(listed.includes(expected), `allowlist must include ${expected}`);
     }
+  });
+});
+
+describe("session store root", () => {
+  const home = "/home/tester";
+
+  it("defaults under the home directory when XDG_DATA_HOME is unset or blank", () => {
+    for (const env of [{}, { XDG_DATA_HOME: "" }, { XDG_DATA_HOME: "   " }]) {
+      assert.equal(
+        resolveStoreRoot(env, home),
+        path.join(home, ".local", "share", "k5-work"),
+      );
+    }
+  });
+
+  it("honours an absolute XDG_DATA_HOME", () => {
+    assert.equal(
+      resolveStoreRoot({ XDG_DATA_HOME: "/var/lib/k5" }, home),
+      "/var/lib/k5/k5-work",
+    );
+  });
+
+  it("refuses a relative or home-relative value instead of resolving it", () => {
+    // The XDG spec says a relative value is invalid and must be ignored in
+    // favour of the default. Resolving it would anchor the store to
+    // process.cwd(), which differs under npm run dev, systemd and a process
+    // manager, so one machine would keep three different transcripts.
+    for (const bad of ["relative/path", "./here", "../up", "~/mydata", "~"]) {
+      assert.throws(
+        () => resolveStoreRoot({ XDG_DATA_HOME: bad }, home),
+        (error: unknown) => error instanceof ServerConfigError,
+        `${bad} must be refused`,
+      );
+    }
+  });
+
+  it("names the offending value in the refusal", () => {
+    assert.throws(
+      () => resolveStoreRoot({ XDG_DATA_HOME: "relative/path" }, home),
+      /relative\/path/,
+      "an operator who set this deserves to see what they set",
+    );
+  });
+
+  it("refuses a base that is a system directory or the home directory itself", () => {
+    // The check is on the base: resolve(base, "k5-work") can never equal its own
+    // base, so testing the joined root could never fire. XDG_DATA_HOME=/etc
+    // would otherwise create /etc/k5-work and scatter transcripts through a
+    // system tree.
+    for (const bad of ["/", "/etc", "/usr", "/var", "/opt", home]) {
+      assert.throws(
+        () => resolveStoreRoot({ XDG_DATA_HOME: bad }, home),
+        (error: unknown) => error instanceof ServerConfigError,
+        `${bad} must never hold the store`,
+      );
+    }
+    // The traversal form resolves to the same forbidden place.
+    assert.throws(
+      () => resolveStoreRoot({ XDG_DATA_HOME: "/tmp/../etc" }, home),
+      (error: unknown) => error instanceof ServerConfigError,
+    );
+  });
+
+  it("allows the spec's own default base under the home directory", () => {
+    // $HOME/.local/share is where an unconfigured install must land, so
+    // forbidding it would stop every ordinary boot.
+    assert.equal(
+      resolveStoreRoot({ XDG_DATA_HOME: `${home}/.local/share` }, home),
+      `${home}/.local/share/k5-work`,
+    );
+    assert.equal(
+      resolveStoreRoot({ XDG_DATA_HOME: `${home}/.local` }, home),
+      `${home}/.local/k5-work`,
+    );
+  });
+
+  it("is injected through ServerConfig rather than derived at import time", () => {
+    // module-graph.test.ts imports every compiled module, so a directory created
+    // at module scope would be a side effect in a test.
+    const config = loadServerConfig({
+      env: { XDG_DATA_HOME: "/var/lib/k5" },
+      workspaceRoot: "/tmp",
+      homeDir: home,
+    });
+    assert.equal(config.storeRoot, "/var/lib/k5/k5-work");
+  });
+
+  it("refuses a config whose store root is forbidden, at boot", () => {
+    assert.throws(
+      () => loadServerConfig({ env: { XDG_DATA_HOME: "relative" }, workspaceRoot: "/tmp", homeDir: home }),
+      (error: unknown) => error instanceof ServerConfigError,
+    );
   });
 });

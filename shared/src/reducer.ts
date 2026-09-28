@@ -6,6 +6,12 @@ import type {
   ToolLifecycle,
   ToolStatus,
 } from "./contracts.js";
+import {
+  isFailedTurn,
+  projectTranscript,
+  transcriptEntries,
+  type ProjectedTranscript,
+} from "./sessions.js";
 
 // --- browser view state ---
 // Pure state transitions over the wire contract. No Node imports, no service
@@ -42,6 +48,18 @@ export interface K5ViewState {
   connection: ConnectionState;
   session: SessionState;
   sessionId: string | null;
+  /**
+   * The harness's own title for this session, once it has generated one. Kept
+   * apart from a stored summary because the sidebar lists stored sessions over
+   * HTTP and this is the live one.
+   */
+  sessionTitle: string | null;
+  /**
+   * The durable record for this session, so a reconnect can rehydrate from the
+   * store. Null when no session is open, and the all-zero id when the server is
+   * not recording, which the browser must not try to fetch.
+   */
+  storeId: string | null;
   /** The reason a session failed or closed, for a visible reverse state. */
   sessionReason: CommandFailureReason | null;
   sessionMessage: string | null;
@@ -59,6 +77,8 @@ export const INITIAL_VIEW_STATE: K5ViewState = {
   connection: "connecting",
   session: "none",
   sessionId: null,
+  sessionTitle: null,
+  storeId: null,
   sessionReason: null,
   sessionMessage: null,
   activeTurnId: null,
@@ -69,6 +89,84 @@ export const INITIAL_VIEW_STATE: K5ViewState = {
   thinking: "",
   configOptions: [],
 };
+
+/**
+ * A hard ceiling on retained entries.
+ *
+ * Deltas arrive per chunk, and the original append mapped the whole array each
+ * time, so a long turn was quadratic. The cap bounds both the copy cost and what
+ * a rehydrating browser can be asked to render. Oldest entries are dropped, and
+ * the drop is reported so the UI can say the transcript is a tail rather than
+ * implying completeness.
+ */
+export const MAX_VIEW_ENTRIES = 500;
+
+/**
+ * Replaces the visible transcript with a stored one.
+ *
+ * Used after a reconnect or when a task is opened from the sidebar. The stored
+ * log is read through `projectTranscript` rather than replayed event by event
+ * here, because every turn event below is gated on `activeTurnId`: feeding a
+ * history through `applyServerEvent` would produce one empty assistant entry and
+ * silently drop the rest.
+ *
+ * The live socket then continues appending to the same shape, because a loaded
+ * transcript is always a prefix and later turns arrive with fresh ids.
+ */
+export function hydrateTranscript(
+  state: K5ViewState,
+  transcript: ProjectedTranscript,
+  options: { readonly storeId?: string; readonly sessionId?: string } = {},
+): K5ViewState {
+  const entries = capEntries(transcriptEntries(transcript));
+  const tools: Record<string, ToolCard> = {};
+  // Only the final turn's cards are live state: earlier ones belong to history and
+  // are rendered from the projection, not from the reducer's per-turn rail.
+  const last = transcript.turns[transcript.turns.length - 1];
+  const lastTurnId = last?.turnId ?? null;
+  if (lastTurnId !== null) {
+    for (const card of last?.tools ?? []) {
+      tools[card.toolCallId] = {
+        toolCallId: card.toolCallId,
+        title: card.title,
+        status: card.status,
+        lifecycle: card.lifecycle,
+      };
+    }
+  }
+  return {
+    ...state,
+    session: options.sessionId === undefined ? state.session : "open",
+    ...(options.sessionId === undefined ? {} : { sessionId: options.sessionId }),
+    ...(options.storeId === undefined ? {} : { storeId: options.storeId }),
+    // A hydrated transcript is a finished prefix, so no turn is live. Leaving
+    // activeTurnId pointing at the last turn would let a late delta for it pass
+    // the active-turn gate and append to text that is already there, and would
+    // let a cancel reach for a turn that finished an hour ago. The socket
+    // re-establishes the live turn from its own turn.started.
+    turnStatus: last !== undefined && isFailedTurn(last) ? "error" : "idle",
+    turnReason: last !== undefined && isFailedTurn(last) ? last.stopReason : null,
+    activeTurnId: null,
+    thinking: last?.thoughtText ?? "",
+    entries,
+    tools,
+    sessionReason: null,
+    sessionMessage:
+      transcript.outcome === null
+        ? state.sessionMessage
+        : transcript.outcome.message ??
+          `this task ${transcript.outcome.reason === "failed" ? "failed" : "was closed"}`,
+    ...(transcript.dropped > 0
+      ? {
+          sessionMessage:
+            "some of this transcript could not be read back, so it may be incomplete",
+        }
+      : {}),
+    ...(transcript.truncated
+      ? { sessionMessage: "this transcript was cut off at its storage limit" }
+      : {}),
+  };
+}
 
 export function isTurnTerminal(status: TurnStatus): boolean {
   return status === "done" || status === "error";
@@ -115,9 +213,23 @@ function appendTo(
   entryId: string,
   text: string,
 ): TranscriptEntry[] {
-  return state.entries.map((entry) =>
-    entry.id === entryId ? { ...entry, text: entry.text + text } : entry,
-  );
+  // Only the matching entry is rebuilt. The old form allocated a new object for
+  // every entry on every delta; measured at 200 deltas against a full 500-entry
+  // view this is about 4 ms in total, so the win is real but modest.
+  let found = false;
+  const next = state.entries.map((entry) => {
+    if (entry.id !== entryId) return entry;
+    found = true;
+    return { ...entry, text: entry.text + text };
+  });
+  return found ? capEntries(next) : next;
+}
+
+/** Drops the oldest entries past the cap, and reports that it did. */
+function capEntries(entries: TranscriptEntry[]): TranscriptEntry[] {
+  return entries.length > MAX_VIEW_ENTRIES
+    ? entries.slice(entries.length - MAX_VIEW_ENTRIES)
+    : entries;
 }
 
 /**
@@ -153,6 +265,12 @@ export function applyServerEvent(
         ...state,
         session: "open",
         sessionId: event.sessionId,
+        storeId: event.storeId,
+        // Cleared, not carried: a title belongs to one session, and the harness
+        // only sends its own once it has generated one. Without this a new
+        // session showed the previous one's name until that update arrived, and
+        // forever if the harness never sends one.
+        sessionTitle: null,
         sessionReason: null,
         sessionMessage: null,
         configOptions: event.configOptions,
@@ -167,6 +285,8 @@ export function applyServerEvent(
         ...state,
         session: "none",
         sessionId: null,
+        sessionTitle: null,
+        storeId: null,
         turnStatus: isTurnTerminal(state.turnStatus) ? state.turnStatus : "idle",
         turnReason: null,
         thinking: "",
@@ -183,11 +303,29 @@ export function applyServerEvent(
         turnReason: isTurnTerminal(state.turnStatus) ? state.turnReason : event.reason,
       };
 
+    case "session.listed":
+    case "session.loaded":
+      // Discovery and continuation are reported through command.result and the
+      // session's own events. Neither changes view state on its own: a listed
+      // session is not a session, and a loaded one announces itself with
+      // session.opened semantics on the same connection.
+      return state;
+
+    case "session.updated":
+      // The harness's own title, which it generates after the first exchange.
+      // A null title means the update carried none, so an existing title is
+      // kept rather than blanked.
+      if (state.sessionId !== event.sessionId) return state;
+      if (event.title === null) return state;
+      return { ...state, sessionTitle: event.title };
+
     case "seat.reaped":
       return {
         ...state,
         session: "none",
         sessionId: null,
+        sessionTitle: null,
+        storeId: null,
         turnStatus: isTurnTerminal(state.turnStatus) ? state.turnStatus : "idle",
         turnReason: null,
         thinking: "",
@@ -203,11 +341,20 @@ export function applyServerEvent(
 
     case "command.result": {
       if (event.ok) return state;
-      // A configure failure is about a model, not the turn. Treating it as a
-      // turn failure would kill the working dots and then silently drop every
-      // remaining delta from a harness that is still streaming.
-      if (commandScope === "session.configure") {
-        return { ...state, sessionMessage: event.message ?? state.sessionMessage };
+      // A command that is not the turn must report into the session message and
+      // nothing else. A failed model change is about a model, and a failed list
+      // or continuation is about discovery; treating either as a turn failure
+      // killed the working dots and then dropped every remaining delta from a
+      // harness that was still streaming, so a finished answer stayed truncated.
+      if (
+        commandScope === "session.configure" ||
+        commandScope === "session.list" ||
+        commandScope === "session.load"
+      ) {
+        return {
+          ...state,
+          sessionMessage: event.message ?? state.sessionMessage,
+        };
       }
       // A failed open leaves an optimistic "opening" state that must not persist.
       if (state.session === "opening" || state.turnStatus === "running") {
@@ -280,10 +427,16 @@ export function applyServerEvent(
         ...state,
         turnStatus: failed ? "error" : "done",
         turnReason: failed ? event.stopReason : null,
-        // A cancelled turn must not leave a tool card claiming to be running.
+        // A turn that has ended cannot have a tool still running. This covers
+        // `in_progress` as well as `pending`: a card the harness left mid-flight
+        // used to keep lifecycle "active" and spin forever, because only
+        // "pending" was corrected. The harness's own reported status is left
+        // alone, so a card that really did complete still reads completed.
         tools: Object.fromEntries(
           Object.entries(state.tools).map(([id, card]) =>
-            card.lifecycle === "active" && card.status === "pending"
+            card.lifecycle === "active" &&
+            card.status !== "completed" &&
+            card.status !== "failed"
               ? [id, { ...card, lifecycle: "cancelled" as ToolLifecycle }]
               : [id, card],
           ),

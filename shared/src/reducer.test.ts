@@ -18,6 +18,7 @@ const opened: ServerEvent = {
   type: "session.opened",
   commandId: "c-1",
   sessionId: "s-1",
+  storeId: "11111111-1111-4111-8111-111111111111",
   projectId: "p-1",
   cwd: "/tmp/p",
   configOptions: [{ id: "model", name: "model", type: "select", current: null, values: [] }],
@@ -237,6 +238,7 @@ describe("configure failures are not turn failures", () => {
         type: "session.opened",
         commandId: "c-open",
         sessionId: "s-1",
+        storeId: "11111111-1111-4111-8111-111111111111",
         projectId: "p-1",
         cwd: "/tmp/p",
         configOptions: [],
@@ -292,4 +294,93 @@ describe("configure failures are not turn failures", () => {
     });
     assert.equal(after.entries.at(-1)?.text, "still going");
   });
+});
+
+it("a failed discovery or continuation is not a turn failure", () => {
+  // A sidebar refresh that fails while the model is working used to kill the turn:
+  // the dots stopped and every later delta was dropped, so a finished answer stayed
+  // truncated with an error badge on it.
+  for (const scope of ["session.list", "session.load", "session.configure"] as const) {
+    let state: K5ViewState = beginTurn(INITIAL_VIEW_STATE, "t-1", "do the thing");
+    state = applyServerEvent(state, {
+      type: "turn.started",
+      sessionId: "s-1",
+      turnId: "t-1",
+      userText: "do the thing",
+    });
+    state = applyServerEvent(state, {
+      type: "turn.delta",
+      sessionId: "s-1",
+      turnId: "t-1",
+      stream: "text",
+      text: "working on it",
+    });
+
+    state = applyServerEvent(
+      state,
+      { type: "command.result", commandId: "c-1", ok: false, reason: "posture-unverifiable", message: "no" },
+      scope,
+    );
+    assert.equal(state.turnStatus, "running", `a failed ${scope} must not stop the turn`);
+    assert.equal(state.sessionMessage, "no", `a failed ${scope} is reported`);
+
+    // And the stream continues to land.
+    state = applyServerEvent(state, {
+      type: "turn.delta",
+      sessionId: "s-1",
+      turnId: "t-1",
+      stream: "text",
+      text: " and finished",
+    });
+    state = applyServerEvent(state, {
+      type: "turn.completed",
+      sessionId: "s-1",
+      turnId: "t-1",
+      stopReason: "end_turn",
+    });
+    assert.equal(state.turnStatus, "done");
+    const assistant = state.entries.find((e) => e.id === "assistant:t-1");
+    assert.equal(assistant?.text, "working on it and finished", "the answer is not truncated");
+  }
+});
+
+it("a title does not leak from one session into the next", () => {
+  let state: K5ViewState = applyServerEvent(INITIAL_VIEW_STATE, {
+    type: "session.opened",
+    commandId: "c-1",
+    sessionId: "s-1",
+    storeId: "11111111-1111-4111-8111-111111111111",
+    projectId: "p-1",
+    cwd: "/tmp/p",
+    configOptions: [],
+  });
+  state = applyServerEvent(state, {
+    type: "session.updated",
+    sessionId: "s-1",
+    title: "Named task",
+    updatedAt: null,
+  });
+  assert.equal(state.sessionTitle, "Named task");
+
+  // A new session starts untitled, not carrying the previous one forward.
+  state = applyServerEvent(state, {
+    type: "session.opened",
+    commandId: "c-2",
+    sessionId: "s-2",
+    storeId: "11111111-1111-4111-8111-111111111111",
+    projectId: "p-1",
+    cwd: "/tmp/p",
+    configOptions: [],
+  });
+  assert.equal(state.sessionTitle, null, "a new session must not inherit a title");
+
+  // And a closed session drops it too.
+  state = applyServerEvent(state, {
+    type: "session.updated",
+    sessionId: "s-2",
+    title: "Second",
+    updatedAt: null,
+  });
+  state = applyServerEvent(state, { type: "session.closed", sessionId: "s-2", reason: "client-request" });
+  assert.equal(state.sessionTitle, null, "a closed session drops its title");
 });

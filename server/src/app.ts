@@ -1,6 +1,8 @@
 import { createServer, type Server } from "node:http";
 import type { Duplex } from "node:stream";
 import { handleProjectApiRequest } from "./project-api.js";
+import { handleSessionApiRequest, isSessionApiPath } from "./session-api.js";
+import type { SessionStore } from "./store/session-store.js";
 import { isAllowedHostHeader, type ServerConfig } from "./env.js";
 import {
   createGateway,
@@ -23,6 +25,12 @@ export interface CreateAppOptions {
   config: ServerConfig;
   bounds?: Partial<GatewayBounds>;
   /**
+   * Read side of the durable session store. Optional so a test can exercise the
+   * existing HTTP surface without standing up a store; when absent the session
+   * routes report that history is unavailable rather than 404-ing ambiguously.
+   */
+  store?: SessionStore;
+  /**
    * Called once per accepted browser socket. Required on purpose: a server with
    * no command sink would accept a browser, validate its commands, and discard
    * them, leaving the UI waiting on a request it can never match.
@@ -39,7 +47,6 @@ export const SHUTDOWN_HARD_MS = 8_000;
 export function createApp(options: CreateAppOptions): K5App {
   const { config } = options;
   const upgraded = new Set<Duplex>();
-
   const server = createServer((req, res) => {
     if (!isAllowedHostHeader(req.headers.host, config)) {
       // DNS rebinding makes a request same-origin, so this must be answered
@@ -57,16 +64,44 @@ export function createApp(options: CreateAppOptions): K5App {
       res.end(JSON.stringify({ status: "ok" }));
       return;
     }
-    handleProjectApiRequest(
-      req,
-      res,
-      () => {
-        res.statusCode = 404;
+
+    const notFound = (): void => {
+      res.statusCode = 404;
+      res.setHeader("Content-Type", "application/json; charset=utf-8");
+      res.end(JSON.stringify({ error: "Not found" }));
+    };
+
+    // One dispatch chain, so exactly one handler answers. Each handler calls
+    // `next()` only for paths that are not its own, which is the signal to keep
+    // looking; passing a shared terminal 404 to both would let the first one end
+    // the response and leave the second unable to reply.
+    let notAProjectRoute = false;
+    handleProjectApiRequest(req, res, () => {
+      notAProjectRoute = true;
+    }, config.workspaceRoot);
+    if (!notAProjectRoute) return;
+
+    // The same predicate the session handler uses, so /api/sessionsfoo is a 404
+    // rather than being treated as a session route.
+    const isSessionPath = isSessionApiPath(req.url?.split("?", 1)[0] ?? "");
+    if (options.store === undefined) {
+      if (isSessionPath) {
+        res.statusCode = 503;
         res.setHeader("Content-Type", "application/json; charset=utf-8");
-        res.end(JSON.stringify({ error: "Not found" }));
-      },
-      config.workspaceRoot,
-    );
+        res.setHeader("Cache-Control", "no-store");
+        res.end(JSON.stringify({ error: "Stored session history is unavailable" }));
+        return;
+      }
+      notFound();
+      return;
+    }
+    void handleSessionApiRequest(req, res, notFound, { store: options.store }).catch(() => {
+      if (!res.writableEnded) {
+        res.statusCode = 500;
+        res.setHeader("Content-Type", "application/json; charset=utf-8");
+        res.end(JSON.stringify({ error: "The session store failed" }));
+      }
+    });
   });
   server.headersTimeout = 10_000;
   server.requestTimeout = 30_000;
