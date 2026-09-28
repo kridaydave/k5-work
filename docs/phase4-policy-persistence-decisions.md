@@ -123,9 +123,114 @@ The forbidden-directory check runs on the resolved *base*, not the joined root, 
 fire. `$HOME/.local/share` is deliberately not forbidden: it is the spec's own default,
 and refusing it would stop every ordinary boot.
 
+## The seat's update stream belongs to the session, not to a turn
+
+`nextUpdate()` reads a queue that belongs to the ACP session, so there is exactly one
+pump for the seat's lifetime and it routes to whichever turn is active. A pump per turn
+means a cancelled turn's pump is still awaiting when the next turn begins, receives that
+turn's opening updates, drops them, and poisons the seat.
+
+Terminal state does not come from the pump's `stop` message. The SDK matches a prompt's
+response to that prompt, so `session.prompt()` resolving is the only trustworthy signal. A
+`stop` read off the shared queue cannot be attributed: a harness that ignores
+`$/cancelRequest` never sends one for the cancelled turn, so the next `stop` on the wire
+belongs to the *live* turn. Matching it against a list of abandoned turns swallowed the
+live turn's completion instead, which is what the failing test caught.
+
+## A drain bound belongs after the abort, not at the start
+
+`CANCEL_DRAIN_MS` was armed when a turn began, though its own comment said it bounded the
+drain for a cancelled or timed-out turn. Any turn slower than five seconds was settled as
+`cancelled` with its answer truncated mid-word, and the seat was then poisoned with
+"harness did not stop after a cancel", so every later prompt was refused. Real OpenCode
+turns measured 4.25s, 6.84s and 16.4s, so most of them were being killed.
+
+This is also why a model provider looked broken for a long stretch of this work. It was
+never broken. k5 was cancelling the turns. **When a component disagrees with itself, read
+the two claims before believing either:** the comment and the code here contradicted each
+other for the whole life of the bug, and the comment was the correct one.
+
+Fixing the timer exposed the pump bug underneath it, which the force-settle had been
+hiding. Expect that: a bound that fires early is often the only thing keeping a deeper
+defect from being visible.
+
+A cancelled turn keeps a drain window in which the harness's trailing updates are
+forgiven rather than treated as misbehaviour. That is what the five seconds was for
+originally.
+
+## Attachments reach the model inline, never by reference
+
+A `resource_link` is never emitted. k5 advertises `fs.readTextFile: false`, so a path on
+k5's disk is one the harness provably cannot open, and a link renders as a real attachment
+while delivering nothing. `resource` is exactly the variant gated on `embeddedContext`, so
+that one capability covers every kind and a harness without it refuses the turn outright
+rather than accepting one that claims an attachment the model never saw. Real OpenCode
+1.18.32 advertises `embeddedContext: true`, so the path is live.
+
+Attachment ids are k5-minted and opaque (`k5-attachment:<id>`). No filesystem path reaches
+a block, and a real 1x1 PNG was read back by the model through that scheme.
+
+An image rides as a `resource` block, not an `image` block, so there is one capability gate
+rather than two. The wire accepts it; whether the model can see it is a separate fact. The
+default model here has no vision and says so in plain words, which is a model capability
+and not a protocol failure.
+
+## Spooled bytes are charged, and charged back
+
+The whole-store ceiling was checked against a counter the spool never incremented, so every
+upload passed the check however many had gone before and the disk grew without bound.
+Spooled bytes are accrued per session and released on discard, on remove, and on eviction.
+
+Charging without discharging is its own bug: a store that once held a large attachment would
+refuse real writes for the rest of the process while the disk was wide open. All three
+release paths need a test, because the fourth path is the one someone will add.
+
+A partial upload leak is the same class of problem one layer up. Racing three uploads and
+refusing the second leaves two spooled, referenced by nothing, with the caller never learning
+their ids and no way out except deleting the whole task. The batch is settled rather than
+raced, and whatever landed is given back before the failure is reported.
+
+## Bytes are never recorded, only a manifest
+
+A base64 image in `events.jsonl` would blow the store's 12 MiB per-session cap and render as
+a wall of garbage in the user bubble. The transcript records name, mime, size and kind.
+
+## A resolved posture needs a discriminator or it is a lie
+
+When the resolver cannot be read, posture resolution substitutes a placeholder that carries
+`wildcardAllow: true`. Without a `verified` flag the browser cannot tell that placeholder
+from an observed blanket `*: allow`, and would render a verified claim out of a harness
+nobody checked. `verified` is keyed off the resolver having counted at least one rule, which
+is sound because the resolver throws on a rule list with no readable allow grant.
+
+It is checked **before** `wildcardAllow`, or the placeholder prints the lie.
+
+The posture is deliberately not persisted. It is a property of the seat, not of the
+conversation, so storing it repeats one unchanging value across the whole log and a
+rehydrated task would show the permissions of a harness that has since been reaped.
+
+The resolved posture was being discarded inside `SeatRunner.gate`. Putting the contract on
+the wire alone would have left the browser permanently unverified while the code looked
+complete, so a change that looked like plumbing was load-bearing.
+
+## A skip that excuses a fixed bug lets it survive twice
+
+The real-harness test had grown a branch that skipped when a turn came back `cancelled`,
+documenting k5's own five-second drain as though it were the provider's state. It kept the
+suite green while the bug was live. It is deleted, and the test now asserts a real terminal
+stop.
+
+The general rule: when a test is made lenient to accommodate a defect, the leniency needs
+an owner and a removal condition. Otherwise it becomes the contract.
+
 ## Test registration is explicit and silent
 
 `shared` and `server` run `node --test` over a hand-listed set of compiled files. A new
 test file that is not added to that list does not fail, does not run, and is invisible:
-`sessions.test.ts` sat unregistered through several rounds of work, with ten tests that
-had never once executed. A suite that cannot fail is not a suite.
+`sessions.test.ts` sat unregistered through several rounds of work, with ten tests that had
+never once executed. A suite that cannot fail is not a suite.
+
+The fake harness responds in milliseconds, so no fake-harness suite can prove anything about
+a turn that is supposed to take time. A green suite over fakes is not evidence about real
+latency, and that gap hid a bug that shipped in this branch.
+

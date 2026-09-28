@@ -26,14 +26,12 @@ import { SessionStore } from "../store/session-store.js";
 // existing there. It is asserted as the value measured against the real binary,
 // not as whatever the binary happens to say on the day.
 //
-// One thing this file found while being written, recorded here because it decides
-// how the last test reads: a real turn that OpenCode answers with end_turn after
-// 6.8s and 16.4s comes back from AcpSeat.prompt as "cancelled", with the seat
-// poisoned and every later prompt refused. acp-seat.ts arms a 5s CANCEL_DRAIN_MS
-// timer at the start of every turn instead of after a cancel, so it gives up on
-// any turn slower than five seconds. The source is left alone for Kriday to
-// decide on; the last test therefore records "cancelled" and asserts nothing
-// about it in either direction.
+// This file found a real bug while being written: a turn the harness answered with
+// end_turn after 6.8s and 16.4s came back as "cancelled", with the seat poisoned,
+// because acp-seat.ts armed its 5s drain at the start of every turn instead of
+// after a cancel. That is fixed, and the fix is proved against the real binary in
+// slow-turn-opencode.test.ts. The last test below now asserts a real terminal stop
+// rather than recording whatever the day produced.
 
 const OPENCODE_ARGV = ["opencode", "acp"];
 // A cold `session/new` against a real harness routinely takes tens of seconds.
@@ -537,23 +535,11 @@ describe("attachments and session adoption against a real opencode", () => {
         `seat poisoned=${String(seat.poisoned)}`,
     );
 
-    // "cancelled" here is NOT a claim that the provider is unwell, and this test
-    // deliberately does not assert it as the expected outcome either way. Measured
-    // against real OpenCode 1.18.32: a healthy turn that answers `end_turn` after
-    // 6.8s and 16.4s comes back as "cancelled" here, because acp-seat.ts arms a
-    // CANCEL_DRAIN_MS (5s) drain timer at the start of every turn rather than after
-    // a cancel. So "cancelled" is this seat's own timeout, and reporting it as the
-    // provider's state would be a wrong diagnosis. See the note in the file header.
-    if (stop === "cancelled") {
-      t.skip(
-        'the turn settled as "cancelled" with seat poisoned -- which on this seat means acp-seat.ts\'s 5s CANCEL_DRAIN_MS fired on a turn that was never cancelled (a healthy real turn measured 6.8s and 16.4s to end_turn). Recorded as the observed state, asserted in neither direction: encoding it as expected would make the bug the contract.',
-      );
-      return;
-    }
-
-    // A terminal stop reason means the pump unwound and released the turn. A
-    // leaked turn here would make every later prompt on this seat fail with
-    // "a turn is already running", which is the failure this asserts against.
+    // A real turn must reach a real terminal stop. This branch used to skip on
+    // "cancelled", documenting the seat's own five-second drain as if it were the
+    // provider's state. It was k5 killing healthy turns, it is fixed, and a skip
+    // that excuses a fixed bug is how the same bug survives a second time.
+    assert.notEqual(stop, "cancelled", "a turn that was never cancelled must not settle as cancelled");
     assert.notEqual(stop, "", "the turn reported no stop reason");
     assert.equal(seat.busy, false, "the seat still holds a turn after a terminal stop reason");
   });
