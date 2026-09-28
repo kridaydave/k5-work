@@ -112,12 +112,126 @@ function isUnrecorded(storeId: string | null | undefined): boolean {
   );
 }
 
+/** One page from the store. I/O only; it makes no policy decision. */
+async function readPage(storeId: string, since: number | null): Promise<SessionEventsResponse> {
+  const query = new URLSearchParams({ limit: String(MAX_EVENTS_PER_PAGE) });
+  if (since !== null) query.set("since", String(since));
+  const response = await fetch(
+    `/api/sessions/${encodeURIComponent(storeId)}/events?${query.toString()}`,
+    { headers: { Accept: "application/json" } },
+  );
+  if (!response.ok) throw new Error(`the transcript could not be read (${String(response.status)}`);
+  return SessionEventsResponseSchema.parse(await response.json());
+}
+
+/**
+ * The cursor and restart policy, as a state machine.
+ *
+ * This was one function with eleven branches, and it is where both bugs this
+ * reader ever had lived: an eager clear that erased a full transcript, then a
+ * second refusal that re-erased it. The states are named now and the only way out
+ * of a refusal is the single restart, so "how many times may this happen" is a
+ * property of the machine rather than a detail of the loop wrapped around it.
+ */
+class TranscriptCursor {
+  private readonly bySeq = new Map<number, StoredEvent>();
+  private since: number | null;
+  private nextSince: number | null;
+  private dropped = 0;
+  private truncated = false;
+  private restarted = false;
+  /** Set when the store disowned a cursor, which is a hard signal to rehydrate. */
+  rehydrateRequired = false;
+
+  constructor(since: number | null) {
+    this.since = since;
+    this.nextSince = since;
+  }
+
+  /** The cursor the next request should carry. */
+  get cursor(): number | null {
+    return this.since;
+  }
+
+  /** Absorbs one page. Returns false when there is nothing left worth asking for. */
+  accept(page: SessionEventsResponse): boolean {
+    if (page.status === "cursor-too-old" || page.status === "cursor-invalid") {
+      this.rehydrateRequired = true;
+      // With no cursor of our own the store is refusing the start of the log, and
+      // asking again cannot help. Report what was read as a prefix and stop.
+      if (this.restarted || this.since === null) {
+        this.truncated = true;
+        return false;
+      }
+      // The discard is deliberately NOT here. It happens when a restart returns a
+      // usable page and not before: clearing now, then finding the restart also
+      // refused, erased a full transcript and left nothing to report.
+      this.restarted = true;
+      this.since = null;
+      return true;
+    }
+
+    if (this.restarted) {
+      this.bySeq.clear();
+      this.dropped = 0;
+      this.restarted = false;
+    }
+    for (const event of page.events) this.bySeq.set(event.seq, event);
+    this.dropped += page.dropped;
+    this.nextSince = page.nextSince;
+    this.since = page.nextSince;
+    // A page that claims more but carries nothing, or carries nothing to page
+    // past, is a store that will not advance. Continuing re-requests the same
+    // cursor until the page bound, so stop and call what we have a prefix.
+    if (!page.hasMore) return false;
+    if (page.nextSince === null) {
+      this.truncated = true;
+      return false;
+    }
+    if (page.events.length === 0) {
+      this.truncated = true;
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * Closes the read. `budgetExhausted` is true when the page bound ended the
+   * loop rather than the store.
+   */
+  finish(budgetExhausted: boolean): {
+    records: StoredEvent[];
+    nextSince: number | null;
+    truncated: boolean;
+    dropped: number;
+  } {
+    if (budgetExhausted) {
+      // Anything still unread once the budget is gone is a prefix, and the caller
+      // has to be able to tell that from a complete history.
+      const last = parsedLastSeq(this.bySeq);
+      if (last !== null && this.nextSince !== null && this.nextSince < last) this.truncated = true;
+      if (this.bySeq.size === MAX_EVENTS_PER_PAGE * MAX_TRANSCRIPT_PAGES) this.truncated = true;
+    }
+    return {
+      records: [...this.bySeq.values()].sort((a, b) => a.seq - b.seq),
+      nextSince: this.nextSince,
+      truncated: this.truncated,
+      dropped: this.dropped,
+    };
+  }
+}
+
 /**
  * Reads a stored transcript, paging until the store says there is no more.
  *
  * The four replay states are honoured explicitly: `cursor-too-old` and
  * `cursor-invalid` both mean the client's cursor cannot be used, so the read
- * restarts from the beginning rather than silently returning a partial history.
+ * restarts from the beginning rather than silently returning partial history.
+ *
+ * Records are keyed by seq, so a store that reports hasMore with a cursor that
+ * has stopped advancing cannot duplicate them: the page bound stops the loop and
+ * the keying makes a repeat a no-op. A cursor comparison cannot do this, because
+ * a first request has no previous cursor to compare against.
  */
 export async function readStoredTranscript(
   storeId: string,
@@ -126,78 +240,22 @@ export async function readStoredTranscript(
   if (isUnrecorded(storeId)) {
     return { transcript: projectTranscript([]), nextSince: null, rehydrateRequired: false };
   }
-  // Keyed by seq, so a store that reports hasMore with a cursor that has stopped
-  // advancing cannot duplicate records: the page bound stops the loop and the
-  // keying makes a repeat a no-op. A cursor comparison cannot do this, because a
-  // first request has no previous cursor to compare against.
-  const bySeq = new Map<number, StoredEvent>();
-  let since: number | null = options.since ?? null;
-  let nextSince: number | null = options.since ?? null;
-  let rehydrateRequired = false;
-  let truncated = false;
-  let dropped = 0;
-  let restarted = false;
-
+  const cursor = new TranscriptCursor(options.since ?? null);
+  let budgetExhausted = true;
   for (let page = 0; page < MAX_TRANSCRIPT_PAGES; page += 1) {
-    const query = new URLSearchParams({ limit: String(MAX_EVENTS_PER_PAGE) });
-    if (since !== null) query.set("since", String(since));
-    const response = await fetch(
-      `/api/sessions/${encodeURIComponent(storeId)}/events?${query.toString()}`,
-      { headers: { Accept: "application/json" } },
-    );
-    if (!response.ok) throw new Error(`the transcript could not be read (${String(response.status)})`);
-    const parsed: SessionEventsResponse = SessionEventsResponseSchema.parse(await response.json());
-
-    // A cursor the store will not honour means its idea of the log and this
-    // client's disagree. Read from the beginning, once. The discard is deferred
-    // until that restart actually returns a usable page: clearing eagerly and
-    // then finding the restart also refused the cursor erased a full transcript
-    // and left nothing to report, which is how a readable session came back empty.
-    if (parsed.status === "cursor-too-old" || parsed.status === "cursor-invalid") {
-      if (restarted || since === null) {
-        truncated = true;
-        rehydrateRequired = true;
-        break;
-      }
-      restarted = true;
-      rehydrateRequired = true;
-      since = null;
-      continue;
+    if (!cursor.accept(await readPage(storeId, cursor.cursor))) {
+      budgetExhausted = false;
+      break;
     }
-
-    if (restarted) {
-      // The restart worked, so what came before it was read against a cursor the
-      // store has disowned.
-      bySeq.clear();
-      dropped = 0;
-      restarted = false;
-    }
-    for (const event of parsed.events) bySeq.set(event.seq, event);
-    dropped += parsed.dropped;
-    nextSince = parsed.nextSince;
-    since = parsed.nextSince;
-    if (!parsed.hasMore) break;
-    if (parsed.nextSince === null) break;
-    if (parsed.events.length === 0) break;
   }
-
-  // Anything still unread once the page budget is gone is a prefix, and the
-  // caller has to be able to tell that from a complete history.
-  if (since !== null) {
-    const last = parsedLastSeq(bySeq);
-    if (last !== null && nextSince !== null && nextSince < last) truncated = true;
-    if (bySeq.size === MAX_EVENTS_PER_PAGE * MAX_TRANSCRIPT_PAGES) truncated = true;
-  }
-
-  const records = [...bySeq.values()].sort((a, b) => a.seq - b.seq);
-
+  const read = cursor.finish(budgetExhausted);
   return {
     transcript: projectTranscript(
-      records.map((record) => ({ v: 1 as const, seq: record.seq, ts: record.ts, event: record.event })),
-      { truncated, dropped },
+      read.records.map((record) => ({ v: 1 as const, seq: record.seq, ts: record.ts, event: record.event })),
+      { truncated: read.truncated, dropped: read.dropped },
     ),
-    nextSince,
-    rehydrateRequired,
+    nextSince: read.nextSince,
+    rehydrateRequired: cursor.rehydrateRequired,
   };
 }
 

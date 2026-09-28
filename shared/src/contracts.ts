@@ -80,6 +80,22 @@ export type SessionConfigureCommand = z.infer<
   typeof SessionConfigureCommandSchema
 >;
 
+/**
+ * Ceiling on a prompt's text, in UTF-8 bytes rather than characters.
+ *
+ * The character cap was 20,000 code units, which reads as "20,000 characters" and
+ * is not what the transport allows. The websocket caps a frame at 64 KiB of
+ * bytes, so 20,000 CJK characters is 60,000 bytes and 20,000 emoji is 80,000. A
+ * prompt that passed the schema was then killed by the gateway with a 1009 and
+ * no `command.result`, so the optimistic turn hung and the whole socket
+ * reconnected. Measured in bytes, "over budget" is an ordinary invalid payload
+ * the gateway answers with a correlated result.
+ *
+ * The store's own per-record cap is 256 KiB, so this stays far inside it and
+ * `turn.started.userText` needs no matching change.
+ */
+export const MAX_PROMPT_TEXT_BYTES = 48 * 1024;
+
 export const SessionPromptCommandSchema = z
   .object({
     ...commandBase,
@@ -137,15 +153,78 @@ export const SessionLoadCommandSchema = z
   .strict();
 export type SessionLoadCommand = z.infer<typeof SessionLoadCommandSchema>;
 
-export const BrowserCommandSchema = z.discriminatedUnion("type", [
-  SessionOpenCommandSchema,
-  SessionConfigureCommandSchema,
-  SessionPromptCommandSchema,
-  SessionCancelCommandSchema,
-  SessionCloseCommandSchema,
-  SessionListCommandSchema,
-  SessionLoadCommandSchema,
+/**
+ * Every command the browser may send, in one place.
+ *
+ * The union is derived from this list rather than hand-listed, so the guard that
+ * stops a new command from shipping untested has something of ours to read. A
+ * test reaching into `ZodDiscriminatedUnion.options` would be asserting on a
+ * library's internals instead of on our contract.
+ */
+export const BROWSER_COMMAND_TYPES = [
+  "session.open",
+  "session.configure",
+  "session.prompt",
+  "session.cancel",
+  "session.close",
+  "session.list",
+  "session.load",
+] as const;
+
+export type BrowserCommandType = (typeof BROWSER_COMMAND_TYPES)[number];
+
+/**
+ * Keyed by the same names as `BROWSER_COMMAND_TYPES`, so the union below is built
+ * from lookups and cannot quietly grow a member the list does not name.
+ *
+ * `satisfies` and not an annotation: an annotation widens each entry to the
+ * generic `ZodDiscriminatedUnionOption`, which erases every command's own `type`
+ * literal. That leaves the server's dispatch switch with nothing to narrow on,
+ * so each handler's parameter resolves to `never`. `satisfies` checks the same
+ * thing and keeps the precise types.
+ */
+const BROWSER_COMMAND_SCHEMAS = {
+  "session.open": SessionOpenCommandSchema,
+  "session.configure": SessionConfigureCommandSchema,
+  "session.prompt": SessionPromptCommandSchema,
+  "session.cancel": SessionCancelCommandSchema,
+  "session.close": SessionCloseCommandSchema,
+  "session.list": SessionListCommandSchema,
+  "session.load": SessionLoadCommandSchema,
+} satisfies Record<BrowserCommandType, z.ZodTypeAny>;
+
+const BrowserCommandUnionSchema = z.discriminatedUnion("type", [
+  BROWSER_COMMAND_SCHEMAS["session.open"],
+  BROWSER_COMMAND_SCHEMAS["session.configure"],
+  BROWSER_COMMAND_SCHEMAS["session.prompt"],
+  BROWSER_COMMAND_SCHEMAS["session.cancel"],
+  BROWSER_COMMAND_SCHEMAS["session.close"],
+  BROWSER_COMMAND_SCHEMAS["session.list"],
+  BROWSER_COMMAND_SCHEMAS["session.load"],
 ]);
+
+/**
+ * The union plus the one check that cannot live on a member.
+ *
+ * It lives here because a `discriminatedUnion` member must be a plain object, and
+ * `.superRefine` returns a `ZodEffects` that cannot sit inside one. The browser
+ * validates every command it sends against this schema, so putting the budget
+ * here is what turns an over-budget prompt into a refused command rather than a
+ * socket the gateway closes.
+ */
+export const BrowserCommandSchema = BrowserCommandUnionSchema.superRefine(
+  (command, ctx) => {
+    if (command.type !== "session.prompt") return;
+    const bytes = new TextEncoder().encode(command.text).length;
+    if (bytes > MAX_PROMPT_TEXT_BYTES) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["text"],
+        message: `the prompt is ${bytes} bytes of UTF-8, over the ${MAX_PROMPT_TEXT_BYTES}-byte cap`,
+      });
+    }
+  },
+);
 export type BrowserCommand = z.infer<typeof BrowserCommandSchema>;
 
 // --- events ---

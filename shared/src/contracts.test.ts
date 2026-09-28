@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
+  BROWSER_COMMAND_TYPES,
   BrowserCommandSchema,
   CommandFailureReasonSchema,
   ServerEventSchema,
@@ -12,7 +13,6 @@ describe("browser command contract", () => {
   it("accepts every command the union declares", () => {
     // Enumerated from the schema rather than hand-listed, so a new command cannot
     // be added to the union and left untested.
-    assert.equal(BrowserCommandSchema.options.length, 7, "the browser command union grew");
     const commands = [
       { ...base, type: "session.open", projectId: "p-1" },
       {
@@ -32,6 +32,11 @@ describe("browser command contract", () => {
         storeId: "11111111-1111-4111-8111-111111111111",
       },
     ];
+    assert.equal(
+      commands.length,
+      BROWSER_COMMAND_TYPES.length,
+      "a command was added to the union and not exercised here",
+    );
     for (const command of commands) {
       const parsed = BrowserCommandSchema.safeParse(command);
       assert.equal(parsed.success, true, `${command.type} must parse`);
@@ -221,5 +226,39 @@ describe("server event contract", () => {
       false,
       "bounded by the same cap as session.prompt",
     );
+  });
+});
+
+describe("a prompt is capped in bytes, not in characters", () => {
+  const base = { commandId: "c-1", type: "session.prompt", sessionId: "s-1", turnId: "t-1" };
+
+  it("refuses a prompt whose UTF-8 encoding does not fit the frame", () => {
+    // 20,000 CJK characters is 20,000 code units, so it passes the character cap,
+    // and 60,000 bytes, so it does not fit a 64 KiB frame. Before this the
+    // gateway killed the socket with no command.result at all.
+    const cjk = "\u4f60\u597d".repeat(10_000);
+    const parsed = BrowserCommandSchema.safeParse({ ...base, text: cjk });
+    assert.equal(parsed.success, false);
+    assert.equal(parsed.error?.issues[0]?.path.join("."), "text");
+    assert.match(parsed.error?.issues[0]?.message ?? "", /bytes of UTF-8/);
+  });
+
+  it("accepts a prompt of emoji right at the character cap", () => {
+    // The byte cap does not over-reject. 10,000 emoji is the most the character
+    // cap allows, and it is 40,000 bytes, which fits. Only a script that costs
+    // three or more bytes per code unit can actually reach 48 KiB, and a
+    // byte-blind cap is what used to kill those.
+    const emoji = "\u{1f600}".repeat(10_000);
+    assert.equal(emoji.length, 20_000, "at the character cap");
+    assert.equal(new TextEncoder().encode(emoji).length, 40_000);
+    assert.equal(BrowserCommandSchema.safeParse({ ...base, text: emoji }).success, true);
+  });
+
+  it("still accepts an ordinary prompt, and one right at the byte cap", () => {
+    assert.equal(BrowserCommandSchema.safeParse({ ...base, text: "hi" }).success, true);
+    // 16,384 three-byte CJK characters is exactly 48 KiB.
+    const atCap = "\u4f60\u597d".repeat(8_192);
+    assert.equal(atCap.length, 16_384, "the character cap is not the one doing the work");
+    assert.equal(BrowserCommandSchema.safeParse({ ...base, text: atCap }).success, true);
   });
 });
