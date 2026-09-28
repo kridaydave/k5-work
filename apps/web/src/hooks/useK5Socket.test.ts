@@ -1,5 +1,6 @@
 import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { MAX_ATTACHMENTS } from "@k5-work/shared";
 import type { ServerEvent } from "@k5-work/shared";
 import type { Scheduler } from "@k5-work/shared";
 import { useK5Socket } from "./useK5Socket";
@@ -394,6 +395,64 @@ describe("useK5Socket", () => {
       });
     });
     expect(result.current.state.configOptions[0].current).toBe("opencode/space-bunny-free");
+  });
+});
+
+describe("prompt attachments", () => {
+  async function mountOpen() {
+    const view = await mount();
+    const socket = view.sockets.at(-1)!;
+    act(() => {
+      socket.receive({
+        type: "session.opened",
+        commandId: "c-1",
+        sessionId: "s-1",
+        storeId: "11111111-1111-4111-8111-111111111111",
+        projectId: "p-1",
+        cwd: "/tmp/p",
+        configOptions: [],
+      });
+    });
+    return { ...view, socket };
+  }
+
+  it("puts the spooled attachment ids in the sent frame", async () => {
+    // The command carries identity only: the name, mime and size are the server's
+    // to read back off the bytes.
+    const { result, socket } = await mountOpen();
+
+    act(() => result.current.prompt("what is wrong here?", [{ attachmentId: "att-1" }]));
+
+    const prompt = socket.commands().find((command) => command.type === "session.prompt");
+    expect(prompt?.attachments).toEqual([{ attachmentId: "att-1" }]);
+  });
+
+  it("sends an empty list when a prompt carries no attachments", async () => {
+    // Asserted rather than assumed: the schema defaults the field, and the frame
+    // the server parses is the schema's output, not the caller's object.
+    const { result, socket } = await mountOpen();
+
+    act(() => result.current.prompt("just text"));
+
+    const prompt = socket.commands().find((command) => command.type === "session.prompt");
+    expect(prompt?.attachments).toEqual([]);
+  });
+
+  it("refuses an over-budget prompt instead of putting it on the wire", async () => {
+    const { result, socket } = await mountOpen();
+
+    act(() =>
+      result.current.prompt(
+        "too many",
+        Array.from({ length: MAX_ATTACHMENTS + 1 }, (_, index) => ({
+          attachmentId: `att-${String(index)}`,
+        })),
+      ),
+    );
+
+    expect(socket.commands().map((command) => command.type)).not.toContain("session.prompt");
+    expect(result.current.state.turnStatus).toBe("error");
+    expect(result.current.state.sessionMessage).toMatch(/wire contract/);
   });
 });
 

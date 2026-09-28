@@ -21,6 +21,10 @@ export const SCENARIOS = [
   "protocol-mismatch",
   "session-new-auth-required",
   "echo",
+  // Repeats the received prompt back verbatim. The only way a test can see what
+  // the harness actually got, rather than what k5 believes it sent.
+  "echo-blocks",
+  "no-embedded-context",
   "slow",
   "unsupported-request",
   "long-title",
@@ -62,6 +66,19 @@ export function initializeResult(scenario: Scenario): Json {
     return {
       ...base,
       agentCapabilities: { loadSession: false, sessionCapabilities: {} },
+    };
+  }
+  if (scenario === "no-embedded-context") {
+    // Text prompts only. `promptCapabilities.embeddedContext` is the gate on ACP
+    // `resource` blocks, so this harness provably cannot take an attachment and
+    // k5 must refuse the turn rather than send a block it will drop.
+    return {
+      ...base,
+      agentCapabilities: {
+        loadSession: true,
+        sessionCapabilities: { list: {}, resume: {}, close: {} },
+        promptCapabilities: { image: true },
+      },
     };
   }
   if (scenario === "weird-caps") {
@@ -116,7 +133,12 @@ function configOptionsFixture(): Json[] {
   ];
 }
 
-export function promptScript(scenario: Scenario, text: string, sessionId = "fake-session-1"): {
+export function promptScript(
+  scenario: Scenario,
+  text: string,
+  sessionId = "fake-session-1",
+  blocks: unknown = null,
+): {
   notifications: Json[];
   response: Json;
 } {
@@ -190,8 +212,16 @@ export function promptScript(scenario: Scenario, text: string, sessionId = "fake
       },
     });
   }
+  // An attachment arrives as a `resource` block, which carries no text, so a
+  // prompt that only joined the text blocks would look identical to one with no
+  // attachment at all. Serialising the whole received array is what makes the
+  // difference observable from the outside.
   const pieces =
-    scenario === "echo" ? [`echo: ${text}`] : ["first ", "second ", "third"];
+    scenario === "echo"
+      ? [`echo: ${text}`]
+      : scenario === "echo-blocks"
+        ? [`blocks:${JSON.stringify(blocks)}`]
+        : ["first ", "second ", "third"];
   for (const piece of pieces) {
     notifications.push({
       jsonrpc: "2.0",
@@ -353,11 +383,12 @@ export function handleMessage(
         return { error: { code: -32601, message: "session/prompt unsupported" } };
       }
       const promptSessionId = String(params?.sessionId ?? "fake-session-1");
-    const prompt = params?.prompt as { type?: string; text?: string }[] | undefined;
-      const text = Array.isArray(prompt)
-        ? prompt.filter((b) => b?.type === "text").map((b) => b?.text ?? "").join("")
-        : "";
-      const script = promptScript(scenario, text, promptSessionId);
+      const prompt = Array.isArray(params?.prompt) ? (params?.prompt as Json[]) : [];
+      const text = prompt
+        .filter((b) => b?.["type"] === "text")
+        .map((b) => String(b?.["text"] ?? ""))
+        .join("");
+      const script = promptScript(scenario, text, promptSessionId, prompt);
       if (scenario === "permission") {
         pending.push(
           {

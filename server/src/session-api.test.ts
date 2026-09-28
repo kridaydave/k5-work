@@ -6,14 +6,18 @@ import os from "node:os";
 import path from "node:path";
 import { request } from "node:http";
 import type { AddressInfo } from "node:net";
+import { MAX_ATTACHMENT_BYTES } from "@k5-work/shared";
 import { createApp, type K5App } from "./app.js";
 import { loadServerConfig } from "./env.js";
+import { SessionStoreError } from "./store/errors.js";
 import { SessionStore } from "./store/session-store.js";
 import type { AcceptedConnection, ConnectionHandlers } from "./ws/gateway.js";
 
 interface Harness {
   readonly url: string;
   readonly store: SessionStore;
+  /** The store's root, so a test can remove a session behind the store's back. */
+  readonly root: string;
   close(): Promise<void>;
 }
 
@@ -27,6 +31,13 @@ function tempHome(prefix: string): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
 
+async function sessionDirName(root: string): Promise<string> {
+  const entries = await fsp.readdir(root, { withFileTypes: true });
+  const dir = entries.find((entry) => entry.isDirectory());
+  assert.ok(dir, "expected a session directory");
+  return dir.name;
+}
+
 /**
  * A raw request per call rather than fetch: undici pools keep-alive sockets, and
  * a pooled idle socket is enough to make server.close() never call back, which
@@ -36,8 +47,8 @@ function tempHome(prefix: string): string {
 function send(
   baseUrl: string,
   pathname: string,
-  options: { method?: string; host?: string } = {},
-): Promise<{ status: number; body: unknown; allow: string | undefined }> {
+  options: { method?: string; host?: string; body?: Buffer; headers?: Record<string, string> } = {},
+): Promise<{ status: number; body: unknown; allow: string | undefined; cacheControl: string | undefined }> {
   const target = new URL(pathname, baseUrl);
   return new Promise((resolve, reject) => {
     const outgoing = request(
@@ -47,7 +58,10 @@ function send(
         path: `${target.pathname}${target.search}`,
         method: options.method ?? "GET",
         agent: false,
-        headers: options.host === undefined ? {} : { Host: options.host },
+        headers: {
+          ...(options.host === undefined ? {} : { Host: options.host }),
+          ...(options.headers ?? {}),
+        },
       },
       (response) => {
         const chunks: Buffer[] = [];
@@ -64,12 +78,60 @@ function send(
             status: response.statusCode ?? 0,
             body,
             allow: response.headers.allow,
+            cacheControl: response.headers["cache-control"],
           });
         });
       },
     );
     outgoing.once("error", reject);
-    outgoing.end();
+    if (options.body === undefined) {
+      outgoing.end();
+      return;
+    }
+    outgoing.end(options.body);
+  });
+}
+
+/**
+ * A body sent without a Content-Length, so the cap can only be enforced while
+ * reading. Node frames it chunked, which is how most real clients upload.
+ */
+function sendChunked(
+  baseUrl: string,
+  pathname: string,
+  total: number,
+): Promise<{ status: number }> {
+  const target = new URL(pathname, baseUrl);
+  return new Promise((resolve, reject) => {
+    const outgoing = request(
+      {
+        hostname: target.hostname,
+        port: target.port,
+        path: `${target.pathname}${target.search}`,
+        method: "POST",
+        agent: false,
+        headers: { "Transfer-Encoding": "chunked" },
+      },
+      (response) => {
+        response.resume();
+        response.once("end", () => resolve({ status: response.statusCode ?? 0 }));
+      },
+    );
+    outgoing.once("error", reject);
+    const chunk = Buffer.alloc(64 * 1024, 0x20);
+    let sent = 0;
+    const pump = (): void => {
+      while (sent < total) {
+        const piece = Math.min(chunk.length, total - sent);
+        sent += piece;
+        if (!outgoing.write(piece === chunk.length ? chunk : chunk.subarray(0, piece))) {
+          outgoing.once("drain", pump);
+          return;
+        }
+      }
+      outgoing.end();
+    };
+    pump();
   });
 }
 
@@ -92,6 +154,7 @@ async function startHarness(): Promise<Harness> {
   return {
     url: `http://127.0.0.1:${address.port}`,
     store,
+    root: config.storeRoot,
     close: async () => {
       await stopApp(app);
       await store.close();
@@ -323,6 +386,210 @@ test("a malformed percent-encoding in the id is a client error, not a store faul
       const result = await send(harness.url, attempt);
       assert.equal(result.status, 400, `${attempt} should be a 400, not a 500`);
     }
+  } finally {
+    await harness.close();
+  }
+});
+
+test("an upload is answered with a manifest the server derived, and the bytes are readable", async () => {
+  const harness = await startHarness();
+  try {
+    const session = await harness.store.create({
+      harness: "opencode",
+      harnessSessionId: "ses_1",
+      projectId: "p",
+      projectName: null,
+      cwd: "/tmp/p",
+      title: "With a file",
+    });
+    // The client lies about the type on purpose: these four bytes are a PNG
+    // header, and the manifest must describe what arrived.
+    const png = Buffer.from([0x89, 0x50, 0x4e, 0x47]);
+    const query = new URLSearchParams({ name: "shot.png", mime: "text/plain" });
+    const uploaded = await send(
+      harness.url,
+      `/api/sessions/${session.storeId}/attachments?${query.toString()}`,
+      { method: "POST", body: png, headers: { "Content-Type": "application/octet-stream" } },
+    );
+    assert.equal(uploaded.status, 200);
+    assert.equal(uploaded.cacheControl, "no-store", "an upload is not a cacheable read");
+    const manifest = uploaded.body as {
+      attachmentId: string;
+      name: string;
+      mimeType: string;
+      kind: string;
+      size: number;
+    };
+    assert.equal(manifest.name, "shot.png");
+    assert.equal(manifest.mimeType, "text/plain");
+    assert.equal(manifest.kind, "binary", "kind comes from the bytes, not the declared mime");
+    assert.equal(manifest.size, 4);
+    assert.equal(manifest.attachmentId.length > 0, true);
+    // And the id really addresses the bytes on disk, which is what a later prompt
+    // depends on.
+    assert.deepEqual(await harness.store.readAttachment(session.storeId, manifest.attachmentId), png);
+
+    // The body is the file, not JSON: a text attachment round-trips exactly.
+    const text = Buffer.from("héllo wörld\n", "utf8");
+    const textQuery = new URLSearchParams({ name: "notes.txt", mime: "text/plain" });
+    const textUpload = await send(
+      harness.url,
+      `/api/sessions/${session.storeId}/attachments?${textQuery.toString()}`,
+      { method: "POST", body: text },
+    );
+    assert.equal(textUpload.status, 200);
+    const textManifest = textUpload.body as { attachmentId: string; kind: string; size: number };
+    assert.equal(textManifest.kind, "text");
+    assert.equal(textManifest.size, text.length);
+    assert.deepEqual(
+      await harness.store.readAttachment(session.storeId, textManifest.attachmentId),
+      text,
+    );
+  } finally {
+    await harness.close();
+  }
+});
+
+test("an upload over the byte cap is refused, and an unknown session is a 404", async () => {
+  const harness = await startHarness();
+  try {
+    const session = await harness.store.create({
+      harness: "opencode",
+      harnessSessionId: "ses_1",
+      projectId: "p",
+      projectName: null,
+      cwd: "/tmp/p",
+      title: "Capped",
+    });
+    const query = new URLSearchParams({ name: "huge.bin", mime: "application/octet-stream" });
+    const tooLarge = await send(
+      harness.url,
+      `/api/sessions/${session.storeId}/attachments?${query.toString()}`,
+      { method: "POST", body: Buffer.alloc(MAX_ATTACHMENT_BYTES + 1) },
+    );
+    assert.equal(tooLarge.status, 413, "the cap is enforced before the bytes are stored");
+    const dir = path.join(harness.root, await sessionDirName(harness.root));
+    assert.deepEqual(
+      (await fsp.readdir(dir)).filter((name) => name !== "meta.json" && name !== "events.jsonl"),
+      [],
+      "and nothing was written",
+    );
+
+    const unknownQuery = new URLSearchParams({ name: "a.txt", mime: "text/plain" });
+    const unknown = await send(
+      harness.url,
+      `/api/sessions/11111111-1111-4111-8111-111111111111/attachments?${unknownQuery.toString()}`,
+      { method: "POST", body: Buffer.from("x") },
+    );
+    assert.equal(unknown.status, 404);
+
+    // The query is the client's name and type; without them the response could
+    // only echo a guess.
+    const noQuery = await send(harness.url, `/api/sessions/${session.storeId}/attachments`, {
+      method: "POST",
+      body: Buffer.from("x"),
+    });
+    assert.equal(noQuery.status, 400);
+
+    const wrongMethod = await send(harness.url, `/api/sessions/${session.storeId}/attachments`);
+    assert.equal(wrongMethod.status, 405);
+    assert.equal(wrongMethod.allow, "POST");
+
+    // Same cap, discovered while reading rather than from a header. The client
+    // must still be told why: a reset would look like a network fault and the
+    // browser would retry the same 26 MB forever.
+    const chunked = await sendChunked(
+      harness.url,
+      `/api/sessions/${session.storeId}/attachments?${query.toString()}`,
+      MAX_ATTACHMENT_BYTES + 1024,
+    );
+    assert.equal(chunked.status, 413);
+  } finally {
+    await harness.close();
+  }
+});
+
+test("a session removed mid-flight does not come back through an upload", async () => {
+  const harness = await startHarness();
+  try {
+    const session = await harness.store.create({
+      harness: "opencode",
+      harnessSessionId: "ses_1",
+      projectId: "p",
+      projectName: null,
+      cwd: "/tmp/p",
+      title: "Vanishing",
+    });
+    // Removed behind the store's back, so the index still names it: a store that
+    // mkdir -p'd here would hand the user back a session they deleted.
+    const dir = path.join(harness.root, await sessionDirName(harness.root));
+    await fsp.rm(dir, { recursive: true, force: true });
+
+    const query = new URLSearchParams({ name: "a.txt", mime: "text/plain" });
+    const refused = await send(
+      harness.url,
+      `/api/sessions/${session.storeId}/attachments?${query.toString()}`,
+      { method: "POST", body: Buffer.from("x") },
+    );
+    assert.equal(refused.status, 404);
+    assert.deepEqual(await fsp.readdir(harness.root), [], "the directory must stay gone");
+
+    // And the honest removal refuses the same way, without recreating anything.
+    assert.equal(await harness.store.remove(session.storeId), true);
+    const afterRemove = await send(
+      harness.url,
+      `/api/sessions/${session.storeId}/attachments?${query.toString()}`,
+      { method: "POST", body: Buffer.from("x") },
+    );
+    assert.equal(afterRemove.status, 404);
+    assert.deepEqual(await fsp.readdir(harness.root), []);
+  } finally {
+    await harness.close();
+  }
+});
+
+test("an attachment can be dropped again, so an upload is not a one-way door", async () => {
+  const harness = await startHarness();
+  try {
+    const session = await harness.store.create({
+      harness: "opencode",
+      harnessSessionId: "ses_1",
+      projectId: "p",
+      projectName: null,
+      cwd: "/tmp/p",
+      title: "Changeable mind",
+    });
+    const query = new URLSearchParams({ name: "a.txt", mime: "text/plain" });
+    const uploaded = await send(
+      harness.url,
+      `/api/sessions/${session.storeId}/attachments?${query.toString()}`,
+      { method: "POST", body: Buffer.from("x") },
+    );
+    const manifest = uploaded.body as { attachmentId: string };
+    const target = `/api/sessions/${session.storeId}/attachments/${manifest.attachmentId}`;
+
+    const wrongMethod = await send(harness.url, target, { method: "POST", body: Buffer.from("x") });
+    assert.equal(wrongMethod.status, 405);
+    assert.equal(wrongMethod.allow, "DELETE");
+
+    const hostile = await send(
+      harness.url,
+      `/api/sessions/${session.storeId}/attachments/${encodeURIComponent("../../etc")}`,
+      { method: "DELETE" },
+    );
+    assert.equal(hostile.status, 400, "an unsafe id is a client error, not a store fault");
+
+    const deleted = await send(harness.url, target, { method: "DELETE" });
+    assert.equal(deleted.status, 204);
+    assert.equal(deleted.cacheControl, "no-store");
+    await assert.rejects(
+      () => harness.store.readAttachment(session.storeId, manifest.attachmentId),
+      (error: unknown) =>
+        error instanceof SessionStoreError && error.code === "E_STORE_UNKNOWN_ATTACHMENT",
+    );
+    // Idempotent, so a retried delete is not a confusing error.
+    const again = await send(harness.url, target, { method: "DELETE" });
+    assert.equal(again.status, 404);
   } finally {
     await harness.close();
   }

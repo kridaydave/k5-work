@@ -14,6 +14,7 @@ import {
   type StoredEventRecord,
 } from "./sessions.js";
 import type {
+  AttachmentManifestEntry,
   ServerEvent,
   ToolLifecycle,
   ToolStatus,
@@ -36,6 +37,18 @@ const turnStarted = (turnId: string, userText = "what should we build?"): Server
   sessionId: "ses_live",
   turnId,
   userText,
+  attachments: [],
+});
+const turnStartedWith = (
+  turnId: string,
+  attachments: AttachmentManifestEntry[],
+  userText = "what should we build?",
+): ServerEvent => ({
+  type: "turn.started",
+  sessionId: "ses_live",
+  turnId,
+  userText,
+  attachments,
 });
 const text = (turnId: string, chunk: string): ServerEvent => ({
   type: "turn.delta",
@@ -163,6 +176,54 @@ test("a reloaded transcript shows what the user asked, not only the answer", () 
     { id: "user:t1", role: "user", text: "refactor the composer" },
     { id: "assistant:t1", role: "assistant", text: "Done." },
   ]);
+});
+
+test("a reloaded turn carries the attachment manifest through from the store", () => {
+  // The spooled bytes are addressed by id alone, so a reloaded transcript can
+  // only say what was attached by reading the manifest off the turn.started
+  // record. Without this the names and sizes are simply gone after a reload.
+  const attachments: AttachmentManifestEntry[] = [
+    { attachmentId: "att-1", name: "screenshot.png", mimeType: "image/png", kind: "image", size: 2048 },
+    { attachmentId: "att-2", name: "notes.md", mimeType: "text/markdown", kind: "text", size: 512 },
+  ];
+  const projected = projectTranscript([
+    record(1, turnStartedWith("t1", attachments, "what is wrong with this?")),
+    record(2, text("t1", "Two things.")),
+    record(3, completed("t1", "end_turn")),
+  ]);
+  assert.deepEqual(projected.turns[0]?.attachments, attachments);
+});
+
+test("a turn recorded before attachments existed projects an empty manifest", () => {
+  const projected = projectTranscript([
+    record(1, turnStarted("t1", "no files here")),
+    record(2, text("t1", "ok")),
+  ]);
+  assert.deepEqual(projected.turns[0]?.attachments, []);
+});
+
+test("a turn with a manifest still projects its text and stop reason", () => {
+  // The manifest is additive: it must not disturb anything the projection
+  // already carried, or an attached turn would render differently from a bare
+  // one.
+  const bare = projectTranscript([
+    record(1, turnStarted("t1", "compare these")),
+    record(2, text("t1", "Answer.")),
+    record(3, completed("t1", "end_turn")),
+  ]);
+  const attached = projectTranscript([
+    record(4, turnStartedWith("t1", [
+      { attachmentId: "att-1", name: "a.png", mimeType: "image/png", kind: "image", size: 10 },
+    ], "compare these")),
+    record(5, text("t1", "Answer.")),
+    record(6, completed("t1", "refusal")),
+  ]);
+  assert.equal(attached.turns[0]?.userText, bare.turns[0]?.userText);
+  assert.equal(attached.turns[0]?.assistantText, "Answer.");
+  assert.equal(attached.turns[0]?.stopReason, "refusal");
+  // The manifest is not a transcript entry, so the bubble stays the user's
+  // words rather than becoming a wall of base64.
+  assert.deepEqual(transcriptEntries(attached), transcriptEntries(bare));
 });
 
 test("a duplicated record cannot replace the prompt the user sent", () => {

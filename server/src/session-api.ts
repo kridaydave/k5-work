@@ -1,11 +1,17 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { randomUUID } from "node:crypto";
+import { z } from "zod";
 import {
+  AttachmentIdSchema,
+  MAX_ATTACHMENT_BYTES,
   MAX_EVENTS_PER_PAGE,
   SessionEventsResponseSchema,
   SessionListResponseSchema,
+  UploadedAttachmentSchema,
   type SessionEventsResponse,
 } from "@k5-work/shared";
 import { SessionStoreError, type SessionStoreErrorCode } from "./store/errors.js";
+import { isSafeNameSegment } from "./store/safe-name.js";
 import { SessionStore } from "./store/session-store.js";
 
 // Read side of the durable store, over HTTP. Bulk history does not belong on the
@@ -21,6 +27,12 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.end(JSON.stringify(body));
 }
 
+/** 413, which no store code maps to: an over-cap body never reaches the store. */
+const STATUS_TOO_LARGE = 413;
+
+/** 408, for an upload that stopped arriving. Never reaches the store either. */
+const STATUS_TIMEOUT = 408;
+
 /** A store fault the browser can render. Anything else is a 500 with no detail. */
 const STATUS_BY_CODE: Record<SessionStoreErrorCode, number> = {
   E_STORE_PATH_ESCAPE: 500,
@@ -32,6 +44,7 @@ const STATUS_BY_CODE: Record<SessionStoreErrorCode, number> = {
   E_STORE_QUOTA: 507,
   E_STORE_EVICTED: 500,
   E_STORE_UNKNOWN_SESSION: 404,
+  E_STORE_UNKNOWN_ATTACHMENT: 404,
   E_STORE_ROOT: 500,
 };
 
@@ -45,6 +58,7 @@ const MESSAGE_BY_CODE: Record<SessionStoreErrorCode, string> = {
   E_STORE_QUOTA: "The session store is full",
   E_STORE_EVICTED: "A stored session was pruned",
   E_STORE_UNKNOWN_SESSION: "No such stored session",
+  E_STORE_UNKNOWN_ATTACHMENT: "No such attachment",
   E_STORE_ROOT: "The session store root is unusable",
 };
 
@@ -72,6 +86,27 @@ function decodeStoreId(rawId: string): string | null {
   return isStoreIdSegment(decoded) ? decoded.toLowerCase() : null;
 }
 
+/**
+ * The same gates the store applies, run at the edge so a hostile id is a 400
+ * rather than a 500 from deep inside a write.
+ *
+ * The separator check is not redundant with the safe-name predicate: that one
+ * judges a single path segment by design, and a value taken from a URL can still
+ * carry one.
+ */
+function decodeAttachmentId(rawId: string): string | null {
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(rawId);
+  } catch {
+    return null;
+  }
+  if (decoded.includes("/") || decoded.includes("\\")) return null;
+  return AttachmentIdSchema.safeParse(decoded).success && isSafeNameSegment(decoded)
+    ? decoded
+    : null;
+}
+
 function parseSince(raw: string | null): number | null | "invalid" {
   if (raw === null || raw === "") return null;
   if (!/^\d{1,15}$/.test(raw)) return "invalid";
@@ -85,6 +120,74 @@ function parseLimit(raw: string | null): number {
   const value = Number(raw);
   if (value < 1) return 1;
   return Math.min(value, MAX_EVENTS_PER_PAGE);
+}
+
+/**
+ * The upload's identity, which travels in the query because the body is the file
+ * itself — not JSON, not multipart, and not base64, which would add a third again
+ * to a 25 MB cap and buy nothing.
+ */
+const UploadQuerySchema = z.object({
+  name: z.string().min(1).max(200),
+  mime: z.string().min(1).max(120),
+});
+
+/**
+ * How long an upload may take end to end. Matches the app's own requestTimeout so
+ * a stalled client is answered rather than left holding a connection, and a
+ * stalled socket cannot pin a store handle either.
+ */
+const UPLOAD_TIMEOUT_MS = 30_000;
+
+/**
+ * Reads the body, refusing the moment it is over the cap rather than after it has
+ * been buffered: an unbounded read is how a 25 MB limit becomes an
+ * out-of-memory crash.
+ *
+ * An over-cap body is drained rather than cut. Destroying the socket would take
+ * the 413 down with it, so a client that streams without a Content-Length — which
+ * is most of them — would see a reset instead of the reason it was refused. The
+ * app's own requestTimeout is what bounds a client that keeps streaming.
+ */
+function readCappedBody(
+  req: IncomingMessage,
+  cap: number,
+): Promise<{ ok: true; bytes: Buffer } | { ok: false; refused: "too-large" | "stalled" }> {
+  return new Promise((resolve) => {
+    const chunks: Buffer[] = [];
+    let total = 0;
+    let settled = false;
+    const finish = (result: { ok: true; bytes: Buffer } | { ok: false; refused: "too-large" | "stalled" }): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      req.removeListener("data", onData);
+      req.removeListener("end", onEnd);
+      req.removeListener("error", onEnd);
+      resolve(result);
+    };
+    const onData = (chunk: Buffer): void => {
+      total += chunk.length;
+      if (total > cap) {
+        chunks.length = 0;
+        finish({ ok: false, refused: "too-large" });
+        return;
+      }
+      chunks.push(chunk);
+    };
+    const onEnd = (): void => {
+      finish({ ok: true, bytes: Buffer.concat(chunks) });
+    };
+    const timer = setTimeout(() => {
+      chunks.length = 0;
+      finish({ ok: false, refused: "stalled" });
+      req.destroy();
+    }, UPLOAD_TIMEOUT_MS);
+    timer.unref();
+    req.on("data", onData);
+    req.once("end", onEnd);
+    req.once("error", onEnd);
+  });
 }
 
 export interface SessionApiOptions {
@@ -201,6 +304,80 @@ export function handleSessionApiRequest(
           parseLimit(url.searchParams.get("limit")),
         );
         sendJson(res, 200, SessionEventsResponseSchema.parse(page));
+        return;
+      }
+
+      // --- attachments ---
+      // Both directions, so an upload is never a one-way door: what a user
+      // attached and then changed their mind about can be dropped without
+      // deleting the whole task.
+      if (tail === "attachments" || tail.startsWith("attachments/")) {
+        if (tail === "attachments") {
+          if (req.method !== "POST") {
+            res.setHeader("Allow", "POST");
+            sendJson(res, 405, { error: "Method not allowed" });
+            return;
+          }
+          const query = UploadQuerySchema.safeParse({
+            name: url.searchParams.get("name"),
+            mime: url.searchParams.get("mime"),
+          });
+          if (!query.success) {
+            sendJson(res, 400, { error: "name and mime are required" });
+            return;
+          }
+          // Refused on the declared length before a byte is read, so an
+          // over-cap upload is a 413 rather than a 25 MB allocation.
+          const declared = req.headers["content-length"];
+          if (declared !== undefined && Number(declared) > MAX_ATTACHMENT_BYTES) {
+            sendJson(res, STATUS_TOO_LARGE, { error: "The attachment is too large" });
+            return;
+          }
+          const body = await readCappedBody(req, MAX_ATTACHMENT_BYTES);
+          if (!body.ok) {
+            // Distinct codes, because the two have different repairs: too large
+            // means pick a smaller file, stalled means try again.
+            sendJson(
+              res,
+              body.refused === "too-large" ? STATUS_TOO_LARGE : STATUS_TIMEOUT,
+              {
+                error:
+                  body.refused === "too-large"
+                    ? "The attachment is too large"
+                    : "The upload stalled before it finished",
+              },
+            );
+            return;
+          }
+          // Minted here, never taken from the request: the id becomes a filename
+          // in the spool, and a browser that chose it would be choosing a path.
+          const manifest = await store.spoolAttachment(storeId, {
+            attachmentId: randomUUID(),
+            name: query.data.name,
+            mimeType: query.data.mime,
+            bytes: body.bytes,
+          });
+          sendJson(res, 200, UploadedAttachmentSchema.parse(manifest));
+          return;
+        }
+        const attachmentId = decodeAttachmentId(tail.slice("attachments/".length));
+        if (attachmentId === null) {
+          sendJson(res, 400, { error: "Malformed attachment id" });
+          return;
+        }
+        if (req.method !== "DELETE") {
+          res.setHeader("Allow", "DELETE");
+          sendJson(res, 405, { error: "Method not allowed" });
+          return;
+        }
+        const discarded = await store.discardAttachment(storeId, attachmentId);
+        if (!discarded) {
+          sendJson(res, 404, { error: "No such attachment" });
+          return;
+        }
+        res.statusCode = 204;
+        res.setHeader("Cache-Control", "no-store");
+        res.end();
         return;
       }
 

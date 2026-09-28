@@ -80,6 +80,9 @@ const app = createApp({
         titleFromPrompt: (storeId, prompt) => store.titleFromPrompt(storeId, prompt),
         remove: (storeId) => store.remove(storeId),
         stored: (storeId) => store.stored(storeId),
+        attachmentManifest: (storeId, attachmentId) =>
+          store.attachmentManifest(storeId, attachmentId),
+        readAttachment: (storeId, attachmentId) => store.readAttachment(storeId, attachmentId),
       },
       trackSeat: (child) => seats.register(child),
       untrackSeat: (child) => seats.unregister(child),

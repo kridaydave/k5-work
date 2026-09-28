@@ -3,13 +3,15 @@ import {
   Composer,
   type ComposerSettings,
   type PromptSubmission,
+  type RestoredSubmission,
 } from "@/components/Composer";
 import { Markdown } from "@/components/Markdown";
 import { PathPromptModal } from "@/components/PathPromptModal";
 import { Sidebar, type Session } from "@/components/Sidebar";
 import { Wallpaper } from "@/components/Wallpaper";
 import { WindowChrome } from "@/components/WindowChrome";
-import type { ProjectedTranscript } from "@k5-work/shared";
+import type { AttachmentRef, ProjectedTranscript } from "@k5-work/shared";
+import { uploadAttachments } from "@/hooks/useAttachments";
 import { useK5Socket } from "@/hooks/useK5Socket";
 import { useProjects } from "@/hooks/useProjects";
 import { readStoredTranscript, useStoredSessions } from "@/hooks/useStoredSessions";
@@ -59,12 +61,20 @@ export default function App() {
   const [rehydrated, setRehydrated] = useState<ProjectedTranscript | null>(null);
   const k5 = useK5Socket({ rehydrate });
   const { state } = k5;
-  // The Composer clears its textarea on send and onSend returns void, so a
-  // prompt issued while the seat is still opening must be held here rather than
-  // dropped. Bounded to one turn: a second queued prompt is refused visibly
-  // rather than silently lost.
-  const queuedPrompt = useRef<string | null>(null);
+  // The Composer clears its textarea and its chips once the parent confirms the
+  // submission went out. On the lazy-open path that confirmation cannot happen
+  // inline — the seat is still opening when onSend returns — so the whole
+  // submission is held here, files included: the bytes cannot be uploaded before
+  // the spool exists. Bounded to one turn: a second queued prompt is refused
+  // visibly rather than silently lost.
+  const queuedPrompt = useRef<PromptSubmission | null>(null);
   const queueFullRef = useRef(false);
+  // A refused submission pushed back into the Composer. Needed for exactly one
+  // case — the seat was still opening when Send was pressed, so the answer came
+  // back after onSend had already resolved — and kept out of the return value for
+  // every other one.
+  const [restore, setRestore] = useState<RestoredSubmission | null>(null);
+  const restoreId = useRef(0);
   // A model/mode the user picked but the harness has not confirmed yet.
   const pendingChoice = useRef<{ model?: string; mode?: string }>({});
   // The last confirmed values, so a refused change can be rolled back to what
@@ -78,6 +88,57 @@ export default function App() {
     if (rehydrated === null) return;
     k5.adoptTranscript(rehydrated);
   }, [rehydrated, k5]);
+
+  /**
+   * Puts a submission the parent could not deliver back into the Composer.
+   *
+   * The Composer owns the files, so returning them means a prop rather than
+   * clearing and re-adding them. `restore.id` makes a repeated return of the same
+   * files observable, so the Composer can ignore an id it has already applied.
+   */
+  const handBack = useCallback((submission: PromptSubmission) => {
+    restoreId.current += 1;
+    setRestore({
+      id: restoreId.current,
+      text: submission.text,
+      attachments: submission.attachments,
+    });
+  }, []);
+
+  /**
+   * Uploads a submission's files, then prompts. Shared by the direct send and the
+   * lazy-open flush so both paths read the spool the same way.
+   *
+   * `storeId` is k5's own id: the spool lives in the store, and the harness's
+   * opaque session id addresses nothing on this side of the wire.
+   */
+  const deliver = useCallback(
+    async (submission: PromptSubmission, storeId: string | null): Promise<boolean> => {
+      let refs: AttachmentRef[] = [];
+      if (submission.attachments.length > 0) {
+        if (storeId === null) {
+          setTranscriptNote("Attachments need an open task, so the prompt was not sent.");
+          return false;
+        }
+        try {
+          const uploaded = await uploadAttachments(storeId, submission.attachments);
+          refs = uploaded.map((entry) => ({ attachmentId: entry.attachmentId }));
+        } catch (cause) {
+          setTranscriptNote(
+            `The attachments were not uploaded: ${
+              cause instanceof Error ? cause.message : "the upload did not finish"
+            }`,
+          );
+          // The bytes are still in the Composer's hands, which is why this reports
+          // a refusal instead of prompting without them.
+          return false;
+        }
+      }
+      k5.prompt(submission.text, refs);
+      return true;
+    },
+    [k5],
+  );
 
   const messages = state.entries;
   const active = state.entries.length > 0;
@@ -118,6 +179,9 @@ export default function App() {
   const handleNewTask = useCallback(() => {
     queuedPrompt.current = null;
     queueFullRef.current = false;
+    // A remounted Composer would otherwise replay the last refused submission,
+    // resurrecting files into a task the user just walked away from.
+    setRestore(null);
     pendingChoice.current = {};
     confirmed.current = {};
     // A new task must clear any note; a stale error above an empty hero reads as
@@ -169,7 +233,15 @@ export default function App() {
   useEffect(() => {
     if (state.session !== "failed") return;
     setTranscriptNote(state.sessionMessage ?? `Session failed: ${state.sessionReason ?? "unknown"}`);
-  }, [state.session, state.sessionMessage, state.sessionReason]);
+    // A prompt queued against a seat that then refused to open is now a prompt
+    // that will never be sent, so its files go back to the Composer rather than
+    // staying in a ref nobody renders.
+    const stranded = queuedPrompt.current;
+    if (stranded === null) return;
+    queuedPrompt.current = null;
+    queueFullRef.current = false;
+    handBack(stranded);
+  }, [handBack, state.session, state.sessionMessage, state.sessionReason]);
 
   useEffect(() => {
     const element = mainRef.current;
@@ -178,50 +250,56 @@ export default function App() {
     element.scrollTo({ top: element.scrollHeight, behavior: smooth ? "smooth" : "auto" });
   }, [messages.length, pending]);
 
-  // A queued prompt is sent as soon as the session opens, so the submission
-  // always reaches the harness.
+  // A healthy session clears the previous failure note.
   useEffect(() => {
-    // A healthy session clears the previous failure note.
     if (state.session === "open") setTranscriptNote(null);
   }, [state.session]);
 
+  // A queued prompt is sent as soon as the session opens, so the submission
+  // always reaches the harness.
   useEffect(() => {
     const queued = queuedPrompt.current;
     if (state.sessionId === null || queued === null) return;
-    setTranscriptNote(null);
+    // Cleared before the await, not after: this effect re-runs on every render,
+    // and leaving the submission queued would send it twice.
     queuedPrompt.current = null;
     queueFullRef.current = false;
-    k5.prompt(queued);
-  }, [k5, state.sessionId]);
+    void (async () => {
+      const delivered = await deliver(queued, state.storeId);
+      if (delivered) setTranscriptNote(null);
+      else handBack(queued);
+    })();
+  }, [deliver, handBack, state.sessionId, state.storeId]);
 
   const handleSend = useCallback(
-    (submission: PromptSubmission) => {
+    async (submission: PromptSubmission): Promise<boolean> => {
       const text = submission.text.trim();
-      if (!text) return;
+      if (!text) return false;
       const busy = state.turnStatus === "running" || state.turnStatus === "cancelling";
       if (busy || queuedPrompt.current !== null) {
-        if (queueFullRef.current) return;
+        if (queueFullRef.current) return false;
         queueFullRef.current = true;
         setTranscriptNote("One prompt is already queued. Wait for it to finish.");
-        return;
+        return false;
       }
       if (state.sessionId === null) {
-        if (!activeProject) return;
+        if (!activeProject) return false;
         if (state.session === "failed") {
           setTranscriptNote(
             state.sessionMessage ?? "The previous session could not be opened.",
           );
-          return;
+          return false;
         }
         // The seat opens lazily on the first prompt, so an empty hero costs no
-        // harness process.
-        queuedPrompt.current = text;
+        // harness process. There is no store to spool into yet, so the files ride
+        // along and go up once the flush effect sees a session.
+        queuedPrompt.current = { ...submission, text };
         k5.openSession(activeProject.id);
-        return;
+        return true;
       }
-      k5.prompt(text);
+      return deliver(submission, state.storeId);
     },
-    [activeProject, k5, state.session, state.sessionId, state.sessionMessage, state.turnStatus],
+    [activeProject, deliver, k5, state.session, state.sessionId, state.sessionMessage, state.storeId, state.turnStatus],
   );
 
   const handleRemoveSession = useCallback(
@@ -364,6 +442,7 @@ export default function App() {
                 settings={composerSettings}
                 configOptions={state.session === "open" ? state.configOptions : null}
                 compact={active}
+                restore={restore}
                 onRequestProject={handleOpenProject}
                 onSelectProject={handleSelectProject}
                 onSettingsChange={(next) => {

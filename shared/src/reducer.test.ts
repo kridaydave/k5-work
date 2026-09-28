@@ -307,6 +307,7 @@ it("a failed discovery or continuation is not a turn failure", () => {
       sessionId: "s-1",
       turnId: "t-1",
       userText: "do the thing",
+      attachments: [],
     });
     state = applyServerEvent(state, {
       type: "turn.delta",

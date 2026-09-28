@@ -146,6 +146,7 @@ describe("a turn streams deltas and terminates exactly once", () => {
         type: "session.prompt",
         sessionId,
         turnId: "t-1",
+        attachments: [],
         text: "hello",
       });
 
@@ -184,11 +185,11 @@ describe("a turn streams deltas and terminates exactly once", () => {
     const rig = await startRig("ok");
     try {
       const sessionId = await openSession(rig);
-      rig.send({ commandId: "c-2", type: "session.prompt", sessionId, turnId: "t-1", text: "one" });
+      rig.send({ commandId: "c-2", type: "session.prompt", sessionId, turnId: "t-1", text: "one", attachments: [] });
       await rig.waitFor("turn.completed", { turnId: "t-1" });
 
       const before = rig.events.length;
-      rig.send({ commandId: "c-3", type: "session.prompt", sessionId, turnId: "t-2", text: "two" });
+      rig.send({ commandId: "c-3", type: "session.prompt", sessionId, turnId: "t-2", text: "two", attachments: [] });
       // Scoped to t-2, so this cannot be satisfied by turn 1's completion.
       await rig.waitFor("turn.completed", { turnId: "t-2", after: before });
       const stale = rig.events
@@ -205,10 +206,10 @@ describe("a turn streams deltas and terminates exactly once", () => {
     const rig = await startRig("slow");
     try {
       const sessionId = await openSession(rig);
-      rig.send({ commandId: "c-2", type: "session.prompt", sessionId, turnId: "t-1", text: "one" });
+      rig.send({ commandId: "c-2", type: "session.prompt", sessionId, turnId: "t-1", text: "one", attachments: [] });
       await rig.waitFor("turn.started");
       const before = rig.events.length;
-      rig.send({ commandId: "c-3", type: "session.prompt", sessionId, turnId: "t-2", text: "two" });
+      rig.send({ commandId: "c-3", type: "session.prompt", sessionId, turnId: "t-2", text: "two", attachments: [] });
       // Waits for the refusal itself rather than sleeping and hoping.
       const refusal = await rig.waitFor("command.result", { after: before });
       assert.equal(refusal.ok, false);
@@ -224,7 +225,7 @@ describe("a turn streams deltas and terminates exactly once", () => {
     const rig = await startRig("slow");
     try {
       const sessionId = await openSession(rig);
-      rig.send({ commandId: "c-2", type: "session.prompt", sessionId, turnId: "t-1", text: "one" });
+      rig.send({ commandId: "c-2", type: "session.prompt", sessionId, turnId: "t-1", text: "one", attachments: [] });
       await rig.waitFor("turn.started");
       rig.send({ commandId: "c-3", type: "session.cancel", sessionId });
 
@@ -243,7 +244,7 @@ describe("a turn streams deltas and terminates exactly once", () => {
     const rig = await startRig("unsupported-request");
     try {
       const sessionId = await openSession(rig);
-      rig.send({ commandId: "c-2", type: "session.prompt", sessionId, turnId: "t-1", text: "one" });
+      rig.send({ commandId: "c-2", type: "session.prompt", sessionId, turnId: "t-1", text: "one", attachments: [] });
       const done = await rig.waitFor("turn.completed");
       assert.equal(
         done.stopReason,
@@ -262,14 +263,14 @@ describe("a turn streams deltas and terminates exactly once", () => {
     const rig = await startRig("slow");
     try {
       const sessionId = await openSession(rig);
-      rig.send({ commandId: "c-2", type: "session.prompt", sessionId, turnId: "t-1", text: "one" });
+      rig.send({ commandId: "c-2", type: "session.prompt", sessionId, turnId: "t-1", text: "one", attachments: [] });
       await rig.waitFor("turn.started", { turnId: "t-1" });
       rig.send({ commandId: "c-3", type: "session.cancel", sessionId });
       await rig.waitFor("turn.completed", { turnId: "t-1" });
 
       // The seat must drain its cancelled turn and take a new one.
       const before = rig.events.length;
-      rig.send({ commandId: "c-4", type: "session.prompt", sessionId, turnId: "t-2", text: "two" });
+      rig.send({ commandId: "c-4", type: "session.prompt", sessionId, turnId: "t-2", text: "two", attachments: [] });
       const started = await rig.waitFor("turn.started", { turnId: "t-2", after: before, timeoutMs: 15_000 });
       assert.equal(started.turnId, "t-2", "a fresh turn must be accepted after a cancel");
       await rig.waitFor("turn.completed", { turnId: "t-2", timeoutMs: 15_000 });
@@ -285,7 +286,7 @@ describe("a turn streams deltas and terminates exactly once", () => {
     const rig = await startRig("long-title");
     try {
       const sessionId = await openSession(rig);
-      rig.send({ commandId: "c-2", type: "session.prompt", sessionId, turnId: "t-1", text: "one" });
+      rig.send({ commandId: "c-2", type: "session.prompt", sessionId, turnId: "t-1", text: "one", attachments: [] });
       const done = await rig.waitFor("turn.completed", { turnId: "t-1", timeoutMs: 15_000 });
       assert.equal(done.stopReason, "end_turn", "a truncated card must not fail the turn");
       assert.equal(rig.count("turn.completed"), 1, "exactly one terminal event");
@@ -391,7 +392,7 @@ describe("a turn streams deltas and terminates exactly once", () => {
   it("refuses a prompt with no open session instead of hanging", async () => {
     const rig = await startRig("ok");
     try {
-      rig.send({ commandId: "c-9", type: "session.prompt", sessionId: "nope", turnId: "t-9", text: "hi" });
+      rig.send({ commandId: "c-9", type: "session.prompt", sessionId: "nope", turnId: "t-9", text: "hi", attachments: [] });
       const result = await rig.waitFor("command.result");
       assert.equal(result.ok, false);
       assert.equal(result.reason, "not-found");

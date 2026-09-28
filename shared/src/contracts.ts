@@ -21,6 +21,48 @@ export type TurnId = z.infer<typeof TurnIdSchema>;
 export const SessionIdSchema = z.string().min(1).max(256);
 export type WireSessionId = z.infer<typeof SessionIdSchema>;
 
+// --- attachments ---
+
+/** k5-minted identity for one spooled attachment. Opaque, like StoreId. */
+export const AttachmentIdSchema = z.string().min(1).max(64);
+export type AttachmentId = z.infer<typeof AttachmentIdSchema>;
+
+export const MAX_ATTACHMENTS = 8;
+export const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+
+export const AttachmentKindSchema = z.enum(["text", "image", "binary"]);
+export type AttachmentKind = z.infer<typeof AttachmentKindSchema>;
+
+/**
+ * The client names an attachment by id only. Name, mime, size and kind are the
+ * server's to decide, read back off the spooled bytes, so a client cannot claim
+ * a file is a 10-byte PNG.
+ */
+export const AttachmentRefSchema = z.object({ attachmentId: AttachmentIdSchema }).strict();
+export type AttachmentRef = z.infer<typeof AttachmentRefSchema>;
+
+/**
+ * What one attachment contributed to a turn. Bytes are never recorded.
+ *
+ * The bytes live in the spool and are addressed by `attachmentId` alone. Writing
+ * them into `events.jsonl` would blow the store's 12 MiB per-session cap on a
+ * single screenshot and render as a wall of base64 in the user bubble, so the
+ * manifest records identity and provenance and nothing else.
+ */
+export const AttachmentManifestEntrySchema = z
+  .object({
+    attachmentId: AttachmentIdSchema,
+    name: z.string().min(1).max(200),
+    mimeType: z.string().min(1).max(120),
+    kind: AttachmentKindSchema,
+    size: z.number().int().nonnegative().max(MAX_ATTACHMENT_BYTES),
+  })
+  .strict();
+export type AttachmentManifestEntry = z.infer<typeof AttachmentManifestEntrySchema>;
+
+/** Returned by a successful upload. */
+export const UploadedAttachmentSchema = AttachmentManifestEntrySchema;
+
 // Closed so the UI can switch exhaustively and a typo cannot invent a branch.
 export const CommandFailureReasonSchema = z.enum([
   "ok",
@@ -103,6 +145,9 @@ export const SessionPromptCommandSchema = z
     sessionId: SessionIdSchema,
     turnId: TurnIdSchema,
     text: z.string().min(1).max(20_000),
+    // Defaulted so a client predating attachments still sends a valid prompt
+    // instead of being refused at the boundary for a field it cannot know.
+    attachments: z.array(AttachmentRefSchema).max(MAX_ATTACHMENTS).default([]),
   })
   .strict();
 export type SessionPromptCommand = z.infer<typeof SessionPromptCommandSchema>;
@@ -341,6 +386,10 @@ export const TurnStartedEventSchema = z
     // because a reloaded transcript is read from the store, and without it a
     // stored session shows only the assistant's half of every exchange.
     userText: z.string().min(1).max(20_000),
+    // The same manifest the command named, resolved against the spool. This is
+    // the durable half: a reloaded transcript has the command's ids but not the
+    // names and sizes, so the manifest is what lets it say what was attached.
+    attachments: z.array(AttachmentManifestEntrySchema).max(MAX_ATTACHMENTS).default([]),
   })
   .strict();
 export type TurnStartedEvent = z.infer<typeof TurnStartedEventSchema>;

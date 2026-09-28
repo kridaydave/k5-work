@@ -4,6 +4,7 @@ import {
   RequestError,
   type ActiveSession,
   type ClientContext,
+  type ContentBlock,
 } from "@agentclientprotocol/sdk";
 import type { AcpChild } from "./spawn.js";
 import { NO_CAPABILITIES, probeCapabilities, type AcpCapabilities } from "./capabilities.js";
@@ -184,7 +185,11 @@ export class AcpSeat {
               "initialize",
               {
                 protocolVersion: PROTOCOL_VERSION,
-                // Nothing is advertised that k5 has no handler behind.
+                // Nothing is advertised that k5 has no handler behind. The fs
+                // pair is the load-bearing one: it is why k5 never sends a
+                // `resource_link`, whose whole contract is that the agent asks
+                // the client to read a path. Attached files go out as inline
+                // `resource` blocks instead — see prompt-blocks.ts.
                 clientCapabilities: {
                   fs: { readTextFile: false, writeTextFile: false },
                   terminal: false,
@@ -508,7 +513,15 @@ export class AcpSeat {
     }
   }
 
-  async prompt(turnId: string, text: string): Promise<SeatStopReason> {
+  /**
+   * Runs one turn with the blocks the service planned.
+   *
+   * An array rather than a string because ACP prompt content is a list: a
+   * prompt carrying an attachment is one text block plus resource blocks, and
+   * joining them into prose would make the bytes the model sees depend on how the
+   * text happened to be formatted.
+   */
+  async prompt(turnId: string, blocks: ContentBlock[]): Promise<SeatStopReason> {
     if (this.closed) throw new AcpSeatError("seat is closed");
     if (this.poisonReason) {
       throw new AcpSeatError(`seat is unusable: ${this.poisonReason}`);
@@ -585,7 +598,7 @@ export class AcpSeat {
       // message the pump above is waiting for. A raw ctx.request would leave
       // nextUpdate() hanging forever.
       void session
-        .prompt(text, { cancellationSignal: controller.signal })
+        .prompt(blocks, { cancellationSignal: controller.signal })
         .catch((err: unknown) => {
           if (err instanceof RequestError && err.code === -32800) {
             settle("cancelled");

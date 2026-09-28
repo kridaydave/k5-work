@@ -5,6 +5,7 @@ import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { ServerEvent } from "@k5-work/shared";
+import { MAX_ATTACHMENT_BYTES } from "@k5-work/shared";
 import {
   MAX_READ_WINDOW_BYTES,
   MAX_SESSION_BYTES,
@@ -75,6 +76,16 @@ function metaPathOf(root: string): Promise<string> {
       const dir = entries.find((e) => e.isDirectory());
       assert.ok(dir, "expected a session directory");
       return path.join(root, dir.name, "meta.json");
+    });
+}
+
+function sessionDirOf(root: string): Promise<string> {
+  return fsp
+    .readdir(root, { withFileTypes: true })
+    .then((entries) => {
+      const dir = entries.find((e) => e.isDirectory());
+      assert.ok(dir, "expected a session directory");
+      return path.join(root, dir.name);
     });
 }
 
@@ -828,6 +839,275 @@ test("a delete racing a live write does not leak a handle or resurrect the sessi
   });
 });
 
+// --- attachments ---
+
+// A four-byte PNG header: valid as a PNG, not decodable as UTF-8.
+const PNG_HEAD = Buffer.from([0x89, 0x50, 0x4e, 0x47]);
+
+test("a spooled attachment round-trips, and its manifest is derived from the bytes", async () => {
+  await withStore(async (store, root) => {
+    const session = await newSession(store);
+    // The client claims this is plain text. It is not, and the manifest must say
+    // what arrived rather than what was asked for: a harness handed a binary as
+    // text inlines replacement characters, and the transcript records a size that
+    // never existed.
+    const manifest = await store.spoolAttachment(session.storeId, {
+      attachmentId: "att-1",
+      name: "notes.txt",
+      mimeType: "text/plain",
+      bytes: PNG_HEAD,
+    });
+    assert.deepEqual(manifest, {
+      attachmentId: "att-1",
+      name: "notes.txt",
+      mimeType: "text/plain",
+      kind: "binary",
+      size: 4,
+    });
+    assert.deepEqual(await store.readAttachment(session.storeId, "att-1"), PNG_HEAD);
+    assert.deepEqual(await store.attachmentManifest(session.storeId, "att-1"), manifest);
+
+    // The declared mime only ever decides image versus binary, and only for
+    // bytes that are not text.
+    const asImage = await store.spoolAttachment(session.storeId, {
+      attachmentId: "att-2",
+      name: "shot.png",
+      mimeType: "image/png",
+      bytes: PNG_HEAD,
+    });
+    assert.equal(asImage.kind, "image");
+    const asText = await store.spoolAttachment(session.storeId, {
+      attachmentId: "att-3",
+      name: "shot.png",
+      mimeType: "text/plain",
+      bytes: Buffer.from("plain words", "utf8"),
+    });
+    assert.equal(asText.kind, "text", "decodable UTF-8 is text whatever the name claims");
+    assert.equal(asText.size, 11);
+
+    // The spool lives inside the session directory, so cleanup is inherited.
+    const entries = await fsp.readdir(root, { withFileTypes: true });
+    assert.equal(entries.length, 1);
+    const spooled = await fsp.readdir(path.join(root, entries[0]!.name, "attachments"));
+    assert.deepEqual(spooled.sort(), ["att-1", "att-2", "att-3"]);
+  });
+});
+
+test("spooling into an unknown or deleted session is refused and creates nothing", async () => {
+  await withStore(async (store, root) => {
+    await assert.rejects(
+      () =>
+        store.spoolAttachment("11111111-1111-4111-8111-111111111111", {
+          attachmentId: "att-1",
+          name: "a.txt",
+          mimeType: "text/plain",
+          bytes: Buffer.from("x"),
+        }),
+      (error: unknown) =>
+        error instanceof SessionStoreError && error.code === "E_STORE_UNKNOWN_SESSION",
+    );
+    assert.deepEqual(await fsp.readdir(root), []);
+
+    // A deleted session must not be brought back by a late upload: a directory
+    // here would resurrect a transcript the user removed.
+    const session = await newSession(store);
+    await store.spoolAttachment(session.storeId, {
+      attachmentId: "att-1",
+      name: "a.txt",
+      mimeType: "text/plain",
+      bytes: Buffer.from("x"),
+    });
+    assert.equal(await store.remove(session.storeId), true);
+    await assert.rejects(
+      () =>
+        store.spoolAttachment(session.storeId, {
+          attachmentId: "att-2",
+          name: "a.txt",
+          mimeType: "text/plain",
+          bytes: Buffer.from("x"),
+        }),
+      (error: unknown) =>
+        error instanceof SessionStoreError && error.code === "E_STORE_UNKNOWN_SESSION",
+    );
+    assert.deepEqual(await fsp.readdir(root), []);
+  });
+});
+
+test("a session whose directory is gone mid-flight cannot be spooled into", async () => {
+  // The index still names it, so only a look at the disk can tell. Refusing here
+  // is what stops a removed session from quietly reappearing.
+  await withStore(async (store, root) => {
+    const session = await newSession(store);
+    const entries = await fsp.readdir(root, { withFileTypes: true });
+    await fsp.rm(path.join(root, entries[0]!.name), { recursive: true, force: true });
+    await assert.rejects(
+      () =>
+        store.spoolAttachment(session.storeId, {
+          attachmentId: "att-1",
+          name: "a.txt",
+          mimeType: "text/plain",
+          bytes: Buffer.from("x"),
+        }),
+      (error: unknown) =>
+        error instanceof SessionStoreError && error.code === "E_STORE_UNKNOWN_SESSION",
+    );
+    assert.deepEqual(await fsp.readdir(root), []);
+  });
+});
+
+test("an attachment id that is not a safe name never becomes a path", async () => {
+  await withStore(async (store) => {
+    const session = await newSession(store);
+    for (const bad of ["..", "../escape", "with\nnewline", "a/b", "", "nul\u0000byte"]) {
+      await assert.rejects(
+        () =>
+          store.spoolAttachment(session.storeId, {
+            attachmentId: bad,
+            name: "a.txt",
+            mimeType: "text/plain",
+            bytes: Buffer.from("x"),
+          }),
+        (error: unknown) => error instanceof SessionStoreError,
+        `${JSON.stringify(bad)} must be refused`,
+      );
+      await assert.rejects(
+        () => store.readAttachment(session.storeId, bad),
+        (error: unknown) =>
+          error instanceof SessionStoreError && error.code === "E_STORE_PATH_ESCAPE",
+      );
+    }
+  });
+});
+
+test("an attachment is bounded by the store's own caps", async () => {
+  await withStore(
+    async (store, root) => {
+      const session = await newSession(store);
+      await assert.rejects(
+        () =>
+          store.spoolAttachment(session.storeId, {
+            attachmentId: "att-1",
+            name: "huge.bin",
+            mimeType: "application/octet-stream",
+            bytes: Buffer.alloc(MAX_ATTACHMENT_BYTES + 1),
+          }),
+        (error: unknown) => error instanceof SessionStoreError && error.code === "E_STORE_QUOTA",
+      );
+      // A manifest that cannot satisfy the contract is refused before a byte is
+      // written, rather than stored and discovered broken by the turn.
+      await assert.rejects(
+        () =>
+          store.spoolAttachment(session.storeId, {
+            attachmentId: "att-1",
+            name: "x".repeat(400),
+            mimeType: "text/plain",
+            bytes: Buffer.from("x"),
+          }),
+        (error: unknown) => error instanceof SessionStoreError,
+      );
+      assert.deepEqual(
+        await fsp.readdir(path.join(await sessionDirOf(root), "attachments")).catch(() => []),
+        [],
+        "a refused upload must leave no bytes behind",
+      );
+    },
+    { maxStoreBytes: MAX_ATTACHMENT_BYTES + 1_000_000 },
+  );
+});
+
+test("an attachment over the whole-store cap is refused", async () => {
+  await withStore(
+    async (store) => {
+      const session = await newSession(store);
+      await assert.rejects(
+        () =>
+          store.spoolAttachment(session.storeId, {
+            attachmentId: "att-1",
+            name: "big.bin",
+            mimeType: "application/octet-stream",
+            bytes: Buffer.alloc(8_000),
+          }),
+        (error: unknown) => error instanceof SessionStoreError && error.code === "E_STORE_QUOTA",
+      );
+    },
+    { maxStoreBytes: 4_000 },
+  );
+});
+
+test("a manifest is not readable as bytes, and a missing one is a typed error", async () => {  await withStore(async (store) => {
+    const session = await newSession(store);
+    await store.spoolAttachment(session.storeId, {
+      attachmentId: "att-1",
+      name: "a.txt",
+      mimeType: "text/plain",
+      bytes: Buffer.from("payload", "utf8"),
+    });
+    // "att-1.json" is a legal attachment id, so the two namespaces have to be
+    // separate directories rather than two extensions in one.
+    await assert.rejects(
+      () => store.readAttachment(session.storeId, "att-1.json"),
+      (error: unknown) =>
+        error instanceof SessionStoreError && error.code === "E_STORE_UNKNOWN_ATTACHMENT",
+    );
+    await assert.rejects(
+      () => store.attachmentManifest(session.storeId, "never-spooled"),
+      (error: unknown) =>
+        error instanceof SessionStoreError && error.code === "E_STORE_UNKNOWN_ATTACHMENT",
+    );
+    await assert.rejects(
+      () => store.readAttachment(session.storeId, "never-spooled"),
+      (error: unknown) =>
+        error instanceof SessionStoreError && error.code === "E_STORE_UNKNOWN_ATTACHMENT",
+    );
+  });
+});
+
+test("an unused attachment can be dropped, and deleting the session takes the rest", async () => {
+  await withStore(async (store, root) => {
+    const session = await newSession(store);
+    const spool = async (attachmentId: string): Promise<void> => {
+      await store.spoolAttachment(session.storeId, {
+        attachmentId,
+        name: "a.txt",
+        mimeType: "text/plain",
+        bytes: Buffer.from("x", "utf8"),
+      });
+    };
+    await spool("att-1");
+    await spool("att-2");
+    assert.equal(await store.discardAttachment(session.storeId, "att-1"), true);
+    // Idempotent, so a retried delete is not a confusing error.
+    assert.equal(await store.discardAttachment(session.storeId, "att-1"), false);
+    assert.equal(await store.discardAttachment(session.storeId, "att-2"), true);
+    await assert.rejects(
+      () => store.readAttachment(session.storeId, "att-2"),
+      (error: unknown) =>
+        error instanceof SessionStoreError && error.code === "E_STORE_UNKNOWN_ATTACHMENT",
+    );
+
+    // A used attachment still goes when the session does.
+    await spool("att-3");
+    assert.equal(await store.remove(session.storeId), true);
+    assert.deepEqual(await fsp.readdir(root), []);
+  });
+});
+
+test("a store that is not open refuses to spool", async () => {
+  const root = tempRoot();
+  const store = new SessionStore({ root });
+  await assert.rejects(
+    () =>
+      store.spoolAttachment("11111111-1111-4111-8111-111111111111", {
+        attachmentId: "att-1",
+        name: "a.txt",
+        mimeType: "text/plain",
+        bytes: Buffer.from("x"),
+      }),
+    (error: unknown) => error instanceof SessionStoreError && error.code === "E_STORE_WRITABLE",
+  );
+  await fsp.rm(root, { recursive: true, force: true });
+});
+
 // --- path safety ---
 
 test("session directories never escape the store root", async () => {
@@ -1020,4 +1300,82 @@ test("a backwards step in the log degrades to a reported loss, never a broken pa
     // And the page must still satisfy the response contract.
     assert.equal(SessionEventsResponseSchema.safeParse(page).success, true);
   });
+});
+
+test("the whole-store cap bites on the second upload, not only the first", async () => {
+  // The ceiling used to be checked against a counter the spool never added to, so
+  // every upload passed the check however many had gone before and the disk grew
+  // without bound. Two uploads that each fit must together exceed the cap.
+  await withStore(
+    async (store) => {
+      const session = await newSession(store);
+      const upload = (attachmentId: string) =>
+        store.spoolAttachment(session.storeId, {
+          attachmentId,
+          name: `${attachmentId}.bin`,
+          mimeType: "application/octet-stream",
+          bytes: Buffer.alloc(2_000),
+        });
+      await upload("att-1");
+      await assert.rejects(
+        () => upload("att-2"),
+        (error: unknown) => error instanceof SessionStoreError && error.code === "E_STORE_QUOTA",
+        "2 x 2 KB must not both fit under a 3 KB cap",
+      );
+      // And the refused one left nothing behind: the bytes file is not there,
+      // so a later turn naming it would not find a manifest to read.
+      await assert.rejects(
+        () => store.readAttachment(session.storeId, "att-2"),
+        (error: unknown) =>
+          error instanceof SessionStoreError && error.code === "E_STORE_UNKNOWN_ATTACHMENT",
+      );
+    },
+    { maxStoreBytes: 3_000 },
+  );
+});
+
+test("discarding an attachment gives the budget back", async () => {
+  // Otherwise a store that once held a large attachment refuses real writes for
+  // the rest of the process, while the disk is wide open.
+  await withStore(
+    async (store) => {
+      const session = await newSession(store);
+      const upload = (attachmentId: string) =>
+        store.spoolAttachment(session.storeId, {
+          attachmentId,
+          name: `${attachmentId}.bin`,
+          mimeType: "application/octet-stream",
+          bytes: Buffer.alloc(2_000),
+        });
+      await upload("att-1");
+      assert.equal(await store.discardAttachment(session.storeId, "att-1"), true);
+      // The room is back, so this must be accepted where it was refused before.
+      await upload("att-2");
+    },
+    { maxStoreBytes: 3_000 },
+  );
+});
+
+test("removing a session gives its spooled bytes back", async () => {
+  await withStore(
+    async (store) => {
+      const first = await newSession(store);
+      await store.spoolAttachment(first.storeId, {
+        attachmentId: "att-1",
+        name: "a.bin",
+        mimeType: "application/octet-stream",
+        bytes: Buffer.alloc(2_000),
+      });
+      assert.equal(await store.remove(first.storeId), true);
+      // A second session's upload must not be refused for bytes that are gone.
+      const second = await newSession(store);
+      await store.spoolAttachment(second.storeId, {
+        attachmentId: "att-2",
+        name: "b.bin",
+        mimeType: "application/octet-stream",
+        bytes: Buffer.alloc(2_000),
+      });
+    },
+    { maxStoreBytes: 3_000 },
+  );
 });

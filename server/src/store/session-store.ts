@@ -4,12 +4,16 @@ import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
 import {
+  AttachmentManifestEntrySchema,
+  MAX_ATTACHMENT_BYTES,
   RECORD_VERSION,
   SessionSummarySchema,
   StoredEventRecordSchema,
   isPersistedEventType,
   MAX_EVENTS_PER_PAGE,
   MAX_LISTED_SESSIONS,
+  type AttachmentKind,
+  type AttachmentManifestEntry,
   type IsoTimestamp,
   type ReplayStatus,
   type SessionEventsResponse,
@@ -69,6 +73,14 @@ const EVENTS_FILE = "events.jsonl";
 const META_VERSION = 1;
 const TITLE_MAX_GRAPHEMES = 120;
 const SESSION_IDLE_EVICT_MS = 30 * 24 * 60 * 60 * 1000;
+// Both live inside the session directory, so remove() and evict() already take
+// them with them and no retention rule has to be written a second time. They are
+// separate directories rather than two extensions in one, because an id is
+// validated as a safe name and not as a UUID: "x.json" is a legal name, and in a
+// shared directory it would be both bytes for one attachment and the manifest of
+// another.
+const ATTACHMENT_BYTES_DIR = "attachments";
+const ATTACHMENT_MANIFEST_DIR = "manifests";
 
 /**
  * Zod rather than a bag of `String()` and `Number()` coercions. `Number({})` is
@@ -192,6 +204,22 @@ function assertInside(root: string, target: string): void {
   }
 }
 
+/**
+ * Decides an attachment's kind from the bytes, not from the declared mime.
+ *
+ * A clean UTF-8 decode is text, because that is the only case where inlining the
+ * content as text is lossless. Everything else is binary, and an image is called
+ * an image so the browser can show it as one.
+ */
+function classifyAttachment(bytes: Buffer, mimeType: string): AttachmentKind {
+  try {
+    new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    return mimeType.trim().toLowerCase().startsWith("image/") ? "image" : "binary";
+  }
+  return "text";
+}
+
 export class SessionStore {
   private readonly root: string;
   private readonly now: () => number;
@@ -203,6 +231,17 @@ export class SessionStore {
   private readonly index = new Map<string, MetaFile>();
   private readonly writers = new Map<string, Writer>();
   private storeBytes = 0;
+  /**
+   * Bytes spooled per session, tracked apart from the log.
+   *
+   * The log carries its own size in meta.json, so it can be re-measured after a
+   * restart. The spool has no such file, so without this the whole-store ceiling
+   * is checked on every upload and never accumulated: a loop of 25 MB uploads
+   * passes the check every time and fills the disk. Deleting bytes has to give
+   * the budget back, or a store that once held a large attachment refuses real
+   * writes for the rest of the process.
+   */
+  private readonly spoolBytes = new Map<string, number>();
   private ready = false;
 
   constructor(options: SessionStoreOptions) {
@@ -429,6 +468,47 @@ export class SessionStore {
     return target;
   }
 
+  /**
+   * A path two levels below the root. The spool needs its own containment check
+   * because `assertInside` judges a direct child, and an attachment is a grandchild.
+   */
+  private subPath(storeId: string, dirName: string, fileName: string): string {
+    const sessionDir = this.dirFor(storeId);
+    const dir = path.join(sessionDir, dirName);
+    assertInside(sessionDir, dir);
+    const target = path.join(dir, fileName);
+    assertInside(dir, target);
+    return target;
+  }
+
+  private attachmentPath(storeId: string, attachmentId: string): string {
+    return this.subPath(storeId, ATTACHMENT_BYTES_DIR, this.safeAttachmentName(attachmentId));
+  }
+
+  private attachmentManifestPath(storeId: string, attachmentId: string): string {
+    return this.subPath(
+      storeId,
+      ATTACHMENT_MANIFEST_DIR,
+      `${this.safeAttachmentName(attachmentId)}.json`,
+    );
+  }
+
+  /**
+   * The one place an attachment id becomes a path component. It is caller-named
+   * in every direction, so it goes through the same predicate as a session
+   * directory: a rejected id is never a path, only a 400-shaped error.
+   */
+  private safeAttachmentName(attachmentId: string): string {
+    const reason = unsafeNameReason(attachmentId);
+    if (reason !== null) {
+      throw new SessionStoreError(
+        "E_STORE_PATH_ESCAPE",
+        `unsafe attachment id (${reason})`,
+      );
+    }
+    return attachmentId;
+  }
+
   /** Rebuilds the whole index from disk. The only thing that keeps it honest. */
   async rescan(): Promise<number> {
     this.index.clear();
@@ -578,6 +658,7 @@ export class SessionStore {
       const reason = overCap || needRoom ? "session-cap" : `idle for ${Math.round(idle / 86_400_000)}d`;
       this.index.delete(meta.storeId);
       this.storeBytes = Math.max(0, this.storeBytes - meta.bytes);
+      this.releaseSpool(meta.storeId);
       remaining -= 1;
       removed += 1;
       // Reported, because this deletes a user's whole transcript. Silently
@@ -1077,6 +1158,236 @@ export class SessionStore {
     }
   }
 
+  // --- attachments ---
+  // k5 holds the bytes; the harness is handed a prompt block. Nothing here ever
+  // lets a stored path reach the wire, because the manifest is the only thing the
+  // turn carries and it names no file.
+
+  /**
+   * Writes one attachment into the session's spool and returns the manifest k5
+   * will believe about it.
+   *
+   * `kind` and `size` are derived from the bytes the server just received, never
+   * from what the client claimed in `?mime=`: a client that says "text/plain"
+   * about a binary would otherwise make the harness inline garbage as text, and
+   * the durable transcript would record a size that never arrived. Only `name`
+   * is the client's, because only the client knows it.
+   */
+  async spoolAttachment(
+    storeId: string,
+    input: {
+      readonly attachmentId: string;
+      readonly name: string;
+      readonly mimeType: string;
+      readonly bytes: Buffer;
+    },
+  ): Promise<AttachmentManifestEntry> {
+    this.assertOpen();
+    const dir = await this.liveSessionDir(storeId);
+    if (input.bytes.length > MAX_ATTACHMENT_BYTES) {
+      throw new SessionStoreError(
+        "E_STORE_QUOTA",
+        `an attachment of ${input.bytes.length} bytes is over the ${MAX_ATTACHMENT_BYTES}-byte cap`,
+      );
+    }
+    // Checked against the whole-store ceiling rather than only the per-file cap:
+    // spooled bytes are not events, so they never reach the log's own accounting
+    // and would otherwise be the only thing in the store nothing bounds.
+    if (this.storeBytes + input.bytes.length > this.maxStoreBytes) {
+      throw new SessionStoreError(
+        "E_STORE_QUOTA",
+        `the session store reached its ${this.maxStoreBytes}-byte cap; ${storeId} has no room for an attachment`,
+      );
+    }
+    const manifest = AttachmentManifestEntrySchema.safeParse({
+      attachmentId: input.attachmentId,
+      name: input.name,
+      mimeType: input.mimeType,
+      kind: classifyAttachment(input.bytes, input.mimeType),
+      size: input.bytes.length,
+    });
+    // Refused before a byte is written: a manifest that cannot satisfy the
+    // contract is not a manifest, and a half-stored attachment is invisible to
+    // the prompt that names it.
+    if (!manifest.success) {
+      throw new SessionStoreError(
+        "E_STORE_WRITABLE",
+        `unusable attachment manifest: ${manifest.error.issues[0]?.message ?? "unknown"}`,
+      );
+    }
+    for (const sub of [ATTACHMENT_BYTES_DIR, ATTACHMENT_MANIFEST_DIR]) {
+      await fsp.mkdir(path.join(dir, sub), { recursive: true, mode: 0o700 });
+    }
+    try {
+      await this.publishFile(this.attachmentPath(storeId, input.attachmentId), input.bytes);
+      await this.publishFile(
+        this.attachmentManifestPath(storeId, input.attachmentId),
+        `${JSON.stringify(manifest.data)}\n`,
+      );
+    } catch (cause) {
+      throw cause instanceof SessionStoreError
+        ? cause
+        : new SessionStoreError(
+            "E_STORE_WRITABLE",
+            `could not spool an attachment for ${storeId}: ${String(cause)}`,
+          );
+    }
+    // Accrued only after both files are published, so a failed write charges
+    // nothing. The manifest is charged with the bytes because it shares the disk.
+    const charged = manifest.data.size + Buffer.byteLength(`${JSON.stringify(manifest.data)}\n`);
+    this.storeBytes += charged;
+    this.spoolBytes.set(storeId, (this.spoolBytes.get(storeId) ?? 0) + charged);
+    return manifest.data;
+  }
+
+  /** Gives a session's spooled bytes back to the store budget. */
+  private releaseSpool(storeId: string): void {
+    const held = this.spoolBytes.get(storeId);
+    if (held === undefined) return;
+    this.storeBytes = Math.max(0, this.storeBytes - held);
+    this.spoolBytes.delete(storeId);
+  }
+
+  /**
+   * The manifest a spooled attachment was stored under, keyed by the id alone.
+   *
+   * The browser names an attachment by id, so this is the only way the name and
+   * mime it was given at upload can reach the turn that uses it. It is re-read
+   * rather than remembered: an in-memory table would lose every attachment across
+   * a restart, and the turn would then silently run without the bytes the user
+   * attached.
+   */
+  async attachmentManifest(
+    storeId: string,
+    attachmentId: string,
+  ): Promise<AttachmentManifestEntry> {
+    // The path is resolved outside the try, so a refused id stays a path refusal
+    // rather than being reported as an attachment that is merely not there.
+    const target = this.attachmentManifestPath(storeId, attachmentId);
+    let text: string;
+    try {
+      text = await fsp.readFile(target, "utf8");
+    } catch (cause) {
+      throw new SessionStoreError(
+        "E_STORE_UNKNOWN_ATTACHMENT",
+        `no attachment ${attachmentId} in session ${storeId}: ${String(cause)}`,
+      );
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch (cause) {
+      throw new SessionStoreError(
+        "E_STORE_UNKNOWN_ATTACHMENT",
+        `the manifest for ${attachmentId} is unreadable: ${String(cause)}`,
+      );
+    }
+    const manifest = AttachmentManifestEntrySchema.safeParse(parsed);
+    if (!manifest.success) {
+      throw new SessionStoreError(
+        "E_STORE_UNKNOWN_ATTACHMENT",
+        `the manifest for ${attachmentId} is not in the expected shape`,
+      );
+    }
+    return manifest.data;
+  }
+
+  async readAttachment(storeId: string, attachmentId: string): Promise<Buffer> {
+    const target = this.attachmentPath(storeId, attachmentId);
+    try {
+      return await fsp.readFile(target);
+    } catch (cause) {
+      throw new SessionStoreError(
+        "E_STORE_UNKNOWN_ATTACHMENT",
+        `no attachment ${attachmentId} in session ${storeId}: ${String(cause)}`,
+      );
+    }
+  }
+
+  /** The reverse state for an upload that was never used. */
+  async discardAttachment(storeId: string, attachmentId: string): Promise<boolean> {
+    const target = this.attachmentPath(storeId, attachmentId);
+    let existed = true;
+    let charged = 0;
+    try {
+      // The size is read before the unlink, because afterwards there is nothing
+      // left to measure and the store would keep charging for bytes it no longer
+      // has on disk.
+      const stat = await fsp.stat(target);
+      existed = true;
+      charged = stat.size;
+      try {
+        const manifest = await this.attachmentManifest(storeId, attachmentId);
+        charged += Buffer.byteLength(`${JSON.stringify(manifest)}\n`);
+      } catch {
+        // The bytes are gone either way; charging only the payload is better than
+        // charging nothing and drifting high.
+      }
+    } catch {
+      existed = false;
+    }
+    await fsp.rm(target, { force: true });
+    await fsp.rm(this.attachmentManifestPath(storeId, attachmentId), { force: true });
+    if (charged > 0) {
+      this.storeBytes = Math.max(0, this.storeBytes - charged);
+      this.spoolBytes.set(storeId, Math.max(0, (this.spoolBytes.get(storeId) ?? 0) - charged));
+    }
+    return existed;
+  }
+
+  private async liveSessionDir(storeId: string): Promise<string> {
+    if (this.index.get(storeId) === undefined) {
+      throw new SessionStoreError("E_STORE_UNKNOWN_SESSION", `no stored session ${storeId}`);
+    }
+    const dir = this.dirFor(storeId);
+    // Stat, never mkdir -p: spooling into a session the user deleted would be a
+    // deleted session quietly back, which is the same resurrection `append`
+    // refuses at the index lookup.
+    try {
+      await fsp.stat(dir);
+    } catch {
+      throw new SessionStoreError(
+        "E_STORE_UNKNOWN_SESSION",
+        `stored session ${storeId} has no directory on disk`,
+      );
+    }
+    return dir;
+  }
+
+  /**
+   * Publishes a file by rename, so a reader never sees half of one.
+   *
+   * The temp name is unpredictable and opened O_EXCL, for the same reason
+   * writeMeta's is: a harness running agent-supplied code shares this uid, so a
+   * predictable temp name is an arbitrary-file-overwrite primitive. A torn
+   * attachment would be worse than a missing one, because the manifest says it
+   * is there.
+   */
+  private async publishFile(target: string, contents: Buffer | string): Promise<void> {
+    const noFollow = fs.constants.O_NOFOLLOW ?? 0;
+    const tmp = path.join(
+      path.dirname(target),
+      `.${path.basename(target)}.${randomUUID()}.tmp`,
+    );
+    const handle = await fsp.open(
+      tmp,
+      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | noFollow,
+      0o600,
+    );
+    try {
+      await handle.writeFile(contents);
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    try {
+      await fsp.rename(tmp, target);
+    } catch (cause) {
+      await fsp.rm(tmp, { force: true }).catch(() => {});
+      throw cause;
+    }
+  }
+
   /** Removes k5's own record. Never touches the harness's session. */
   async remove(storeId: string): Promise<boolean> {
     const meta = this.index.get(storeId);
@@ -1085,6 +1396,7 @@ export class SessionStore {
     // index lookup and can never recreate what we are about to delete.
     this.index.delete(storeId);
     this.storeBytes = Math.max(0, this.storeBytes - meta.bytes);
+    this.releaseSpool(storeId);
     const writer = this.writers.get(storeId);
     if (writer !== undefined) {
       writer.stopped = true;

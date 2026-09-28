@@ -11,6 +11,10 @@ export type SessionStoreErrorCode =
   | "E_STORE_QUOTA"
   | "E_STORE_EVICTED"
   | "E_STORE_UNKNOWN_SESSION"
+  // Distinct from E_STORE_UNKNOWN_SESSION because the caller has two different
+  // repairs: an unknown session is a stale id, and an unknown attachment inside a
+  // live session is an upload that is gone.
+  | "E_STORE_UNKNOWN_ATTACHMENT"
   | "E_STORE_ROOT";
 
 export class SessionStoreError extends Error {

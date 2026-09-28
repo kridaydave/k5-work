@@ -13,7 +13,7 @@ afterEach(() => {
 
 function event(seq: number, type: "turn.started" | "turn.delta" | "turn.completed", text = ""): ServerEvent {
   if (type === "turn.started") {
-    return { type, sessionId: "ses", turnId: `t${String(seq)}`, userText: `q${String(seq)}` };
+    return { type, sessionId: "ses", turnId: `t${String(seq)}`, attachments: [], userText: `q${String(seq)}` };
   }
   if (type === "turn.completed") {
     return { type, sessionId: "ses", turnId: `t${String(seq)}`, stopReason: "end_turn" };

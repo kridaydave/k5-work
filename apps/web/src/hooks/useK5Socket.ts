@@ -11,6 +11,7 @@ import {
   requestCancel,
   resetSession,
   scopeFor,
+  type AttachmentRef,
   type BrowserCommand,
   type K5ViewState,
   type ServerEvent,
@@ -54,7 +55,11 @@ function nextCommandId(): string {
 export interface K5Socket {
   state: K5ViewState;
   openSession(projectId: string): void;
-  prompt(text: string): void;
+  /**
+   * Sends a prompt. `attachments` are ids the spool already holds: the bytes were
+   * uploaded before this call, and the command carries identity only.
+   */
+  prompt(text: string, attachments?: readonly AttachmentRef[]): void;
   cancel(): void;
   closeSession(): void;
   newTask(): void;
@@ -346,7 +351,7 @@ export function useK5Socket(options: UseK5SocketOptions = {}): K5Socket {
   );
 
   const prompt = useCallback(
-    (text: string) => {
+    (text: string, attachments: readonly AttachmentRef[] = []) => {
       const { sessionId, connection } = stateRef.current;
       if (connection !== "open") {
         // Never begin a turn with no way to send it: the optimistic entry would
@@ -376,7 +381,16 @@ export function useK5Socket(options: UseK5SocketOptions = {}): K5Socket {
       }
       const commandId = nextCommandId();
       setState((current) => beginTurn(current, turnId, text));
-      send({ commandId, type: "session.prompt", sessionId, turnId, text });
+      // Copied, because the contract's own type is a mutable array and a caller
+      // holding the list could otherwise mutate the frame after it was validated.
+      send({
+        commandId,
+        type: "session.prompt",
+        sessionId,
+        turnId,
+        text,
+        attachments: [...attachments],
+      });
     },
     [rejectLocal, send],
   );

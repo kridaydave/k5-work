@@ -1,6 +1,7 @@
 import path from "node:path";
 import {
   resolveAccessProfile,
+  type AttachmentManifestEntry,
   type BrowserCommand,
   type CommandFailureReason,
   type ConfigOptionSummary,
@@ -11,6 +12,7 @@ import { SeatOpenError, type SeatRunner } from "./seat-runner.js";
 import { AcpAuthRequiredError } from "./probe.js";
 import { AcpCapabilityError } from "./acp-seat.js";
 import type { AcpSeat, SeatStreamEvent } from "./acp-seat.js";
+import { planPromptBlocks, type PlannedPrompt } from "./prompt-blocks.js";
 import type { TurnCompletedEvent } from "@k5-work/shared";
 type TurnStopReason = TurnCompletedEvent["stopReason"];
 import type { AcpChild } from "./spawn.js";
@@ -101,6 +103,17 @@ export interface SessionRecorder {
    * store's shape to get them.
    */
   stored(storeId: string): { projectId: string; cwd: string; harnessSessionId: string } | null;
+  /**
+   * The manifest a spooled attachment was stored under, and its bytes.
+   *
+   * Two calls rather than one object because a store may hold many attachments:
+   * the manifest is identity and provenance, and the bytes are the payload, and
+   * the service must be able to refuse a turn for a missing attachment before it
+   * has read anything large. Both are keyed by a k5 store id the service already
+   * has, so a browser can never name a path.
+   */
+  attachmentManifest(storeId: string, attachmentId: string): Promise<AttachmentManifestEntry>;
+  readAttachment(storeId: string, attachmentId: string): Promise<Buffer>;
 }
 
 interface ConnectionState {
@@ -674,6 +687,65 @@ export function createSessionHandlers(
     }
   }
 
+  /**
+   * Resolves every ref the browser named to bytes k5 actually holds, and refuses
+   * the turn if any of them cannot be produced.
+   *
+   * A missing attachment is refused rather than skipped. The user's bytes would
+   * not reach the model, and a turn that started anyway would claim otherwise —
+   * which is the same lie as reporting a truncated log as complete.
+   */
+  async function resolveAttachments(
+    command: Extract<BrowserCommand, { type: "session.prompt" }>,
+  ): Promise<
+    | { manifest: AttachmentManifestEntry[]; plan: PlannedPrompt }
+    | { refusal: { reason: "not-found" | "capability-unsupported"; message: string } }
+  > {
+    const storeId = state.storeId;
+    const recorder = options.recorder;
+    if (storeId === null || recorder === undefined) {
+      return {
+        refusal: {
+          reason: "not-found",
+          message: "this session is not recording attachments, so there is nothing to read them from",
+        },
+      };
+    }
+    const attachments: { manifest: AttachmentManifestEntry; bytes: Buffer }[] = [];
+    for (const ref of command.attachments) {
+      try {
+        const manifest = await recorder.attachmentManifest(storeId, ref.attachmentId);
+        const bytes = await recorder.readAttachment(storeId, ref.attachmentId);
+        attachments.push({ manifest, bytes });
+      } catch (err) {
+        return {
+          refusal: {
+            reason: "not-found",
+            message: `attachment ${ref.attachmentId} is not in the store: ${(err as Error).message.slice(0, 300)}`,
+          },
+        };
+      }
+    }
+    const acp = state.acp;
+    // The seat is the only thing that knows what the harness can accept, so the
+    // gate is read from the live connection rather than from configuration.
+    const plan = planPromptBlocks({
+      text: command.text,
+      attachments,
+      caps: { embeddedContext: acp === null ? false : acp.capabilities.embeddedContext },
+    });
+    if (plan.refused.length > 0) {
+      const names = plan.refused.map((entry) => entry.name).join(", ");
+      return {
+        refusal: {
+          reason: "capability-unsupported",
+          message: `this harness cannot accept embedded content, so ${names} could not be delivered`,
+        },
+      };
+    }
+    return { manifest: attachments.map((entry) => entry.manifest), plan };
+  }
+
   async function runTurn(
     command: Extract<BrowserCommand, { type: "session.prompt" }>,
   ): Promise<void> {
@@ -687,6 +759,10 @@ export function createSessionHandlers(
       });
       return;
     }
+    // Captured once: the reads below await, and a close that lands in that window
+    // clears the connection's seat, so a later property read would be a TypeError
+    // from nowhere rather than the seat's own "closed" refusal.
+    const seat = state.acp;
     if (state.turn !== null && !state.turn.closed) {
       emit({
         type: "command.result",
@@ -697,8 +773,7 @@ export function createSessionHandlers(
       });
       return;
     }
-    clearIdleTimer();
-    if (state.acp.busy) {
+    if (seat.busy) {
       emit({
         type: "command.result",
         commandId: command.commandId,
@@ -709,6 +784,28 @@ export function createSessionHandlers(
       return;
     }
 
+    // Before the idle timer is cleared and before state.turn is assigned, so a
+    // refusal leaves nothing half-open: a turn that never started has no
+    // terminator to forget, and an abandoned session still gets reaped.
+    let attachments: AttachmentManifestEntry[] = [];
+    let plan: PlannedPrompt | null = null;
+    if (command.attachments.length > 0) {
+      const resolved = await resolveAttachments(command);
+      if ("refusal" in resolved) {
+        emit({
+          type: "command.result",
+          commandId: command.commandId,
+          ok: false,
+          reason: resolved.refusal.reason,
+          message: resolved.refusal.message.slice(0, 500),
+        });
+        return;
+      }
+      attachments = resolved.manifest;
+      plan = resolved.plan;
+    }
+
+    clearIdleTimer();
     state.turn = { id: command.turnId, closed: false };
     // A title fallback, so a task is never a blank row. Only the first prompt
     // counts; the harness's own title wins if it sends one later.
@@ -728,11 +825,15 @@ export function createSessionHandlers(
       sessionId: command.sessionId,
       turnId: command.turnId,
       userText: command.text,
+      attachments,
     });
     emit({ type: "command.result", commandId: command.commandId, ok: true, reason: "ok" });
 
     try {
-      const stopReason = await state.acp.prompt(command.turnId, command.text);
+      const stopReason = await seat.prompt(
+        command.turnId,
+        plan?.blocks ?? [{ type: "text", text: command.text }],
+      );
       finishTurn(command.turnId, stopReason);
     } catch (err) {
       // A turn that fails must still terminate, or the working dots never stop.

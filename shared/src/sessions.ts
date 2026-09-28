@@ -4,6 +4,7 @@ import {
   StopReasonSchema,
   ToolLifecycleSchema,
   ToolStatusSchema,
+  type AttachmentManifestEntry,
   type ServerEvent,
   type ServerEventType,
   type StopReason,
@@ -175,6 +176,9 @@ export interface ProjectedTurn {
   readonly thoughtText: string;
   readonly stopReason: StopReason | null;
   readonly tools: readonly ProjectedTool[];
+  /** What was attached, from the stored manifest. Identity and provenance only:
+   * the bytes stay in the spool and are read back by `attachmentId`. */
+  readonly attachments: readonly AttachmentManifestEntry[];
 }
 
 export interface ProjectedTranscript {
@@ -213,6 +217,7 @@ interface MutableTurn {
   thoughtText: string;
   stopReason: StopReason | null;
   tools: Map<string, ProjectedTool>;
+  attachments: AttachmentManifestEntry[];
   order: number;
 }
 
@@ -224,6 +229,7 @@ function freezeTurn(turn: MutableTurn): ProjectedTurn {
     thoughtText: turn.thoughtText,
     stopReason: turn.stopReason,
     tools: [...turn.tools.values()],
+    attachments: turn.attachments,
   };
 }
 
@@ -263,6 +269,7 @@ export function projectTranscript(
       thoughtText: "",
       stopReason: null,
       tools: new Map(),
+      attachments: [],
       order: order.length,
     };
     turns.set(turnId, created);
@@ -278,6 +285,7 @@ export function projectTranscript(
         // First writer wins, so a duplicated record after a rehydrate cannot
         // replace the prompt the user actually sent.
         if (turn.userText.length === 0) turn.userText = event.userText;
+        if (turn.attachments.length === 0) turn.attachments = event.attachments;
         break;
       }
       case "turn.delta": {

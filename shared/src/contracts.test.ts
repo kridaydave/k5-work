@@ -4,7 +4,11 @@ import {
   BROWSER_COMMAND_TYPES,
   BrowserCommandSchema,
   CommandFailureReasonSchema,
+  MAX_ATTACHMENTS,
+  MAX_ATTACHMENT_BYTES,
   ServerEventSchema,
+  SessionPromptCommandSchema,
+  TurnStartedEventSchema,
 } from "./contracts.js";
 
 describe("browser command contract", () => {
@@ -260,5 +264,111 @@ describe("a prompt is capped in bytes, not in characters", () => {
     const atCap = "\u4f60\u597d".repeat(8_192);
     assert.equal(atCap.length, 16_384, "the character cap is not the one doing the work");
     assert.equal(BrowserCommandSchema.safeParse({ ...base, text: atCap }).success, true);
+  });
+});
+
+describe("attachments on the wire", () => {
+  const prompt = { commandId: "c-1", type: "session.prompt", sessionId: "s-1", turnId: "t-1", text: "look" };
+  const manifestEntry = {
+    attachmentId: "att-1",
+    name: "screenshot.png",
+    mimeType: "image/png",
+    kind: "image",
+    size: 2048,
+  };
+  const turnStarted = {
+    type: "turn.started",
+    sessionId: "s-1",
+    turnId: "t-1",
+    userText: "look",
+  };
+
+  it("reads a prompt from a client that predates attachments", () => {
+    // A stale web build sends no such key, and refusing it would break prompts
+    // for everyone on that build the moment the server shipped.
+    assert.equal(BrowserCommandSchema.safeParse(prompt).success, true);
+    assert.deepEqual(SessionPromptCommandSchema.parse(prompt).attachments, []);
+  });
+
+  it("takes an attachment by id and nothing else", () => {
+    const parsed = SessionPromptCommandSchema.safeParse({
+      ...prompt,
+      attachments: [{ attachmentId: "att-1" }],
+    });
+    assert.equal(parsed.success, true);
+    assert.deepEqual(parsed.success ? parsed.data.attachments : null, [
+      { attachmentId: "att-1" },
+    ]);
+    // Name, mime, size and kind are the server's to read off the bytes, so a
+    // client supplying them is claiming authority it does not have.
+    assert.equal(
+      SessionPromptCommandSchema.safeParse({
+        ...prompt,
+        attachments: [{ attachmentId: "att-1", name: "innocent.txt", size: 10 }],
+      }).success,
+      false,
+    );
+  });
+
+  it("caps the attachments one prompt can carry", () => {
+    const refs = (count: number) =>
+      Array.from({ length: count }, (_, index) => ({ attachmentId: `att-${index}` }));
+    assert.equal(SessionPromptCommandSchema.safeParse({ ...prompt, attachments: refs(MAX_ATTACHMENTS) }).success, true);
+    assert.equal(
+      SessionPromptCommandSchema.safeParse({ ...prompt, attachments: refs(MAX_ATTACHMENTS + 1) }).success,
+      false,
+    );
+  });
+
+  it("reads a turn.started recorded before the manifest existed", () => {
+    assert.equal(ServerEventSchema.safeParse(turnStarted).success, true);
+    assert.deepEqual(TurnStartedEventSchema.parse(turnStarted).attachments, []);
+  });
+
+  it("carries the resolved manifest on turn.started", () => {
+    const parsed = TurnStartedEventSchema.safeParse({ ...turnStarted, attachments: [manifestEntry] });
+    assert.equal(parsed.success, true);
+    assert.deepEqual(parsed.success ? parsed.data.attachments : null, [manifestEntry]);
+    // Bytes never reach the transcript, so there is no field here that could
+    // hold them even by accident.
+    assert.equal(
+      TurnStartedEventSchema.safeParse({
+        ...turnStarted,
+        attachments: [{ ...manifestEntry, data: "AAAA" }],
+      }).success,
+      false,
+    );
+  });
+
+  it("bounds a manifest entry to the per-attachment byte cap", () => {
+    assert.equal(MAX_ATTACHMENT_BYTES, 26_214_400);
+    assert.equal(
+      TurnStartedEventSchema.safeParse({
+        ...turnStarted,
+        attachments: [{ ...manifestEntry, size: MAX_ATTACHMENT_BYTES }],
+      }).success,
+      true,
+    );
+    assert.equal(
+      TurnStartedEventSchema.safeParse({
+        ...turnStarted,
+        attachments: [{ ...manifestEntry, size: MAX_ATTACHMENT_BYTES + 1 }],
+      }).success,
+      false,
+    );
+  });
+
+  it("keeps the prompt byte budget in force on a prompt that has attachments", () => {
+    // The budget cannot live on the member object, so it runs as a refinement
+    // over the union. A new field on the member is exactly the kind of change
+    // that can silently strand that refinement.
+    const cjk = "\u4f60\u597d".repeat(10_000);
+    const parsed = BrowserCommandSchema.safeParse({
+      ...prompt,
+      text: cjk,
+      attachments: [{ attachmentId: "att-1" }],
+    });
+    assert.equal(parsed.success, false);
+    assert.match(parsed.error?.issues[0]?.message ?? "", /bytes of UTF-8/);
   });
 });

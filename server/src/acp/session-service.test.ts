@@ -121,6 +121,10 @@ async function start(options: {
                 titleFromPrompt: (storeId, prompt) => store.titleFromPrompt(storeId, prompt),
                 remove: (storeId) => store.remove(storeId),
                 stored: (storeId) => store.stored(storeId),
+                attachmentManifest: (storeId, attachmentId) =>
+                  store.attachmentManifest(storeId, attachmentId),
+                readAttachment: (storeId, attachmentId) =>
+                  store.readAttachment(storeId, attachmentId),
               },
             }),
       });
@@ -838,6 +842,201 @@ describe("durable session recording", () => {
       const store = harness.store;
       assert.ok(store !== null);
       assert.equal(store.list().length, 1, "only one stored task may exist");
+      ws.close();
+    } finally {
+      await harness.close();
+    }
+  });
+});
+
+// --- attachments ---
+// The bytes live in the spool and only the id crosses the websocket, so these
+// run the real store against the fake harness and read back what the harness
+// actually received.
+
+describe("a prompt that carries attachments", () => {
+  const ORIGIN = "http://127.0.0.1:5173";
+
+  async function openedSession(
+    harness: Harness,
+  ): Promise<{
+    store: SessionStore;
+    storeId: string;
+    sessionId: string;
+    ws: WebSocket;
+  }> {
+    const store = harness.store;
+    if (store === null) throw new Error("the harness must have been started with record: true");
+    const ws = await harness.connect(ORIGIN);
+    ws.send(openCommand());
+    const opened = await waitFor(harness.events, "session.opened");
+    if (opened.type !== "session.opened") throw new Error("unreachable");
+    assert.match(opened.storeId, /^[0-9a-f-]{36}$/, "a recorded session has a real store id");
+    return { store, storeId: opened.storeId, sessionId: opened.sessionId, ws };
+  }
+
+  it("reaches the harness as a resource block, and the transcript names the file", async () => {
+    // The fake echoes the received prompt array back, which is the only place the
+    // harness side of this feature is observable from.
+    const harness = await start({ record: true, scenario: "echo-blocks" });
+    try {
+      const { store, storeId, sessionId, ws } = await openedSession(harness);
+      const manifest = await store.spoolAttachment(storeId, {
+        attachmentId: "att-1",
+        name: "notes.txt",
+        mimeType: "text/plain",
+        bytes: Buffer.from("the attached words", "utf8"),
+      });
+      ws.send(
+        JSON.stringify({
+          commandId: "c-2",
+          type: "session.prompt",
+          sessionId,
+          turnId: "t-1",
+          text: "read the attached file",
+          attachments: [{ attachmentId: "att-1" }],
+        }),
+      );
+
+      const [echoed] = await waitForAll(
+        harness.events,
+        (event) => event.type === "turn.delta" && event.text.startsWith("blocks:"),
+        1,
+      );
+      if (echoed.type !== "turn.delta") throw new Error("unreachable");
+      const blocks = JSON.parse(echoed.text.slice("blocks:".length)) as {
+        type: string;
+        text?: string;
+        resource?: { uri: string; text?: string; blob?: string; mimeType: string };
+      }[];
+      assert.equal(blocks[0]?.text, "read the attached file", "the prompt leads with the user's text");
+      const resource = blocks.find((block) => block.type === "resource");
+      assert.equal(resource?.resource?.text, "the attached words", "the content, not the path");
+      assert.equal(resource?.resource?.uri, "k5-attachment:att-1");
+      assert.equal(resource?.resource?.mimeType, "text/plain");
+      assert.equal(
+        blocks.some((block) => block.type === "resource_link"),
+        false,
+        "a link would be an attachment the harness cannot open",
+      );
+      // The listing block exists because the resource block has no name field.
+      assert.match(blocks[1]?.text ?? "", /- notes\.txt \(text\/plain, 18 bytes\)/);
+
+      const recorded = harness.events.find(
+        (event): event is Extract<ServerEvent, { type: "turn.started" }> =>
+          event.type === "turn.started",
+      );
+      assert.deepEqual(recorded?.attachments, [manifest]);
+      ws.close();
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("refuses a turn whose attachment is not in the spool, and opens no turn", async () => {
+    // The user's bytes would never reach the model, so a turn that started anyway
+    // would claim otherwise. Both halves matter: the refusal is visible, and
+    // nothing started.
+    const harness = await start({ record: true, scenario: "echo-blocks" });
+    try {
+      const { store, storeId, sessionId, ws } = await openedSession(harness);
+      await store.spoolAttachment(storeId, {
+        attachmentId: "att-1",
+        name: "notes.txt",
+        mimeType: "text/plain",
+        bytes: Buffer.from("kept", "utf8"),
+      });
+      ws.send(
+        JSON.stringify({
+          commandId: "c-2",
+          type: "session.prompt",
+          sessionId,
+          turnId: "t-1",
+          text: "read these",
+          attachments: [{ attachmentId: "att-1" }, { attachmentId: "never-spooled" }],
+        }),
+      );
+      const refused = await waitForCommand(harness.events, "c-2");
+      assert.equal(refused.ok, false);
+      assert.equal(refused.reason, "not-found");
+      assert.equal(
+        harness.events.some((event) => event.type === "turn.started"),
+        false,
+        "a refusal must not leave a turn the browser is waiting on",
+      );
+      assert.equal(
+        harness.events.some((event) => event.type === "turn.delta"),
+        false,
+        "and nothing may have reached the harness",
+      );
+
+      // No half-open turn was left behind: the next prompt is served, not refused
+      // as busy.
+      ws.send(
+        JSON.stringify({
+          commandId: "c-3",
+          type: "session.prompt",
+          sessionId,
+          turnId: "t-2",
+          text: "never mind",
+          attachments: [],
+        }),
+      );
+      const result = await waitForCommand(harness.events, "c-3");
+      assert.equal(result.ok, true, "the seat is still usable after a refusal");
+      await waitFor(harness.events, "turn.completed");
+      ws.close();
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("refuses an attachment on a harness that cannot take embedded context", async () => {
+    // `resource` is exactly the variant gated on promptCapabilities
+    // .embeddedContext, so a harness without it would drop the bytes and the turn
+    // would look like it had read them.
+    const harness = await start({ record: true, scenario: "no-embedded-context" });
+    try {
+      const { store, storeId, sessionId, ws } = await openedSession(harness);
+      await store.spoolAttachment(storeId, {
+        attachmentId: "att-1",
+        name: "notes.txt",
+        mimeType: "text/plain",
+        bytes: Buffer.from("the attached words", "utf8"),
+      });
+      ws.send(
+        JSON.stringify({
+          commandId: "c-2",
+          type: "session.prompt",
+          sessionId,
+          turnId: "t-1",
+          text: "read the attached file",
+          attachments: [{ attachmentId: "att-1" }],
+        }),
+      );
+      const refused = await waitForCommand(harness.events, "c-2");
+      assert.equal(refused.ok, false);
+      assert.equal(refused.reason, "capability-unsupported");
+      assert.equal(
+        harness.events.some((event) => event.type === "turn.started"),
+        false,
+      );
+
+      // The gate is about attachments, not about the harness: a plain prompt
+      // still works, or the refusal would look like a broken seat.
+      ws.send(
+        JSON.stringify({
+          commandId: "c-3",
+          type: "session.prompt",
+          sessionId,
+          turnId: "t-2",
+          text: "hello",
+          attachments: [],
+        }),
+      );
+      const ok = await waitForCommand(harness.events, "c-3");
+      assert.equal(ok.ok, true);
+      await waitFor(harness.events, "turn.completed");
       ws.close();
     } finally {
       await harness.close();

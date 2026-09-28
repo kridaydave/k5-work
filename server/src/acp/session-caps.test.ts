@@ -221,7 +221,9 @@ test("resume adopts a session and leaves it ready to prompt", async () => {
     assert.ok(adopted.configOptions.length > 0, "config options come back from the response");
     // The name promises the seat is ready to prompt, so prompt it. This is the
     // whole point of adopting: the adopted queue has to carry a live turn.
-    const stop = await rig.seat.prompt("t-adopted", "echo: resumed");
+    const stop = await rig.seat.prompt("t-adopted", [
+      { type: "text", text: "echo: resumed" },
+    ]);
     assert.equal(stop, "end_turn");
     assert.ok(chunks.length > 0, "the adopted session must deliver a real reply");
     assert.equal(chunks.join(""), "first second third");
