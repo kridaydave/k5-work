@@ -765,4 +765,33 @@ describe("reconnection", () => {
     act(() => FakeSocket.instances[1]!.open());
     expect(view.result.current.state.connection).toBe("open");
   });
+
+  it("re-reads the stored transcript when the server reports a continuation", async () => {
+    // `session.loaded` announces a task and changes no view state, so without
+    // this read the entries on screen stayed the previous task's: the sidebar
+    // showed the right task selected and the conversation beside it was the
+    // wrong one.
+    const seen: string[] = [];
+    const { view } = mountReconnecting(async (storeId) => {
+      seen.push(storeId);
+    });
+    act(() => FakeSocket.instances[0]!.open());
+    act(() =>
+      FakeSocket.instances[0]!.receive({
+        type: "session.loaded",
+        commandId: "c-9",
+        storeId: "22222222-2222-4222-8222-222222222222",
+        sessionId: "ses-9",
+        projectId: "p-1",
+        cwd: "/tmp/p",
+        configOptions: [],
+      } as ServerEvent),
+    );
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(seen).toEqual(["22222222-2222-4222-8222-222222222222"]);
+    // And it does not disturb anything else about the connection.
+    expect(view.result.current.state.connection).toBe("open");
+  });
 });

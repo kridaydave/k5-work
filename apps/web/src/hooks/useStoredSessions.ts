@@ -94,12 +94,6 @@ export function useStoredSessions(): StoredSessionState {
 /** Enough pages for a log at the store's 12 MiB cap; past this it is a prefix. */
 const MAX_TRANSCRIPT_PAGES = 64;
 
-function parsedLastSeq(bySeq: Map<number, StoredEvent>): number | null {
-  let last: number | null = null;
-  for (const seq of bySeq.keys()) if (last === null || seq > last) last = seq;
-  return last;
-}
-
 function isUnrecorded(storeId: string | null | undefined): boolean {
   // The server sends the all-zero id when no recorder is wired, so the browser
   // never has to distinguish "missing" from "not recorded".
@@ -140,6 +134,13 @@ class TranscriptCursor {
   private dropped = 0;
   private truncated = false;
   private restarted = false;
+  /**
+   * What the last page the store actually served said about the rest of the log.
+   * Truncation is read off this rather than off a record count, because a count
+   * cannot tell a full read of a short log from a budget-bound read of a long
+   * one, and cannot notice a duplicate or a dropped sequence number at all.
+   */
+  private moreAvailable = false;
   /** Set when the store disowned a cursor, which is a hard signal to rehydrate. */
   rehydrateRequired = false;
 
@@ -180,6 +181,7 @@ class TranscriptCursor {
     this.dropped += page.dropped;
     this.nextSince = page.nextSince;
     this.since = page.nextSince;
+    this.moreAvailable = page.hasMore;
     // A page that claims more but carries nothing, or carries nothing to page
     // past, is a store that will not advance. Continuing re-requests the same
     // cursor until the page bound, so stop and call what we have a prefix.
@@ -206,11 +208,12 @@ class TranscriptCursor {
     dropped: number;
   } {
     if (budgetExhausted) {
-      // Anything still unread once the budget is gone is a prefix, and the caller
-      // has to be able to tell that from a complete history.
-      const last = parsedLastSeq(this.bySeq);
-      if (last !== null && this.nextSince !== null && this.nextSince < last) this.truncated = true;
-      if (this.bySeq.size === MAX_EVENTS_PER_PAGE * MAX_TRANSCRIPT_PAGES) this.truncated = true;
+      // Anything the store still said was waiting when the page budget ran out is
+      // unread, so the transcript is a prefix. The store's own answer decides it:
+      // the record count it used to guess with could not tell this from a full
+      // read, and missed a read that was cut short by a duplicate or a dropped
+      // sequence number.
+      if (this.moreAvailable) this.truncated = true;
     }
     return {
       records: [...this.bySeq.values()].sort((a, b) => a.seq - b.seq),

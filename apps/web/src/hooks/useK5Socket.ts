@@ -217,6 +217,34 @@ export function useK5Socket(options: UseK5SocketOptions = {}): K5Socket {
     let cancelRetry: (() => void) | null = null;
     let attempt = 0;
 
+    /**
+     * One bounded rehydrate, shared by both callers: a socket reconnecting under
+     * a live task, and a task just continued from the store. The returned promise
+     * always settles: the read is raced against a budget, and a rejection is
+     * logged rather than propagated, because a rehydrator that throws
+     * synchronously or never settles must not strand the caller.
+     */
+    const rehydrateNow = (storeId: string): Promise<void> => {
+      const load = rehydrate.current;
+      if (disposed || load === undefined) return Promise.resolve();
+      return new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, rehydrateBudget.current);
+        void Promise.resolve()
+          .then(() => load(storeId))
+          .then(
+            () => {
+              clearTimeout(timer);
+              resolve();
+            },
+            (cause: unknown) => {
+              clearTimeout(timer);
+              console.warn("k5: the stored transcript could not be re-read", cause);
+              resolve();
+            },
+          );
+      });
+    };
+
     // Reconnecting, rather than treating a close as terminal: the server restarts
     // during development and a dropped wifi connection is not a reason for the
     // workspace to become a dead tab. Backoff is capped, and the attempt counter
@@ -268,33 +296,15 @@ export function useK5Socket(options: UseK5SocketOptions = {}): K5Socket {
           // a turn that finished while we were away is not silently lost. The
           // store is the record; the socket is only a viewer.
           const storeId = stateRef.current.storeId;
-          const load = rehydrate.current;
-          if (load === undefined || storeId === null) {
-            connect();
-            return;
-          }
-          // Wrapped and bounded. A rehydrator that throws synchronously, or one
-          // whose fetch never settles, would otherwise leave the workspace closed
-          // for ever with no next attempt scheduled.
-          const guard = new Promise<void>((resolve) => {
-            const timer = setTimeout(resolve, rehydrateBudget.current);
-            void load(storeId).then(
-              () => {
-                clearTimeout(timer);
-                resolve();
-              },
-              (cause: unknown) => {
-                clearTimeout(timer);
-                console.warn("k5: the stored transcript could not be re-read", cause);
-                resolve();
-              },
-            );
-          });
-          void guard
-            .catch(() => {})
-            .finally(() => {
+          if (rehydrate.current !== undefined && storeId !== null) {
+            // The reconnect waits for the read, so a live delta can never land
+            // before the history it belongs to.
+            void rehydrateNow(storeId).finally(() => {
               if (!disposed) connect();
             });
+            return;
+          }
+          connect();
         };
         cancelRetry = scheduleRetry.current(runRetry, delay);
       };
@@ -323,6 +333,12 @@ export function useK5Socket(options: UseK5SocketOptions = {}): K5Socket {
           return;
         }
         apply(event);
+        // A continuation announces itself without touching view state, so the
+        // entries on screen are still the previous task's. The store is the
+        // record of the task just opened, and it is read here rather than on a
+        // timer: by now `session.opened` has established this session's ids, so
+        // the transcript lands on the session it belongs to.
+        if (event.type === "session.loaded") void rehydrateNow(event.storeId);
       };
     };
 

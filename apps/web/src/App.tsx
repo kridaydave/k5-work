@@ -136,6 +136,11 @@ export default function App() {
   useEffect(() => {
     if (rehydrated === null) return;
     adoptTranscript(rehydrated);
+    // Cleared once adopted, because the value is a handover rather than a
+    // description of the transcript. Left in place it would be re-adopted by
+    // any future re-render that produces a new callback identity, overwriting
+    // live state with a history that has since grown.
+    setRehydrated(null);
   }, [rehydrated, adoptTranscript]);
 
   /**
@@ -226,10 +231,16 @@ export default function App() {
     const live =
       state.storeId !== null && stored.some((entry) => entry.id === state.storeId)
         ? []
-        : state.sessionId !== null && activeProject !== undefined
+        : state.storeId !== null && activeProject !== undefined
           ? [
               {
-                id: state.sessionId,
+                // The k5 store id, not the harness's session id: every handler in
+                // the sidebar addresses a stored task by store id, and the live
+                // row was the one row carrying something else. Selecting it asked
+                // the server to continue a session the browser is not allowed to
+                // name, and removing it sent a DELETE for a session the store has
+                // never heard of.
+                id: state.storeId,
                 title: activeProject.name,
                 meta: state.configOptions.find((o) => o.id === "model")?.current ?? "connecting",
                 group: "This task",
@@ -372,7 +383,17 @@ export default function App() {
       // leaves it there: the live seat is not the store record, and pretending
       // otherwise would hide work the harness is still running.
       if (session.id === state.storeId) return;
-      removeStored(session.id);
+      void removeStored(session.id).then((removed) => {
+        // A delete that did not happen is reported rather than left to look like
+        // a list that has not refreshed yet. The promise is handled here because
+        // a rejected fetch from a click handler is an unhandled rejection.
+        if (removed) return;
+        setTranscriptNote("That task could not be removed from the store.");
+      }, (cause: unknown) => {
+        setTranscriptNote(
+          `That task could not be removed: ${cause instanceof Error ? cause.message : "the request failed"}`,
+        );
+      });
     },
     [removeStored, state.storeId],
   );
@@ -382,11 +403,20 @@ export default function App() {
       // Continuing a stored task, rather than fabricating one. The server
       // re-validates the recorded cwd and refuses if the project has moved, so
       // this cannot quietly resume a conversation against the wrong directory.
-      if (session.id === state.sessionId) return;
+      //
+      // Compared against the store id, which is what a stored row carries.
+      // Against the harness session id the guard never matched, so clicking the
+      // task already on screen asked the server to continue a session this
+      // connection already holds and was answered with a refusal.
+      if (session.id === state.storeId) return;
       setTranscriptNote(null);
+      // The transcript is not read here: the socket reads it when the server
+      // reports the continuation, so the history lands on the session the load
+      // actually opened rather than on whatever was on screen when the click
+      // happened.
       k5.loadSession(session.id);
     },
-    [k5, state.sessionId],
+    [k5, state.storeId],
   );
 
   const handleSelectProject = useCallback(

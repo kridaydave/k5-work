@@ -320,7 +320,10 @@ export function Sidebar({
                                 aria-label={`Remove ${session.title}`}
                                 title="Remove this task"
                                 onClick={() => runAndClose(() => onRemoveSession(session))}
-                                className="absolute right-1.5 top-1.5 grid h-6 w-6 cursor-pointer place-items-center rounded-lg text-white/30 opacity-0 transition hover:bg-white/[0.07] hover:text-white/70 focus-visible:opacity-100 group-hover/row:opacity-100"
+                                // Visible on a coarse pointer, where there is no
+                                // hover to reveal it: a control that only exists
+                                // for a mouse is a one-way door on a tablet.
+                                className="absolute right-1.5 top-1.5 grid h-6 w-6 cursor-pointer place-items-center rounded-lg text-white/30 opacity-100 transition hover:bg-white/[0.07] hover:text-white/70 focus-visible:opacity-100 [@media(hover:hover)]:opacity-0 group-hover/row:[@media(hover:hover)]:opacity-100"
                               >
                                 <CloseIcon className="h-3.5 w-3.5" />
                               </button>

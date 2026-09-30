@@ -30,6 +30,12 @@ A log that ends mid-turn is marked as such instead of being reported complete, b
 "it stopped cleanly" and "the process was killed" are different facts and only one of
 them is knowable after the fact.
 
+Both ends of the log are taken from the log itself. `firstSeq` is repaired from the
+lowest record on disk, because it is the start of a read: a repair derived from
+`lastSeq` turned a session killed during its first turn into one whose transcript was
+its final record. `updatedAt` orders the list, because `lastSeq` counts records inside
+one session and says nothing about when it was last touched.
+
 ## Continuation resumes; discovery lists
 
 Continuing a stored task uses `session/resume`, not `session/load`. `session/load` is
@@ -42,6 +48,16 @@ after the read. A listing is a read, so it must not take a live seat slot, must 
 create a session, and must not leave a harness process behind. Headless opens are
 capped and concurrent, because a user clicking refresh repeatedly is a normal thing to
 do and a pile of harnesses is not.
+
+The cap counts resident harness processes, not in-progress opens. It is released when
+the child is gone, or when a continuation promotes the seat and the pool starts
+counting it under a live seat's own key.
+
+A continued task streams through the connection that asked for it. The seat a
+continuation adopts is the one the read opened, so it is created with the same event
+forwarder a fresh open gets. A seat with no forwarder still answers a prompt: the
+harness produces deltas that reach no viewer and no store, and the only evidence is an
+empty bubble.
 
 The capability probe is lenient. A harness that advertises nothing usable is reported
 as unsupported rather than treated as a failure, because harnesses vary widely in what
@@ -76,13 +92,17 @@ silently dropping the middle of a conversation is invisible to the person readin
 Two consequences in the browser reader, both learned from a transcript that came back
 empty with no error anywhere:
 
-- On a cursor the store will not honour, the read restarts from the beginning **once**,
-  and the discard of what was already read is **deferred until that restart returns a
-  usable page**. Clearing eagerly and then finding the restart also refused the cursor
-  erased a full transcript and left nothing to report.
+- A refused cursor costs the read one restart, and whatever was already read is kept
+  until that restart returns a usable page. Clearing eagerly and then finding the
+  restart also refused the cursor erased a full transcript and left nothing to report.
 - Rehydrating is bounded, and a rehydrate that never settles or throws synchronously
   cannot strand the socket closed. A workspace with no reconnect is worse than one
   missing a turn.
+
+The read runs on the reconnect and on a continuation, because those are the two moments
+the store holds history the socket has not delivered. A continuation changes no view
+state of its own, so the reader is what puts the opened task's conversation on screen
+instead of leaving the previous task's there.
 
 ## Command failures are scoped to what failed
 
@@ -105,10 +125,15 @@ is rebuilt, because mapping the whole array on every chunk made a long turn quad
 The sidebar lists what the store actually holds over HTTP, so a reload shows the history
 that is there rather than what one live session happens to be. A live session appears
 only until the store catches up with it, so opening a task does not produce a duplicate
-row.
+row. That row carries a `storeId` like every other, because the browser addresses stored
+history by nothing else: a row keyed by the harness's session id sends a `DELETE` for a
+task the store has never heard of and asks the server to continue a session it cannot
+name.
 
 Every task that can be opened can also be removed. A store with no delete is a one-way
-door, and the browser refreshes from the store's receipt rather than optimistically.
+door, and the browser refreshes from the store's receipt rather than optimistically. A
+remove that does not happen is reported, and the control is reachable without a pointer,
+so a touch device is not left with a task it can open but not delete.
 
 ## Store location rules
 

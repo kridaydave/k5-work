@@ -216,6 +216,50 @@ describe("readStoredTranscript", () => {
     expect(fetchCalls).toBe(3);
   });
 
+  it("reports a transcript the page budget cut short as a prefix", async () => {
+    // The store said there was more on the last page it served, and the reader
+    // stopped anyway. That is a partial history whatever its record count says,
+    // and the count used to stand in for it.
+    serveScript(
+      Array.from({ length: 200 }, (_unused, index) =>
+        page({
+          events: [{ seq: index + 1, ts: "t", event: event(index + 1, "turn.delta", `x${String(index)}`) }],
+          nextSince: index + 1,
+          hasMore: true,
+          lastSeq: 100_000,
+        }),
+      ),
+    );
+    const result = await readStoredTranscript("11111111-1111-4111-8111-111111111111");
+    expect(fetchCalls).toBe(64);
+    expect(result.transcript.truncated).toBe(true);
+  });
+
+  it("does not call a complete read a prefix because of its length", async () => {
+    // The same 64 pages, but the store reported no more on the last one. This is
+    // the case the record count could not tell apart from the one above.
+    const responses = Array.from({ length: 63 }, (_unused, index) =>
+      page({
+        events: [{ seq: index + 1, ts: "t", event: event(index + 1, "turn.delta", `x${String(index)}`) }],
+        nextSince: index + 1,
+        hasMore: true,
+        lastSeq: 63,
+      }),
+    );
+    responses.push(
+      page({
+        events: [{ seq: 64, ts: "t", event: event(64, "turn.delta", "last") }],
+        nextSince: 64,
+        hasMore: false,
+        lastSeq: 64,
+      }),
+    );
+    serveScript(responses);
+    const result = await readStoredTranscript("11111111-1111-4111-8111-111111111111");
+    expect(fetchCalls).toBe(64);
+    expect(result.transcript.truncated).toBe(false);
+  });
+
   it("replaces the records once a restart returns a usable page", async () => {
     serveScript([
       page({
