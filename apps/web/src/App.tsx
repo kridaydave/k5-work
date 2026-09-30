@@ -96,13 +96,22 @@ export default function App() {
   // Re-read the transcript after a reconnect, before the new socket can deliver
   // anything: a turn that finished while the socket was down would otherwise be
   // silently lost, because the socket never replays and the store is the record.
+  const [rehydrated, setRehydrated] = useState<ProjectedTranscript | null>(null);
+  // The task on screen, mirrored in a ref because the read is asynchronous and
+  // its callback cannot see the render that started it.
+  const openStoreId = useRef<string | null>(null);
   const rehydrate = useCallback(async (storeId: string) => {
     const { transcript } = await readStoredTranscript(storeId);
+    // Only the task on screen may replace what is on screen. Two quick clicks on
+    // the sidebar start two reads, and the slower one belongs to the task the
+    // user has already left, so adopting it would put the wrong conversation
+    // beside the right task with nothing on screen to say so.
+    if (openStoreId.current !== storeId) return;
     setRehydrated(transcript);
   }, []);
-  const [rehydrated, setRehydrated] = useState<ProjectedTranscript | null>(null);
   const k5 = useK5Socket({ rehydrate });
   const { state, adoptTranscript } = k5;
+  openStoreId.current = state.storeId;
   // The Composer clears its textarea and its chips once the parent confirms the
   // submission went out. On the lazy-open path that confirmation cannot happen
   // inline — the seat is still opening when onSend returns — so the whole
