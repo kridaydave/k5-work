@@ -45,6 +45,12 @@ jobs:
           K5_ALLOWED_ORIGINS: http://127.0.0.1:5173,http://localhost:5173,http://127.0.0.1:4173
         run: |
           set -euo pipefail
+          # The server dev script runs `node --watch --env-file-if-exists=../.env`.
+          # On Node 22.23+ --watch registers the env file as a watch target and
+          # dies with ENOENT when it is absent, so the process exits before it
+          # ever calls listen and this step times out on a connection refused.
+          # The empty file satisfies the watch; nothing reads a value from it.
+          touch .env
           setsid npm run dev > /tmp/k5-work-dev.log 2>&1 &
           dev_pid=$!
           cleanup_dev() {
@@ -52,10 +58,14 @@ jobs:
             wait "$dev_pid" 2>/dev/null || true
           }
           trap cleanup_dev EXIT
-          curl --fail --silent --show-error --retry 20 --retry-connrefused --retry-delay 1 http://127.0.0.1:8787/health
-          curl --fail --silent --show-error --retry 20 --retry-connrefused --retry-delay 1 http://127.0.0.1:5173/
+          # 60, not 20: the dev command rebuilds shared and the server through
+          # predev before anything listens, which measured 18.7s to bind locally.
+          # A 20s window made this step fail on a cold runner for reasons that had
+          # nothing to do with the server.
+          curl --fail --silent --show-error --retry 60 --retry-connrefused --retry-delay 1 http://127.0.0.1:8787/health
+          curl --fail --silent --show-error --retry 60 --retry-connrefused --retry-delay 1 http://127.0.0.1:5173/
           # Reached through the Vite proxy, so this proves the Node server owns /api.
-          curl --fail --silent --show-error --retry 20 --retry-connrefused --retry-delay 1 http://127.0.0.1:5173/api/projects | python3 -c 'import json,sys; data=json.load(sys.stdin); assert "projects" in data and "currentProjectPath" in data'
+          curl --fail --silent --show-error --retry 60 --retry-connrefused --retry-delay 1 http://127.0.0.1:5173/api/projects | python3 -c 'import json,sys; data=json.load(sys.stdin); assert "projects" in data and "currentProjectPath" in data'
           cleanup_dev
           trap - EXIT
       - name: Server health smoke test
