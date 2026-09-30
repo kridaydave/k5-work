@@ -1212,6 +1212,65 @@ test("a boot takes the log as the authority when the stored summary lags it", as
   }
 });
 
+test("a boot takes the lowest sequence on disk as the start of the log", async () => {
+  // The case a crash during a session's first turn produces: the log holds
+  // several records and the meta was never flushed, so it still claims
+  // firstSeq 0. Deriving the repair from lastSeq claimed the log began at its
+  // final record, and the opening of the conversation became unreadable.
+  const root = tempRoot();
+  const options = { root, onError: () => {} } as const;
+  const first = new SessionStore(options);
+  await first.open();
+  let storeId = "";
+  try {
+    storeId = (await newSession(first)).storeId;
+    for (let index = 1; index <= 4; index += 1) first.append(storeId, delta(index, `m${index}`));
+    await first.flushAll();
+  } finally {
+    await first.close();
+  }
+
+  // Model the unclean exit: no meta flush ever ran.
+  const metaPath = await metaPathOf(root);
+  const parsed = JSON.parse(await fsp.readFile(metaPath, "utf8")) as Record<string, unknown>;
+  parsed["firstSeq"] = 0;
+  parsed["lastSeq"] = 0;
+  await fsp.writeFile(metaPath, JSON.stringify(parsed), "utf8");
+
+  const second = new SessionStore(options);
+  await second.open();
+  try {
+    assert.equal(second.meta(storeId)?.firstSeq, 1, "the log begins at its first record");
+    const page = await second.read(storeId, null);
+    assert.deepEqual(
+      page.events.map((e) => e.seq),
+      [1, 2, 3, 4],
+      "so a reader is served the whole transcript, not its last record",
+    );
+  } finally {
+    await second.close();
+    await fsp.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("the list is ordered by recency, not by how many records a task holds", async () => {
+  // `lastSeq` counts records inside one session. Ordering on it put a long old
+  // task above a short new one, which is the opposite of "newest first".
+  await withStore(async (store) => {
+    const old = await newSession(store, { title: "long old task" });
+    for (let index = 1; index <= 9; index += 1) store.append(old.storeId, delta(index, `m${index}`));
+    await store.flushMeta(old.storeId);
+
+    const fresh = await newSession(store, { title: "short new task" });
+    store.append(fresh.storeId, delta(1, "one"));
+    await store.flushMeta(fresh.storeId);
+
+    const listed = store.list().map((entry) => entry.storeId);
+    assert.equal(listed[0], fresh.storeId, "the newer task is first");
+    assert.equal(listed[1], old.storeId, "and the longer older one is second");
+  });
+});
+
 test("a boot marks a log that ended mid-turn instead of reporting it complete", async () => {
   // Nothing runs on SIGKILL, so the terminator written on a graceful release is
   // best-effort. Without this, a reloaded transcript showed tool cards spinning

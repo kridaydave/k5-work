@@ -311,7 +311,8 @@ export class SessionStore {
    */
   private async reconcileLogs(): Promise<void> {
     for (const [storeId, meta] of [...this.index]) {
-      let onDisk: { lastSeq: number; bytes: number; openTurn: boolean } | null = null;
+      let onDisk: { firstSeq: number; lastSeq: number; bytes: number; openTurn: boolean } | null =
+        null;
       try {
         onDisk = await this.scanTail(storeId);
       } catch (cause) {
@@ -325,7 +326,18 @@ export class SessionStore {
           `stored meta for ${storeId} claimed ${meta.lastSeq} records but the log holds ${onDisk.lastSeq}`,
         );
         meta.lastSeq = onDisk.lastSeq;
-        if (meta.firstSeq === 0 || meta.firstSeq > onDisk.lastSeq) meta.firstSeq = onDisk.lastSeq;
+      }
+      if (onDisk.firstSeq > 0 && onDisk.firstSeq !== meta.firstSeq) {
+        // The lowest sequence actually on disk, not the highest. `firstSeq` is
+        // only advanced in memory, so a process killed before the first meta
+        // flush left 0 on disk; deriving the repair from `lastSeq` then claimed
+        // the log began at its final record, and a reader was served the last
+        // event of a crashed first turn as if it were the whole transcript.
+        this.report(
+          "E_STORE_CORRUPT_LOG",
+          `stored meta for ${storeId} claimed records from ${meta.firstSeq} but the log begins at ${onDisk.firstSeq}`,
+        );
+        meta.firstSeq = onDisk.firstSeq;
       }
       if (onDisk.bytes > 0 && onDisk.bytes !== meta.bytes) {
         // The log is the authority for how full it is, which is what keeps the
@@ -351,7 +363,7 @@ export class SessionStore {
   /** Reads a log's last sequence, byte count, and whether a turn is still open. */
   private async scanTail(
     storeId: string,
-  ): Promise<{ lastSeq: number; bytes: number; openTurn: boolean } | null> {
+  ): Promise<{ firstSeq: number; lastSeq: number; bytes: number; openTurn: boolean } | null> {
     let handle: fsp.FileHandle;
     try {
       handle = await fsp.open(this.eventsPath(storeId), fs.constants.O_RDONLY);
@@ -360,12 +372,18 @@ export class SessionStore {
     }
     try {
       const stat = await handle.stat();
-      if (!stat.isFile() || stat.size === 0) return { lastSeq: 0, bytes: 0, openTurn: false };
+      if (!stat.isFile() || stat.size === 0) {
+        return { firstSeq: 0, lastSeq: 0, bytes: 0, openTurn: false };
+      }
       const buffer = Buffer.allocUnsafe(stat.size);
       const { bytesRead } = await handle.read(buffer, 0, stat.size, 0);
       const text = buffer.subarray(0, bytesRead).toString("utf8");
       const lines = text.split("\n").filter((line) => line.length > 0);
       let lastSeq = 0;
+      // The lowest record that survived, because `firstSeq` is what a reader
+      // starts from: a stale meta that claims the log begins later than it
+      // really does silently hides the opening of the conversation.
+      let firstSeq = 0;
       // The last record decides. A turn-scoped record with nothing terminal
       // after it means the turn never finished, which is exactly the state a hard
       // kill leaves behind. Tracking whether turn.started was seen was not enough:
@@ -381,11 +399,12 @@ export class SessionStore {
         const record = StoredEventRecordSchema.safeParse(parsed);
         if (!record.success) continue;
         if (record.data.seq > lastSeq) lastSeq = record.data.seq;
+        if (firstSeq === 0 || record.data.seq < firstSeq) firstSeq = record.data.seq;
         lastType = record.data.event.type;
       }
       const openTurn =
         lastType === "turn.started" || lastType === "turn.delta" || lastType === "tool.updated";
-      return { lastSeq, bytes: stat.size, openTurn };
+      return { firstSeq, lastSeq, bytes: stat.size, openTurn };
     } finally {
       await handle.close();
     }
@@ -929,11 +948,16 @@ export class SessionStore {
   }
 
   list(): SessionSummary[] {
-    // Ordered by the index's own sequence rather than by updatedAt, which a
-    // concurrent write can move underneath the sort.
+    // Newest first, by the timestamp of the last write. `lastSeq` is a per-session
+    // record count, not a store-wide clock: ordering on it put a long old task
+    // above a short new one, which is the opposite of what the sidebar claims.
+    // The storeId breaks a tie between two sessions written in the same
+    // millisecond, so the order is total and repeatable.
     const summaries = [...this.index.values()]
       .map((meta) => this.toSummary(meta))
-      .sort((a, b) => b.lastSeq - a.lastSeq || b.updatedAt.localeCompare(a.updatedAt));
+      .sort(
+        (a, b) => b.updatedAt.localeCompare(a.updatedAt) || b.lastSeq - a.lastSeq || b.storeId.localeCompare(a.storeId),
+      );
     return summaries.slice(0, MAX_LISTED_SESSIONS);
   }
 
