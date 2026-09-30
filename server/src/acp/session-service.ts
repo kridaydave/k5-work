@@ -927,7 +927,8 @@ export function createSessionHandlers(
       });
       return;
     }
-    let headless: { child: AcpChild; acp: AcpSeat } | null = null;
+    let headless: { child: AcpChild; acp: AcpSeat; release: () => void } | null = null;
+    let headlessRunning = false;
     try {
       headless = await options.runner.openHeadless({
         projectId: command.projectId,
@@ -938,6 +939,7 @@ export function createSessionHandlers(
       // is still outstanding must still know there is a process to reap.
       options.trackSeat?.(headless.child);
       options.onChild?.(headless.child);
+      headlessRunning = true;
       headlessStarted();
       const sessions = await headless.acp.listSessions();
       emit({ type: "command.result", commandId: command.commandId, ok: true, reason: "ok" });
@@ -970,11 +972,14 @@ export function createSessionHandlers(
         message: (err as Error).message.slice(0, 500),
       });
     } finally {
-      headlessFinished();
-      // Reaped whatever happened, so a list never leaves a harness behind.
+      if (headlessRunning) headlessFinished();
+      // Reaped whatever happened, so a list never leaves a harness behind. The
+      // slot is released after the child is gone, because the child is what the
+      // cap bounds.
       if (headless !== null) {
         await headless.acp.close().catch(() => {});
         await headless.child.close().catch(() => {});
+        headless.release();
         options.untrackSeat?.(headless.child);
       }
     }
@@ -1028,15 +1033,29 @@ export function createSessionHandlers(
     }
 
     state.opening = true;
-    let headless: { child: AcpChild; acp: AcpSeat; posture: ResolvedPosture | null } | null = null;
+    let headless: {
+      child: AcpChild;
+      acp: AcpSeat;
+      posture: ResolvedPosture | null;
+      release: () => void;
+    } | null = null;
+    let headlessRunning = false;
     try {
       headless = await options.runner.openHeadless({
         projectId: stored.projectId,
         projectPath,
+        // The seat becomes live here, so its turn events have to go somewhere.
+        // Left null, a continued task answered every prompt with an empty
+        // bubble and recorded none of it, because the seat had no callback to
+        // forward through.
+        onEvent: (turnId, event) => {
+          forwardSeatEvent(state, turnId, event);
+        },
       });
       // Tracked before the adopt is awaited, for the same reason as the list.
       options.trackSeat?.(headless.child);
       options.onChild?.(headless.child);
+      headlessRunning = true;
       headlessStarted();
       const info = await headless.acp.adopt(stored.harnessSessionId);
       // The read seat is now a live session, so it takes a pool slot under the
@@ -1048,6 +1067,9 @@ export function createSessionHandlers(
         child: headless.child,
         acp: headless.acp,
         sessionId: info.sessionId,
+        // The read seat's cap slot becomes the live seat's, so a promotion is not
+        // also an in-flight read.
+        release: headless.release,
       });
       state.seat = seat;
       state.acp = headless.acp;
@@ -1059,6 +1081,16 @@ export function createSessionHandlers(
       // Ownership has moved to the connection, so neither the finally block nor a
       // later throw may reap a seat the pool now counts as active.
       headless = null;
+
+      // `closed()` releases a seat only if the connection already held one, and
+      // during the open and the adopt it held none. A socket that dropped inside
+      // that window therefore left the promoted seat unreaped and running behind a
+      // connection that can never answer it. Released here, before anything is
+      // reported, because there is nobody left to report it to.
+      if (state.closed) {
+        state.releasing = releaseSeat(state);
+        return;
+      }
 
       emit({ type: "command.result", commandId: command.commandId, ok: true, reason: "ok" });
       emit({
@@ -1105,10 +1137,14 @@ export function createSessionHandlers(
       refuse(reason, (err as Error).message);
     } finally {
       state.opening = false;
-      headlessFinished();
+      // Paired with the start, because the two are one accounting: a finish
+      // without a start released another caller's read early and let a shutdown
+      // stop waiting for a harness that was still up.
+      if (headlessRunning) headlessFinished();
       if (headless !== null) {
         await headless.acp.close().catch(() => {});
         await headless.child.close().catch(() => {});
+        headless.release();
         options.untrackSeat?.(headless.child);
       }
     }

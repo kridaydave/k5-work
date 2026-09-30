@@ -253,6 +253,20 @@ async function waitForCommand(
   }
 }
 
+/** Polls a predicate rather than an event list, for state only the server has. */
+async function waitUntil(
+  predicate: () => boolean,
+  what: string,
+  timeoutMs = 30_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (predicate()) return;
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+    await new Promise((r) => setTimeout(r, 10));
+  }
+}
+
 describe("session open over the gateway", () => {
   it("opens a seat and reports the reverse state on close", async () => {
     const h = await start();
@@ -1226,6 +1240,171 @@ describe("session discovery and continuation", () => {
       assert.equal(opened.type === "session.opened" ? opened.sessionId : null, "fake-session-1");
       second.close();
     } finally {
+      await harness.close();
+    }
+  });
+
+  it("streams and records a turn that runs on a continued task", async () => {
+    // The seat a continuation adopts was opened headless, and a headless seat
+    // was built with no event callback. So the turn ran, the harness answered,
+    // and every delta went nowhere: the browser showed an empty bubble and the
+    // stored log kept nothing, with no error on either side.
+    const harness = await start({ record: true });
+    try {
+      const ws = await harness.connect("http://127.0.0.1:5173");
+      ws.send(openCommand());
+      await waitFor(harness.events, "session.opened");
+      ws.send(
+        JSON.stringify({
+          commandId: "c-2",
+          type: "session.prompt",
+          sessionId: "fake-session-1",
+          turnId: "t-1",
+          text: "a task worth keeping",
+        }),
+      );
+      await waitFor(harness.events, "turn.completed");
+      const store = harness.store;
+      assert.ok(store !== null);
+      const stored = store.list()[0]!;
+      ws.close();
+
+      harness.events.length = 0;
+      const second = await harness.connect("http://127.0.0.1:5173");
+      second.send(
+        JSON.stringify({ commandId: "c-3", type: "session.load", storeId: stored.storeId }),
+      );
+      await waitFor(harness.events, "session.loaded");
+
+      second.send(
+        JSON.stringify({
+          commandId: "c-4",
+          type: "session.prompt",
+          sessionId: "fake-session-1",
+          turnId: "t-2",
+          text: "carry on",
+        }),
+      );
+      const deltas = await waitForAll(
+        harness.events,
+        (e) => e.type === "turn.delta" && e.turnId === "t-2",
+        1,
+      );
+      assert.ok(
+        deltas.every((e) => e.type === "turn.delta" && e.text.length > 0),
+        "the continued turn produced text the browser can show",
+      );
+      await waitForAll(harness.events, (e) => e.type === "turn.completed" && e.turnId === "t-2", 1);
+      // And the store is the record of it, not only of the session it adopted.
+      const page = await store.read(stored.storeId, null);
+      assert.ok(
+        page.lastSeq >= 5,
+        `only ${String(page.lastSeq)} records after two turns`,
+      );
+      assert.ok(
+        page.events.some((e) => e.event.type === "turn.delta" && e.event.turnId === "t-2"),
+        "the continued turn was recorded",
+      );
+      second.close();
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("releases a continued seat when the socket drops while it is opening", async () => {
+    // `closed()` releases a seat only when the connection already holds one, and
+    // during the headless open and the adopt it holds none. A tab that closed in
+    // that window left the promoted seat running behind a socket that can never
+    // answer it. The harness holds `session/resume` open so the drop lands in
+    // the window rather than racing it.
+    const harness = await start({ record: true, scenario: "slow-resume" });
+    try {
+      const store = harness.store;
+      assert.ok(store !== null);
+      const created = await store.create({
+        harness: "opencode",
+        harnessSessionId: "fake-session-1",
+        projectId: "p-1",
+        projectName: null,
+        cwd: harness.projectDir,
+        title: "a task left mid-continuation",
+      });
+      const ws = await harness.connect("http://127.0.0.1:5173");
+      ws.send(
+        JSON.stringify({ commandId: "c-1", type: "session.load", storeId: created.storeId }),
+      );
+      // Closed while the adopt is still outstanding. Both waits are load-bearing:
+      // the command has to reach the server, and the seat has to exist, or the
+      // assertions below run before anything was ever spawned.
+      await waitUntil(() => harness.commands.length > 0, "the continuation command to arrive");
+      ws.close();
+      await waitUntil(() => harness.children.length > 0, "the read seat to spawn");
+      // Past the hold the harness puts on `session/resume`, so the continuation
+      // has run to whatever end it was going to reach.
+      await new Promise((r) => setTimeout(r, 4_000));
+      assert.equal(
+        harness.pool.activeCount,
+        0,
+        "a seat opened for a connection that had already closed is not left pooled",
+      );
+      for (const child of harness.children) {
+        if (child.pid === undefined) continue;
+        assert.equal(isAlive(child.pid), false, `harness pid ${child.pid} outlived its socket`);
+      }
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("counts a read seat for as long as its harness is alive", async () => {
+    // The cap exists to bound resident harness processes, so releasing it when
+    // the open returned bounded nothing: the caller then waits on the adopt, and
+    // a third read walked in while two children were already up.
+    const harness = await start({ record: true, scenario: "slow-resume" });
+    const sockets: WebSocket[] = [];
+    try {
+      const store = harness.store;
+      assert.ok(store !== null);
+      const ids: string[] = [];
+      for (let index = 0; index < 3; index += 1) {
+        const created = await store.create({
+          harness: "opencode",
+          harnessSessionId: "fake-session-1",
+          projectId: "p-1",
+          projectName: null,
+          cwd: harness.projectDir,
+          title: `task ${String(index)}`,
+        });
+        ids.push(created.storeId);
+      }
+      // Two continuations occupy the whole read cap while their adopts are
+      // outstanding, so the third is refused rather than spawning a third child.
+      for (const index of [0, 1]) {
+        const ws = await harness.connect("http://127.0.0.1:5173");
+        sockets.push(ws);
+        ws.send(
+          JSON.stringify({
+            commandId: `c-${String(index)}`,
+            type: "session.load",
+            storeId: ids[index],
+          }),
+        );
+        await waitUntil(
+          () => harness.children.length > index,
+          `read seat ${String(index)} to spawn`,
+        );
+      }
+      const third = await harness.connect("http://127.0.0.1:5173");
+      sockets.push(third);
+      third.send(
+        JSON.stringify({ commandId: "c-2", type: "session.load", storeId: ids[2] }),
+      );
+      const result = await waitForCommand(harness.events, "c-2");
+      assert.equal(result.ok, false);
+      assert.equal(result.reason, "seat-cap", "the cap counts residents, not opens");
+      assert.equal(harness.children.length, 2, "and no third harness was spawned");
+    } finally {
+      for (const ws of sockets) ws.close();
       await harness.close();
     }
   });

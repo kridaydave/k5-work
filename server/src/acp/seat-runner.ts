@@ -109,7 +109,8 @@ const MAX_INFLIGHT_HEADLESS = 2;
  */
 export class SeatRunner {
   /** See `openHeadless`: the read path takes no keyed reservation, so this is
-   * the only thing bounding how many harness processes a read can spawn. */
+   * the only thing bounding how many harness processes a read can spawn. Counted
+   * over the child's whole life, not the length of the open. */
   private headlessInFlight = 0;
 
   constructor(private readonly options: SeatRunnerOptions) {}
@@ -289,6 +290,11 @@ export class SeatRunner {
    * per headless opencode, one tab looping on a refresh reached twenty children
    * in under ten seconds while the pool reported zero seats. So in-flight reads
    * are counted against their own small cap.
+   *
+   * The count covers the child's whole life rather than the open. Decrementing
+   * when `openHeadless` returned measured nothing, because the caller then waits
+   * on `listSessions()` for as long as its timeout, and the cap read "two" while
+   * a third, fourth and fifth child were already resident.
    */
   async openHeadless(input: {
     projectId: string;
@@ -299,12 +305,25 @@ export class SeatRunner {
      * false, because from that point the harness will run a prompt.
      */
     readOnly?: boolean;
+    /**
+     * Where a promoted seat's turn events go. A `session/list` read never runs a
+     * prompt and needs none; a continuation is about to run one, and a seat with
+     * no callback drops every delta the harness produces for it.
+     */
+    onEvent?: (turnId: string, event: SeatStreamEvent) => void;
   }): Promise<{
     child: AcpChild;
     acp: AcpSeat;
     profile: AccessProfile;
     /** Null only for a read that skipped the resolver; a live seat has one. */
     posture: ResolvedPosture | null;
+    /**
+     * Gives the read seat's cap slot back. Required: the slot is held for the
+     * lifetime of the child, not for the length of the open, because the
+     * process is what the cap exists to bound. Idempotent, so the caller may
+     * release in a `finally` and a promotion may release again.
+     */
+    release: () => void;
   }> {
     if (this.headlessInFlight >= MAX_INFLIGHT_HEADLESS) {
       throw new SeatOpenError(
@@ -313,6 +332,14 @@ export class SeatRunner {
       );
     }
     this.headlessInFlight += 1;
+    // Released once. Every path out of this method releases the slot, either here
+    // before the throw or in the returned closure once the child is gone.
+    let released = false;
+    const release = (): void => {
+      if (released) return;
+      released = true;
+      this.headlessInFlight -= 1;
+    };
     try {
       const { profile, argv, env, posture } = await this.gate({
         projectPath: input.projectPath,
@@ -335,16 +362,20 @@ export class SeatRunner {
               ? {}
               : { openTimeoutMs: this.options.openDeadlineMs }),
           },
-          null,
+          input.onEvent ?? null,
         );
-        return { child, acp, profile, posture };
+        return { child, acp, profile, posture, release };
       } catch (err) {
         // The child is the only thing that can leak; there is no reservation.
         await child.close();
+        release();
         throw classifyOpenFailure(err);
       }
-    } finally {
-      this.headlessInFlight -= 1;
+    } catch (err) {
+      // A gate refusal or a spawn failure never produced a child, so nobody else
+      // can release this slot.
+      release();
+      throw err;
     }
   }
 
@@ -364,6 +395,12 @@ export class SeatRunner {
     child: AcpChild;
     acp: AcpSeat;
     sessionId: string;
+    /**
+     * The read seat's cap slot, handed over here rather than released by the
+     * caller. The child is now a pooled live seat, so counting it as an in-flight
+     * read as well would let a tab's refreshes refuse a real continuation.
+     */
+    release?: () => void;
   }): Seat {
     const profile = resolveAccessProfile("full");
     let seat: Seat;
@@ -380,6 +417,9 @@ export class SeatRunner {
       throw err;
     }
     this.options.pool.promote(seat, input.sessionId, input.child);
+    // Released only once the pool actually counts the seat, so a promotion that
+    // threw above leaves the read slot held and nothing leaks.
+    input.release?.();
     return seat;
   }
 }

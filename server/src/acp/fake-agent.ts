@@ -33,6 +33,7 @@ export const SCENARIOS = [
   "meta-update",
   "no-session-caps",
   "weird-caps",
+  "slow-resume",
 ] as const;
 export type Scenario = (typeof SCENARIOS)[number];
 
@@ -242,12 +243,21 @@ export function promptScript(
   };
 }
 
-/** Sessions the fake knows about, in the shape `session/list` returns. */
-function listSessionsFixture(): Json[] {
+/**
+ * Sessions the fake knows about, in the shape `session/list` returns.
+ *
+ * `cwd` comes from the request rather than from `process.cwd()`, because Node
+ * resolves the child's own cwd to the real path: on macOS the client's temp
+ * directory is a symlink under `/var` while `process.cwd()` reports
+ * `/private/var`, so an exact-string filter dropped every fixture and the test
+ * passed on an empty list it never meant to assert on.
+ */
+function listSessionsFixture(requestedCwd: string | null): Json[] {
+  const cwd = requestedCwd ?? process.cwd();
   return [
     {
       sessionId: "fake-session-1",
-      cwd: process.cwd(),
+      cwd,
       title: "A previous task",
       updatedAt: "2026-09-27T09:00:00.000Z",
     },
@@ -259,7 +269,7 @@ function listSessionsFixture(): Json[] {
     {
       // No title: a session the harness has not named yet.
       sessionId: "fake-session-3",
-      cwd: process.cwd(),
+      cwd,
     },
   ];
 }
@@ -296,7 +306,7 @@ export function handleMessage(
 ):
   | { result: Json }
   | { error: { code: number; message: string } }
-  | { hold: true; permission?: boolean; sessionId?: string } {
+  | { hold: true; permission?: boolean; sessionId?: string; holdMs?: number } {
   const { id, method, params } = message as {
     id?: unknown;
     method: string;
@@ -354,7 +364,7 @@ export function handleMessage(
     }
     case "session/list": {
       const filterCwd = typeof params?.cwd === "string" ? params.cwd : null;
-      const known = listSessionsFixture();
+      const known = listSessionsFixture(filterCwd);
       const sessions = filterCwd === null ? known : known.filter((s) => s.cwd === filterCwd);
       return { result: { sessions } };
     }
@@ -362,7 +372,7 @@ export function handleMessage(
       // ACP requires the replay to be streamed and only then answered, and the
       // client must have attached a queue before the request was issued.
       const loadId = String(params?.sessionId ?? "");
-      const known = listSessionsFixture();
+      const known = listSessionsFixture(typeof params?.cwd === "string" ? params.cwd : null);
       if (!known.some((s) => s.sessionId === loadId)) {
         return { error: { code: -32602, message: `no such session ${loadId}` } };
       }
@@ -371,11 +381,16 @@ export function handleMessage(
     }
     case "session/resume": {
       const resumeId = String(params?.sessionId ?? "");
-      const known = listSessionsFixture();
+      const known = listSessionsFixture(typeof params?.cwd === "string" ? params.cwd : null);
       if (!known.some((s) => s.sessionId === resumeId)) {
         return { error: { code: -32602, message: `no such session ${resumeId}` } };
       }
       // No replay: that is the whole difference between load and resume.
+      if (scenario === "slow-resume") {
+        // Held open, so a socket that closes mid-continuation lands inside the
+        // window where the seat is adopted but not yet the connection's.
+        return { hold: true, holdMs: 1_500 };
+      }
       return { result: { configOptions: configOptionsFixture() } };
     }
     case "session/prompt": {
@@ -520,7 +535,7 @@ function run(scenario: Scenario): void {
         if (holdId === null) return;
         send({ jsonrpc: "2.0", id: holdId, result: { stopReason: "end_turn" } });
         holdId = null;
-      }, 8_000);
+      }, outcome.holdMs ?? 8_000);
     } else if ("error" in outcome) {
       send({ jsonrpc: "2.0", id, error: outcome.error });
     } else {
