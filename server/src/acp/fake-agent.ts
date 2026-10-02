@@ -34,6 +34,11 @@ export const SCENARIOS = [
   "no-session-caps",
   "weird-caps",
   "slow-resume",
+  // Sends one last chunk *after* the prompt response. Legal ACP: the spec lets
+  // an agent answer the request and then flush trailing notifications, and the
+  // seat's own comments say a client cannot use the response alone as proof the
+  // stream is finished. A seat must survive this and stay usable.
+  "trailing-update",
 ] as const;
 export type Scenario = (typeof SCENARIOS)[number];
 
@@ -306,7 +311,8 @@ export function handleMessage(
 ):
   | { result: Json }
   | { error: { code: number; message: string } }
-  | { hold: true; permission?: boolean; sessionId?: string; holdMs?: number } {
+  | { hold: true; permission?: boolean; sessionId?: string; holdMs?: number }
+  | { trailing: true; sessionId: string } {
   const { id, method, params } = message as {
     id?: unknown;
     method: string;
@@ -431,6 +437,12 @@ export function handleMessage(
         pending.push(...script.notifications);
         return { hold: true };
       }
+      if (scenario === "trailing-update") {
+        // Answer the prompt first, then flush a final chunk. The turn is over
+        // from the client's point of view when the response lands, so this
+        // arrives with nothing live to attribute it to.
+        return { trailing: true, sessionId: promptSessionId };
+      }
       pending.push(...script.notifications);
       return { result: { stopReason: "end_turn" } };
     }
@@ -536,6 +548,23 @@ function run(scenario: Scenario): void {
         send({ jsonrpc: "2.0", id: holdId, result: { stopReason: "end_turn" } });
         holdId = null;
       }, outcome.holdMs ?? 8_000);
+    } else if ("trailing" in outcome) {
+      // The response lands first, then the last chunk. Delayed by a tick so the
+      // ordering is real rather than a same-write race.
+      send({ jsonrpc: "2.0", id, result: { stopReason: "end_turn" } });
+      setTimeout(() => {
+        send({
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: {
+            sessionId: outcome.sessionId,
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: "one last trailing chunk" },
+            },
+          },
+        });
+      }, 10);
     } else if ("error" in outcome) {
       send({ jsonrpc: "2.0", id, error: outcome.error });
     } else {

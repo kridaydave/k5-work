@@ -5,6 +5,7 @@ import {
   type ActiveSession,
   type ClientContext,
   type ContentBlock,
+  type SessionUpdate,
 } from "@agentclientprotocol/sdk";
 import type { AcpChild } from "./spawn.js";
 import { MAX_CONFIG_OPTION_VALUES, MAX_CONFIG_OPTIONS } from "@k5-work/shared";
@@ -95,6 +96,56 @@ const DEFAULT_TURN_TIMEOUT_MS = 30 * 60_000;
 const CANCEL_DRAIN_MS = 5_000;
 
 /**
+ * How long close() waits for the update pump to notice the seat is closing.
+ *
+ * The pump now ends on a signal rather than on the stream breaking, so it should
+ * stop almost immediately. The bound exists so a pump wedged behind a read that
+ * never returns cannot hold the teardown: past this, the child close that
+ * follows is what guarantees nothing is left alive.
+ */
+const ACP_PUMP_STOP_MS = 2_000;
+
+/**
+ * How long the seat waits for a quiet stream before ending a turn.
+ *
+ * ACP does not promise the prompt response is the last thing on the wire: an
+ * agent may answer and then flush chunks it had already produced. Settling the
+ * turn on the response therefore races the last chunk, and the chunk that loses
+ * is recorded after `turn.completed`, where nothing can use it — the transcript
+ * reads back one word short of what the harness actually said.
+ *
+ * So the response arms this window instead of ending the turn, and every update
+ * that arrives inside it pushes the deadline out. A harness that has more to
+ * say is taken at its word; one that has finished falls silent and the turn
+ * ends. It is short because trailing chunks are already buffered and arrive in
+ * the same batch, so this only has to outlast that batch, not a slow model.
+ */
+const QUIET_BEFORE_SETTLE_MS = 150;
+
+/** A promise and the one function that settles it. */
+function createClosingSignal(): { promise: Promise<void>; signal: () => void } {
+  let signal!: () => void;
+  const promise = new Promise<void>((resolve) => {
+    signal = resolve;
+  });
+  return { promise, signal };
+}
+
+/** Resolves true when the promise settles first, false when the bound wins. */
+async function settleOrTimeout(pending: Promise<unknown>, ms: number): Promise<boolean> {
+  let timer: NodeJS.Timeout | undefined;
+  const guard = new Promise<boolean>((resolve) => {
+    timer = setTimeout(() => resolve(false), ms);
+    timer.unref();
+  });
+  try {
+    return await Promise.race([pending.then(() => true, () => true), guard]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+/**
  * Arms the drain bound the moment this turn's signal aborts, and disarms it
  * again if the turn finishes on its own.
  *
@@ -164,8 +215,35 @@ export class AcpSeat {
    * after the first cancel.
    */
   private graceUntilMs: number | null = null;
+  /**
+   * The stop reason the prompt response reported, held until the stream is quiet.
+   *
+   * Null when there is nothing pending. The turn is not ended by the response
+   * itself: an agent may flush chunks after answering, and ending on the
+   * response records those chunks after `turn.completed`, where the transcript
+   * cannot use them. Holding the reason until the stream goes quiet puts every
+   * chunk the harness sent inside the turn it belongs to.
+   */
+  private pendingStopReason: SeatStopReason | null = null;
+  private quietTimer: NodeJS.Timeout | null = null;
   /** True while the seat's one pump is consuming the session's update stream. */
   private pumpRunning = false;
+  /**
+   * Resolved when close() begins, so the pump can stop instead of being torn
+   * out from under a pending nextUpdate().
+   *
+   * A pending nextUpdate() has no abort of its own, so the only way to end the
+   * pump is for it to notice the seat is closing. Close used to just close the
+   * connection underneath it and move on, which left the pump running against a
+   * stream whose child was dying and let it call onEvent for a seat that had
+   * already been disposed.
+   *
+   * The resolver is created with the promise rather than assigned to a field
+   * later: with useDefineForClassFields, a declared-but-unassigned field is
+   * defined as undefined after any earlier field initializer runs, which would
+   * silently clobber the assignment.
+   */
+  private readonly closing: { promise: Promise<void>; signal: () => void } = createClosingSignal();
   /** Why the stream broke, kept so the next turn can be refused with the reason. */
   private streamFailure: unknown = null;
   /** Outstanding update pump, awaited so a new turn never steals stale updates. */
@@ -505,6 +583,18 @@ export class AcpSeat {
   }
 
   /**
+   * Whether the seat's update pump is still consuming the stream.
+   *
+   * Read by close(), and exposed because "close() returned" and "the pump has
+   * stopped" are different claims. A caller disposing a seat needs the second
+   * one to hold: a pump that outlives close() can still emit into a connection
+   * the service has already torn down.
+   */
+  get pumping(): boolean {
+    return this.pumpRunning;
+  }
+
+  /**
    * Pumps the SDK's update stream.
    *
    * ACP delivers the `session/prompt` response *before* the trailing
@@ -533,9 +623,14 @@ export class AcpSeat {
       throw new AcpSeatError("seat has no ACP session");
     }
     for (;;) {
-      let message: Awaited<ReturnType<ActiveSession["nextUpdate"]>>;
+      // Checked before every read, so closing the seat ends the pump at the
+      // next boundary rather than at whatever point the stream happens to break.
+      // Racing this against nextUpdate() is what lets close() wait for the pump:
+      // the pending read is abandoned, not the process.
+      if (this.closed) return;
+      let message: Awaited<ReturnType<ActiveSession["nextUpdate"]>> | null;
       try {
-        message = await session.nextUpdate();
+        message = await Promise.race([session.nextUpdate(), this.closing.promise.then(() => null)]);
       } catch (err) {
         // The stream broke. Whoever is live owns the failure; a seat with no live
         // turn has nothing to settle, so the reason is kept for the next opener.
@@ -543,6 +638,9 @@ export class AcpSeat {
         this.activeTurn?.fail(err);
         return;
       }
+      // close() won the race. The message, if any, belongs to a seat that is
+      // being disposed, so it is dropped rather than attributed to a turn.
+      if (message === null) return;
       if (message.kind === "stop") {
         // The pump does NOT settle on `stop`. The SDK correlates a prompt's
         // response to that prompt, so `session.prompt()` resolving is the only
@@ -554,47 +652,35 @@ export class AcpSeat {
         continue;
       }
       const turn = this.activeTurn;
+      if (turn !== null && !turn.settled) {
+        // The harness is still talking, so a pending end is not safe yet.
+        this.deferSettle();
+      }
       if (turn === null || turn.settled) {
         // A straggler for a turn that has ended. Dropped rather than forwarded.
         //
-        // Poisoning here was guarded on `abandonedTurns.length === 0`, and that
-        // list only ever grows, so the guard could not fire again after the
-        // seat's first cancel: a harness that kept streaming would go undetected
-        // for the rest of the session. The grace window is the right shape, and it
-        // is time-based rather than count-based, so it is recorded with the
-        // deadline instead of inferring "still inside the window" from a list that
-        // is never emptied.
-        if (this.graceUntilMs === null) {
-          this.poisonReason = "harness kept streaming after a cancel";
-        } else if (Date.now() >= this.graceUntilMs) {
-          // The harness had its window and kept going, so the stream can no
-          // longer be trusted to belong to any turn.
+        // Poisoning here used to fire whenever no grace window was open, which
+        // is the case where no cancel ever happened. That made an ordinary
+        // trailing chunk fatal: ACP lets an agent answer session/prompt and then
+        // flush more notifications, so a single legal chunk after a normal
+        // completion poisoned the seat and every later prompt on it was refused.
+        // The window is opened only by cancel(), so it is the only evidence that
+        // the harness was told to stop. Without it there is nothing to have
+        // ignored, and a late chunk is noise to drop rather than a verdict.
+        //
+        // With it, the window is the deadline: the harness had its seconds to
+        // finish what it already sent, and anything past that means the stream
+        // can no longer be trusted to belong to any turn. Time-based rather than
+        // count-based, so it is recorded with the deadline instead of inferring
+        // "still inside the window" from a list that is never emptied.
+        if (this.graceUntilMs !== null && Date.now() >= this.graceUntilMs) {
           this.graceUntilMs = null;
           this.poisonReason = "harness kept streaming after a cancel";
         }
         continue;
       }
-      const verdict = classifySessionUpdate(message.update);
       try {
-        if (verdict.kind === "text") {
-          this.onEvent?.(turn.turnId, { kind: verdict.stream, text: verdict.text });
-        } else if (verdict.kind === "tool") {
-          this.onEvent?.(turn.turnId, {
-            kind: "tool",
-            toolCallId: verdict.toolCallId,
-            title: verdict.title,
-            status: verdict.status,
-          });
-        } else if (verdict.kind === "session") {
-          // Forwarded with the turn id it arrived under so the service can route
-          // it to the right connection; the service drops the id because a title
-          // is a session fact, not turn content.
-          this.onEvent?.(turn.turnId, {
-            kind: "session",
-            title: verdict.title,
-            updatedAt: verdict.updatedAt,
-          });
-        }
+        this.forwardTo(turn.turnId, message);
       } catch (err) {
         // An emit that throws must end the turn, not wedge the pump: otherwise
         // the browser's working dots spin forever with no terminal event.
@@ -602,6 +688,55 @@ export class AcpSeat {
         continue;
       }
       // ignore and suppress verdicts carry no browser-visible state by design.
+    }
+  }
+
+  /**
+   * Pushes a pending end back, because an update just proved the stream is not
+   * quiet. A no-op when nothing is pending.
+   */
+  private deferSettle(): void {
+    if (this.pendingStopReason === null) return;
+    if (this.quietTimer !== null) clearTimeout(this.quietTimer);
+    this.quietTimer = setTimeout(() => this.settleIfQuiet(), QUIET_BEFORE_SETTLE_MS);
+    this.quietTimer.unref();
+  }
+
+  /** Ends the turn once the stream has been quiet for the window. */
+  private settleIfQuiet(): void {
+    this.quietTimer = null;
+    const reason = this.pendingStopReason;
+    if (reason === null) return;
+    this.pendingStopReason = null;
+    this.activeTurn?.settle(reason);
+  }
+
+  /**
+   * Projects one update onto the wire and emits it under a turn id.
+   *
+   * Split out so the pump's read loop stays about routing and lifetime rather
+   * than about the shape of an update, which is the part with a schema behind it.
+   */
+  private forwardTo(turnId: string, message: { update: SessionUpdate }): void {
+    const verdict = classifySessionUpdate(message.update);
+    if (verdict.kind === "text") {
+      this.onEvent?.(turnId, { kind: verdict.stream, text: verdict.text });
+    } else if (verdict.kind === "tool") {
+      this.onEvent?.(turnId, {
+        kind: "tool",
+        toolCallId: verdict.toolCallId,
+        title: verdict.title,
+        status: verdict.status,
+      });
+    } else if (verdict.kind === "session") {
+      // Forwarded with the turn id it arrived under so the service can route it
+      // to the right connection; the service drops the id because a title is a
+      // session fact, not turn content.
+      this.onEvent?.(turnId, {
+        kind: "session",
+        title: verdict.title,
+        updatedAt: verdict.updatedAt,
+      });
     }
   }
 
@@ -680,9 +815,16 @@ export class AcpSeat {
     // and a cancelled turn's pump would eat the next turn's opening deltas.
     if (!this.pumpRunning) {
       this.pumpRunning = true;
-      this.pumpDone = this.pumpUpdates().catch((err: unknown) => {
-        this.streamFailure = err;
-      });
+      this.pumpDone = this.pumpUpdates()
+        .catch((err: unknown) => {
+          this.streamFailure = err;
+        })
+        .finally(() => {
+          // Every exit path clears it: close() reads it to know the pump is gone,
+          // and a flag left true after the pump returned would make a closed seat
+          // look like it was still reading.
+          this.pumpRunning = false;
+        });
     } else if (this.streamFailure !== null) {
       // The stream died while this seat sat idle. Refusing here beats opening a
       // turn that can never receive a completion.
@@ -710,18 +852,26 @@ export class AcpSeat {
         .prompt(blocks, { cancellationSignal: controller.signal })
         .then(
           (response) => {
-            settle(normalizeStopReason(response?.stopReason));
+            // Held rather than applied. ACP lets an agent answer session/prompt
+            // and then flush chunks it had already produced, and ending the turn
+            // on the response records those chunks after turn.completed, where
+            // the transcript cannot use them. The pump keeps deferring while the
+            // stream is still talking, so the end lands after the last chunk.
+            this.pendingStopReason = normalizeStopReason(response?.stopReason);
+            this.deferSettle();
           },
           (err: unknown) => {
+            // Same reason as the success path: the wrapper is the only thing that
+            // records the turn as ended.
             if (err instanceof RequestError && err.code === -32800) {
-              settle("cancelled");
+              turn.settle("cancelled");
               return;
             }
             if (controller.signal.aborted) {
-              settle("cancelled");
+              turn.settle("cancelled");
               return;
             }
-            fail(err);
+            turn.fail(err);
           },
         );
       return await finished;
@@ -733,6 +883,15 @@ export class AcpSeat {
       throw err;
     } finally {
       clearTimeout(timer);
+      // A turn that ends by cancel or failure must not leave a pending end
+      // behind: it would fire against whatever turn runs next.
+      if (this.quietTimer !== null) {
+        clearTimeout(this.quietTimer);
+        this.quietTimer = null;
+      }
+      if (this.pendingStopReason !== null && this.activeTurn === turn) {
+        this.pendingStopReason = null;
+      }
       if (this.activeTurn === turn) this.activeTurn = null;
     }
   }
@@ -760,9 +919,15 @@ export class AcpSeat {
     if (this.closed) return;
     this.closed = true;
     this.cancel();
-    // The pump holds a pending nextUpdate() that no abort can release; waiting
-    // for it would hang close, so the connection is torn down underneath it.
-    void this.pumpDone.catch(() => undefined);
+    // Order matters, and it is the reverse of what it used to be. The pump is
+    // told first and awaited second, so it stops on its own terms while the
+    // connection is still intact, rather than being cut off mid-read. Only then
+    // is the lifetime released and the child torn down.
+    this.closing.signal();
+    // A pump wedged behind a read that never returns must not hold the teardown
+    // for ever. The bound is what makes awaiting it safe; the child close below
+    // is what actually guarantees nothing survives.
+    await settleOrTimeout(this.pumpDone, ACP_PUMP_STOP_MS);
     this.releaseLifetime();
     await this.child.close();
   }
