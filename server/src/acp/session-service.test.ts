@@ -51,6 +51,8 @@ interface Harness {
   projectDir: string;
   /** Present only when the harness was started with `record: true`. */
   store: SessionStore | null;
+  /** The store's root, so a test can rewrite a row the store would not produce. */
+  storeRoot: string;
   /** Every harness process spawned so far, so a reap can be asserted by pid. */
   children: AcpChild[];
   connect(origin: string | null): Promise<WebSocket>;
@@ -105,7 +107,8 @@ async function start(options: {
   servers.push(server);
   const events: ServerEvent[] = [];
   const commands: BrowserCommand[] = [];
-  const store = options.record === true ? new SessionStore({ root: path.join(projectDir, "store") }) : null;
+  const storeRoot = path.join(projectDir, "store");
+  const store = options.record === true ? new SessionStore({ root: storeRoot }) : null;
   const children: AcpChild[] = [];
   if (store !== null) await store.open();
 
@@ -175,6 +178,7 @@ async function start(options: {
       rmSync(projectDir, { recursive: true, force: true });
     },
     store,
+    storeRoot,
     children,
   };
 }
@@ -1416,18 +1420,6 @@ describe("session discovery and continuation", () => {
     try {
       const store = harness.store;
       assert.ok(store !== null);
-      const created = await store.create({
-        harness: "opencode",
-        harnessSessionId: "fake-session-1",
-        projectId: "p-1",
-        projectName: null,
-        cwd: harness.projectDir,
-        title: "moved task",
-      });
-      // The stored record claims a different directory.
-      const meta = store.meta(created.storeId);
-      assert.ok(meta !== null);
-      await store.remove(created.storeId);
       const moved = await store.create({
         harness: "opencode",
         harnessSessionId: "fake-session-1",
@@ -1436,13 +1428,8 @@ describe("session discovery and continuation", () => {
         cwd: harness.projectDir,
         title: "moved task",
       });
-      const summary = store.meta(moved.storeId);
-      assert.ok(summary !== null);
-      // Rewrite the stored cwd by hand, as a moved project would look on disk,
-      // then rescan: the index is authoritative until it is reloaded.
-      const raw = { ...summary, cwd: "/somewhere/else" };
-      await fspWriteMeta(harness.projectDir, moved.storeId, raw);
-      await store.rescan();
+      // Rewrite the stored cwd by hand, as a moved project would look on disk.
+      await moveStoredCwd(harness.storeRoot, moved.storeId, "/somewhere/else");
       assert.equal(store.stored(moved.storeId)?.cwd, "/somewhere/else");
 
       const ws = await harness.connect("http://127.0.0.1:5173");
@@ -1484,20 +1471,26 @@ describe("session discovery and continuation", () => {
   });
 });
 
-/** Rewrites a stored session's meta, to model a record that no longer matches. */
-async function fspWriteMeta(
-  projectDir: string,
+/**
+ * Rewrites a stored session's cwd, to model a record that no longer matches the
+ * project it would be opened from. A second connection, because this is a state
+ * the store itself will not produce.
+ */
+async function moveStoredCwd(
+  storeRoot: string,
   storeId: string,
-  meta: Record<string, unknown>,
+  cwd: string,
 ): Promise<void> {
-  const { createHash } = await import("node:crypto");
-  const { readdir, writeFile } = await import("node:fs/promises");
-  const dirName = `s-${createHash("sha256").update(storeId, "utf8").digest("hex").slice(0, 32)}`;
-  const storeRoot = path.join(projectDir, "store");
-  const dir = path.join(storeRoot, dirName);
-  const entries = await readdir(dir).catch(() => []);
-  void entries;
-  await writeFile(path.join(dir, "meta.json"), `${JSON.stringify(meta)}\n`, "utf8");
+  const { DatabaseSync } = await import("node:sqlite");
+  // The root comes from the harness rather than being re-derived here, so moving
+  // the store cannot leave this quietly opening — and creating — a stray database
+  // at the old path.
+  const db = new DatabaseSync(path.join(storeRoot, "k5.db"));
+  try {
+    db.prepare("UPDATE sessions SET cwd = ? WHERE store_id = ?").run(cwd, storeId);
+  } finally {
+    db.close();
+  }
 }
 
 describe("the seat's resolved posture reaches the browser", () => {

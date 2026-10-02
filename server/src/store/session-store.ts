@@ -1,7 +1,8 @@
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
+import { DatabaseSync } from "node:sqlite";
 import { z } from "zod";
 import {
   AttachmentManifestEntrySchema,
@@ -16,26 +17,35 @@ import {
   type AttachmentManifestEntry,
   type IsoTimestamp,
   type ReplayStatus,
+  type ServerEvent,
   type SessionEventsResponse,
   type SessionSummary,
-  type StoredEventRecord,
 } from "@k5-work/shared";
-import type { ServerEvent } from "@k5-work/shared";
 import { SessionStoreError, type SessionStoreErrorCode } from "./errors.js";
 import { unsafeNameReason } from "./safe-name.js";
 
-// Durable local session log.
+// Durable local session store, in one SQLite file.
 //
 // k5 is the store. The harness is asked to continue a session, never to re-read
-// one, so this file is the record of what k5 sent and received and makes no
+// one, so this database is the record of what k5 sent and received and makes no
 // claim to be the harness's own history.
 //
-// Shape per session:
-//   <root>/<hash of a k5-minted id>/meta.json     small mutable summary, replaced atomically
-//   <root>/<hash of a k5-minted id>/events.jsonl  append-only, one record per line
+//   <root>/k5.db   sessions, events and attachment bytes
 //
-// The failure modes below were each reproduced against this code before being
-// fixed; the comment on each says what breaks without it.
+// Three tables. `sessions` is one row per task and carries every field the
+// sidebar and continuation need, so a listing is an indexed read rather than a
+// directory walk. `events` is the transcript, keyed by (store_id, seq) so a page
+// after a cursor is a range scan. `attachments` holds the bytes and the manifest
+// that describes them in one row, which is what makes them atomic together.
+//
+// Why this replaced an append-only JSONL log per session: every hard part of that
+// design existed only because a text file cannot be updated in place. A torn final
+// record, a summary that lagged its own log, a file that had to be renamed into
+// place, a symlink planted where a temp file goes, a whole log read into memory to
+// find its last line. A transaction makes each of those unrepresentable rather
+// than detected, so the code that repaired them is gone rather than kept.
+// `docs/phase4-policy-persistence-decisions.md` records what the store promises;
+// this file records only what it does.
 
 /**
  * Tighter than the websocket's 1 MB outbound frame cap, and deliberately so:
@@ -44,8 +54,8 @@ import { unsafeNameReason } from "./safe-name.js";
  * JSON.stringify expands each control character to six bytes, so the wrapper
  * makes an event near the frame cap exceed this one.
  *
- * A line over the cap is dropped whole rather than truncated, because a
- * truncated line is permanently unparseable and would poison the record after it.
+ * An event over the cap is dropped whole rather than truncated, because a
+ * truncated payload is permanently unparseable and would poison the record after it.
  */
 export const MAX_LINE_BYTES = 256 * 1024;
 
@@ -60,33 +70,128 @@ export const MAX_SESSIONS = 500;
 /** Ceiling on one HTTP page, by serialised bytes rather than by event count. */
 export const MAX_PAGE_BYTES = 4 * 1024 * 1024;
 
-/**
- * How much of a log a single read may scan. Reads start at the beginning of the
- * file, so this must exceed MAX_SESSION_BYTES or the tail of a long session
- * becomes unreachable. The constructor refuses a maxSessionBytes that breaks the
- * invariant, so it cannot rot silently.
- */
-export const MAX_READ_WINDOW_BYTES = 16 * 1024 * 1024;
-
-const META_FILE = "meta.json";
-const EVENTS_FILE = "events.jsonl";
+const DB_FILE = "k5.db";
 const META_VERSION = 1;
 const TITLE_MAX_GRAPHEMES = 120;
 const SESSION_IDLE_EVICT_MS = 30 * 24 * 60 * 60 * 1000;
-// Both live inside the session directory, so remove() and evict() already take
-// them with them and no retention rule has to be written a second time. They are
-// separate directories rather than two extensions in one, because an id is
-// validated as a safe name and not as a UUID: "x.json" is a legal name, and in a
-// shared directory it would be both bytes for one attachment and the manifest of
-// another.
-const ATTACHMENT_BYTES_DIR = "attachments";
-const ATTACHMENT_MANIFEST_DIR = "manifests";
 
 /**
- * Zod rather than a bag of `String()` and `Number()` coercions. `Number({})` is
- * NaN, and a NaN turnCount in one meta file made list() throw a raw ZodError,
- * which 500'd the whole session list for every session, while a NaN byte count
- * silently disabled that session's quota.
+ * Bumped only by a migration that changes what a row means. `user_version` is
+ * SQLite's own slot for this and is read before any table is touched, so an
+ * unknown future version is refused instead of half-read.
+ */
+const SCHEMA_VERSION = 1;
+
+/**
+ * How long a write waits for a competing writer before giving up.
+ *
+ * Generous, because the only realistic competitor is a human running `sqlite3`
+ * against the file or a second k5 on the same root, and losing a transcript to
+ * one of those is not a trade worth making for a faster refusal.
+ */
+const BUSY_TIMEOUT_MS = 5_000;
+
+/**
+ * SQLite's codes for "someone else is using the file right now", as opposed to
+ * something being wrong with the data.
+ *
+ * These are the two that must never end a session. The old store reopened its
+ * file handle and wrote the next record at the same sequence number after a
+ * transient failure; a busy store that gave up instead lost every later event of
+ * a live turn and still reported the transcript as complete, which is the worst
+ * outcome available: silent, unbounded data loss presented as success.
+ */
+const RETRYABLE_ERRCODES: ReadonlySet<number> = new Set([
+  5, // SQLITE_BUSY
+  6, // SQLITE_LOCKED
+]);
+
+function isRetryable(cause: unknown): boolean {
+  return (
+    typeof cause === "object" &&
+    cause !== null &&
+    RETRYABLE_ERRCODES.has((cause as { errcode?: unknown }).errcode as number)
+  );
+}
+
+const SCHEMA = `
+CREATE TABLE IF NOT EXISTS sessions (
+  store_id            TEXT    PRIMARY KEY,
+  harness             TEXT    NOT NULL,
+  harness_session_id  TEXT    NOT NULL,
+  project_id          TEXT    NOT NULL,
+  project_name        TEXT,
+  cwd                 TEXT    NOT NULL,
+  title               TEXT    NOT NULL,
+  created_at          TEXT    NOT NULL,
+  updated_at          TEXT    NOT NULL,
+  turn_count          INTEGER NOT NULL,
+  first_seq           INTEGER NOT NULL,
+  last_seq            INTEGER NOT NULL,
+  bytes               INTEGER NOT NULL,
+  truncated           INTEGER NOT NULL,
+  title_source        TEXT    NOT NULL,
+  ended_mid_turn      INTEGER NOT NULL
+) STRICT;
+
+-- The sidebar reads every session newest-first on every load, so the sort key is
+-- an index rather than a full scan and a sort.
+--
+-- store_id is the only tiebreak, and deliberately not the record count. Two tasks
+-- written in the same millisecond are not ordered by anything we know; breaking
+-- the tie on how many records a task happens to hold put a long old task above a
+-- short new one, which is the opposite of what the column claims. An arbitrary but
+-- stable order is honest here. A millisecond is not a tie in practice, and when it
+-- is, nothing downstream depends on which of the two comes first.
+CREATE INDEX IF NOT EXISTS sessions_by_recency
+  ON sessions (updated_at DESC, store_id DESC);
+
+-- The events table. Its bytes column is the record's own accounted size, written
+-- once by the append that created the row. It exists so there is exactly one
+-- number describing how much a session holds: the cap is checked against it on
+-- every append, and re-measured from it at boot and during reconciliation.
+-- Deriving it from LENGTH(payload) at read time instead meant the append path and
+-- the boot path counted different things, so the total shrank by the difference on
+-- every restart.
+CREATE TABLE IF NOT EXISTS events (
+  store_id  TEXT    NOT NULL REFERENCES sessions (store_id) ON DELETE CASCADE,
+  seq       INTEGER NOT NULL,
+  ts        TEXT    NOT NULL,
+  payload   TEXT    NOT NULL,
+  bytes     INTEGER NOT NULL,
+  PRIMARY KEY (store_id, seq)
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS attachments (
+  store_id       TEXT    NOT NULL REFERENCES sessions (store_id) ON DELETE CASCADE,
+  attachment_id  TEXT    NOT NULL,
+  name           TEXT    NOT NULL,
+  mime_type      TEXT    NOT NULL,
+  kind           TEXT    NOT NULL,
+  size           INTEGER NOT NULL,
+  manifest_bytes INTEGER NOT NULL,
+  body           BLOB    NOT NULL,
+  PRIMARY KEY (store_id, attachment_id)
+) WITHOUT ROWID;
+
+-- One row per one-off thing this store has finished doing to itself. It exists so
+-- a step that must not repeat, and must resume if it was interrupted, has
+-- somewhere to say so. A step that derives its own state from the data cannot tell
+-- "never started" from "half finished", and guessing wrong in one direction
+-- repeats work that is not idempotent while guessing wrong in the other skips it
+-- for ever.
+CREATE TABLE IF NOT EXISTS store_flags (
+  flag   TEXT PRIMARY KEY,
+  value  TEXT NOT NULL
+) STRICT, WITHOUT ROWID;
+`;
+
+/**
+ * Zod rather than a bag of `String()` and `Number()` coercions. SQLite is
+ * dynamically typed, so `turn_count` can hold a string or a float, and a NaN
+ * turnCount in one row made list() throw a raw ZodError, which 500'd the whole
+ * session list for every session, while a NaN byte count silently disabled that
+ * session's quota.
  */
 const MetaFileSchema = z
   .object({
@@ -111,9 +216,9 @@ const MetaFileSchema = z
     // silently rename the session.
     titleSource: z.enum(["none", "prompt", "harness"]),
     /**
-     * True when a boot found a log whose last turn never reached a terminal
-     * event. Best-effort, not a guarantee: nothing runs on SIGKILL, so a hard
-     * kill can still leave a log ending mid-turn.
+     * True when a boot found a transcript whose last turn never reached a
+     * terminal event. Best-effort, not a guarantee: nothing runs on SIGKILL, so
+     * a hard kill can still leave one that ends mid-turn.
      */
     endedMidTurn: z.boolean(),
   })
@@ -125,9 +230,12 @@ const MetaFileSchema = z
     message: "createdAt is not a parseable timestamp",
   });
 
-// The index holds these live and the writer mutates them in place, so they are
-// deliberately not readonly. Every mutation is followed by a serialised meta
-// write, and readMeta re-parses them from disk on rescan.
+/**
+ * The row as it comes out of SQLite, where every column is nullable-typed and
+ * booleans are integers. Parsed through the same schema the file format used, so
+ * a row that drifted is refused on read rather than rendered as a blank card.
+ */
+type MetaRow = Record<string, unknown>;
 type MetaFile = z.infer<typeof MetaFileSchema>;
 
 export interface CreateSessionInput {
@@ -148,15 +256,6 @@ export interface SessionStoreOptions {
   readonly idleEvictMs?: number;
   /** Reports a store fault without letting it become an unhandled rejection. */
   readonly onError?: (error: SessionStoreError) => void;
-}
-
-interface Writer {
-  /** Never rejects, so one failed write cannot poison every later append. */
-  queue: Promise<void>;
-  handle: fsp.FileHandle | null;
-  bytes: number;
-  truncated: boolean;
-  stopped: boolean;
 }
 
 function nowIso(ms: number): IsoTimestamp {
@@ -187,23 +286,6 @@ export function sanitizeTitle(raw: string, maxGraphemes = TITLE_MAX_GRAPHEMES): 
   return `${out.replace(/[\s.]+$/u, "")}…`;
 }
 
-function sessionDirName(storeId: string): string {
-  // The harness session id is never a path component: it is opaque, up to 256
-  // chars, and two harnesses can return the same one. Hashing it would also
-  // collide, since truncate-then-hash maps "a"*40 and "a"*41 to one directory.
-  // storeId is k5-minted, so the name is fixed width and case-independent.
-  return `s-${createHash("sha256").update(storeId, "utf8").digest("hex").slice(0, 32)}`;
-}
-
-function assertInside(root: string, target: string): void {
-  if (path.dirname(target) !== root) {
-    throw new SessionStoreError(
-      "E_STORE_PATH_ESCAPE",
-      `refusing a store path outside the root: ${target}`,
-    );
-  }
-}
-
 /**
  * Decides an attachment's kind from the bytes, not from the declared mime.
  *
@@ -220,6 +302,56 @@ function classifyAttachment(bytes: Buffer, mimeType: string): AttachmentKind {
   return "text";
 }
 
+/** SQLite hands back null-prototype objects; named getters read them field by field. */
+function asText(row: MetaRow, column: string): string | null {
+  const value = row[column];
+  return typeof value === "string" ? value : null;
+}
+
+function asInt(row: MetaRow, column: string): number {
+  const value = row[column];
+  if (typeof value === "bigint") return Number(value);
+  return typeof value === "number" ? value : Number.NaN;
+}
+
+function asFlag(row: MetaRow, column: string): boolean {
+  return asInt(row, column) !== 0;
+}
+
+const SESSION_COLUMNS =
+  "store_id, harness, harness_session_id, project_id, project_name, cwd, title, " +
+  "created_at, updated_at, turn_count, first_seq, last_seq, bytes, truncated, title_source, ended_mid_turn";
+
+/**
+ * One row to the shape the rest of the server uses, or null when the row is not
+ * usable. Refusing one bad row here is what keeps a single corrupt session from
+ * taking down the whole list, which is what the old per-file parse did too.
+ */
+function rowToMeta(row: MetaRow): MetaFile | null {
+  const storeId = asText(row, "store_id");
+  if (storeId === null) return null;
+  const result = MetaFileSchema.safeParse({
+    v: META_VERSION,
+    storeId,
+    harness: asText(row, "harness") ?? "",
+    harnessSessionId: asText(row, "harness_session_id") ?? "",
+    projectId: asText(row, "project_id") ?? "",
+    projectName: asText(row, "project_name"),
+    cwd: asText(row, "cwd") ?? "",
+    title: asText(row, "title") ?? "",
+    createdAt: asText(row, "created_at") ?? "",
+    updatedAt: asText(row, "updated_at") ?? "",
+    turnCount: asInt(row, "turn_count"),
+    firstSeq: asInt(row, "first_seq"),
+    lastSeq: asInt(row, "last_seq"),
+    bytes: asInt(row, "bytes"),
+    truncated: asFlag(row, "truncated"),
+    titleSource: asText(row, "title_source") ?? "none",
+    endedMidTurn: asFlag(row, "ended_mid_turn"),
+  });
+  return result.success ? result.data : null;
+}
+
 export class SessionStore {
   private readonly root: string;
   private readonly now: () => number;
@@ -228,21 +360,35 @@ export class SessionStore {
   private readonly maxStoreBytes: number;
   private readonly idleEvictMs: number;
   private readonly onError: (error: SessionStoreError) => void;
-  private readonly index = new Map<string, MetaFile>();
-  private readonly writers = new Map<string, Writer>();
-  private storeBytes = 0;
-  /**
-   * Bytes spooled per session, tracked apart from the log.
-   *
-   * The log carries its own size in meta.json, so it can be re-measured after a
-   * restart. The spool has no such file, so without this the whole-store ceiling
-   * is checked on every upload and never accumulated: a loop of 25 MB uploads
-   * passes the check every time and fills the disk. Deleting bytes has to give
-   * the budget back, or a store that once held a large attachment refuses real
-   * writes for the rest of the process.
-   */
-  private readonly spoolBytes = new Map<string, number>();
+  private db: DatabaseSync | null = null;
   private ready = false;
+  /**
+   * Sessions whose writer has stopped. A stop is permanent, because a hole in
+   * the sequence can never be filled in place, so this is the whole per-session
+   * write state the old log needed a file handle and a queue to hold.
+   */
+  private readonly stopped = new Set<string>();
+  /**
+   * Records the store failed to keep, per session, for records that left no other
+   * trace. A rolled-back write leaves no gap, so a reader comparing sequences sees
+   * a contiguous log and concludes nothing is missing. This is the only place that
+   * loss is counted.
+   */
+  private readonly storeDrifted = new Map<string, number>();
+  /**
+   * Sessions this process has appended to recently, and eviction therefore skips.
+   *
+   * Bounded, and that is the whole point. The old store got this for free from an
+   * open file handle, which was released with the seat. Here nothing releases it, so
+   * an unbounded set pins every session the process has ever written to: at the cap
+   * eviction walks the list, skips everything as live, deletes nothing, and every
+   * later create fails for the rest of the process. Keyed by last write, oldest
+   * first, so the pin is a recency window rather than a permanent mark.
+   *
+   * Sized to the session cap, which is far more pins than there can be live seats.
+   */
+  private readonly live = new Map<string, number>();
+  private storeBytes = 0;
 
   constructor(options: SessionStoreOptions) {
     this.root = path.resolve(options.root);
@@ -252,22 +398,13 @@ export class SessionStore {
     this.maxStoreBytes = options.maxStoreBytes ?? MAX_STORE_BYTES;
     this.idleEvictMs = options.idleEvictMs ?? SESSION_IDLE_EVICT_MS;
     this.onError = options.onError ?? (() => {});
-    // A configured cap at or above the read window would produce a log whose
-    // tail no read can reach, with no error anywhere. Refuse the configuration
-    // rather than relying on a test that compares two constants.
-    if (this.maxSessionBytes >= MAX_READ_WINDOW_BYTES) {
-      throw new SessionStoreError(
-        "E_STORE_ROOT",
-        `maxSessionBytes ${this.maxSessionBytes} must be below the read window ${MAX_READ_WINDOW_BYTES}`,
-      );
-    }
   }
 
   /**
    * The single reporting path. A caller-supplied reporter that throws would
    * otherwise turn the store's central safety claim into its opposite: append()
-   * would throw synchronously into the synchronous emit path, and a rejected
-   * write queue would be permanently poisoned.
+   * would throw synchronously into the synchronous emit path, taking every live
+   * harness child down with it.
    */
   private report(code: SessionStoreErrorCode, message: string): void {
     try {
@@ -277,11 +414,27 @@ export class SessionStore {
     }
   }
 
+  private handle(): DatabaseSync {
+    const db = this.db;
+    if (db === null) {
+      throw new SessionStoreError("E_STORE_WRITABLE", "the session store is not open");
+    }
+    return db;
+  }
+
+  private assertOpen(): void {
+    if (this.db === null) {
+      throw new SessionStoreError("E_STORE_WRITABLE", "the session store is not open");
+    }
+  }
+
   /**
-   * Creates the root, repairs any torn tail, and loads the index. Called from
-   * the server entry point, never at module scope, because module-graph.test.ts
-   * imports every compiled module and a directory created at import time is a
-   * side effect in a test.
+   * Opens the database, migrates a pre-SQLite store if one is sitting there, and
+   * reconciles each session against its own events.
+   *
+   * Called from the server entry point, never at module scope, because
+   * module-graph.test.ts imports every compiled module and a database opened at
+   * import time is a side effect in a test.
    */
   async open(): Promise<void> {
     await fsp.mkdir(this.root, { recursive: true, mode: 0o700 });
@@ -289,354 +442,218 @@ export class SessionStore {
     // other local users. Transcripts are agent output: source, and whatever the
     // agent read. Tighten it explicitly.
     await fsp.chmod(this.root, 0o700).catch(() => {});
-    await this.repairTornTails();
-    await this.rescan();
-    await this.reconcileLogs();
+    // A second process, or a `sqlite3` shell, or a backup tool, can hold the
+    // write lock. Without a timeout SQLite's busy handler is off, so the very
+    // first collision is an instant SQLITE_BUSY rather than a wait, and a
+    // one-millisecond lock is enough to lose a record.
+    const db = new DatabaseSync(path.join(this.root, DB_FILE), { timeout: BUSY_TIMEOUT_MS });
+    this.db = db;
+    try {
+      // WAL so a reader never blocks the writer, which matters because /api/sessions
+      // reads on every sidebar load while turns are being appended.
+      db.exec("PRAGMA journal_mode = WAL");
+      // NORMAL, not FULL. In WAL mode this still fsyncs at checkpoints and on a
+      // clean close, and a power loss can lose only the last commits, never the
+      // database. FULL fsyncs every commit, which buys durability the append path
+      // never had (the old log was not fsynced per record either) at roughly a
+      // third of the throughput on a page fault.
+      db.exec("PRAGMA synchronous = NORMAL");
+      // Off by default in SQLite. The cascade is what makes remove() and evict()
+      // take a session's events and attachments with it in one statement, rather
+      // than leaving rows that outlive the session they describe.
+      db.exec("PRAGMA foreign_keys = ON");
+      // SQLite creates its files 0644, honouring only the umask, and it creates
+      // the -wal and -shm sidecars with the same mode as the database when they do
+      // not exist yet. Transcripts are agent output: source, and whatever the
+      // agent read. The 0700 root is the real boundary; this is the second one,
+      // and it has to be applied to all three files because a sidecar created
+      // later takes its mode from the database file.
+      for (const name of [DB_FILE, `${DB_FILE}-wal`, `${DB_FILE}-shm`]) {
+        await fsp.chmod(path.join(this.root, name), 0o600).catch(() => {});
+      }
+      const version = db.prepare("PRAGMA user_version").get() as MetaRow | undefined;
+      const found = version === undefined ? 0 : asInt(version, "user_version");
+      if (found > SCHEMA_VERSION) {
+        throw new SessionStoreError(
+          "E_STORE_ROOT",
+          `k5.db is at schema version ${found}, which this build does not understand`,
+        );
+      }
+      db.exec(SCHEMA);
+      db.exec(`PRAGMA user_version = ${String(SCHEMA_VERSION)}`);
+    } catch (cause) {
+      this.db = null;
+      db.close();
+      throw cause instanceof SessionStoreError
+        ? cause
+        : new SessionStoreError("E_STORE_ROOT", `could not open the session store: ${String(cause)}`);
+    }
+    try {
+      await this.importLegacyJsonl();
+      // Reconcile first, then measure. Reconcile rewrites `sessions.bytes` from the
+      // events, so measuring first left the counter holding the pre-repair totals for
+      // the rest of the process. The same drift in the other direction is a store
+      // that refuses every write while sitting nearly empty.
+      this.reconcile();
+      this.chargeStoreBytes();
+    } catch (cause) {
+      this.db = null;
+      db.close();
+      throw cause instanceof SessionStoreError
+        ? cause
+        : new SessionStoreError("E_STORE_ROOT", `could not open the session store: ${String(cause)}`);
+    }
     this.ready = true;
   }
 
   /**
-   * Brings each index entry back into agreement with its log.
+   * The store's byte total, measured from the rows rather than from a counter a
+   * crash could leave behind.
    *
-   * The meta is flushed on a timer and at turn end, so after an unclean exit it
-   * can sit behind the log. Appending against a stale lastSeq re-issued sequence
-   * numbers that were already on disk, and from there every read of that session
-   * failed permanently. Taking the larger of the two is safe: a number is only
-   * ever issued once, and the log is the authority on what exists.
-   *
-   * Also marks a log that ends mid-turn. Nothing runs on SIGKILL, so the
-   * terminator written on a graceful release is best-effort, not a guarantee —
-   * without this, a reloaded transcript showed tool cards that spin forever
-   * while the store reported the session as complete.
+   * One full scan of the events table, which is linear in the size of the store.
+   * It runs at boot only, never on a request, and the alternative, subtracting
+   * each session's own `bytes` as it is deleted, is what the delete path does.
    */
-  private async reconcileLogs(): Promise<void> {
-    for (const [storeId, meta] of [...this.index]) {
-      let onDisk: { firstSeq: number; lastSeq: number; bytes: number; openTurn: boolean } | null =
-        null;
-      try {
-        onDisk = await this.scanTail(storeId);
-      } catch (cause) {
-        this.report("E_STORE_WRITABLE", `could not reconcile ${storeId}: ${String(cause)}`);
-        continue;
-      }
-      if (onDisk === null) continue;
-      if (onDisk.lastSeq > meta.lastSeq) {
-        this.report(
-          "E_STORE_CORRUPT_LOG",
-          `stored meta for ${storeId} claimed ${meta.lastSeq} records but the log holds ${onDisk.lastSeq}`,
-        );
-        meta.lastSeq = onDisk.lastSeq;
-      }
-      if (onDisk.firstSeq > 0 && onDisk.firstSeq !== meta.firstSeq) {
-        // The lowest sequence actually on disk, not the highest. `firstSeq` is
-        // only advanced in memory, so a process killed before the first meta
-        // flush left 0 on disk; deriving the repair from `lastSeq` then claimed
-        // the log began at its final record, and a reader was served the last
-        // event of a crashed first turn as if it were the whole transcript.
-        this.report(
-          "E_STORE_CORRUPT_LOG",
-          `stored meta for ${storeId} claimed records from ${meta.firstSeq} but the log begins at ${onDisk.firstSeq}`,
-        );
-        meta.firstSeq = onDisk.firstSeq;
-      }
-      if (onDisk.bytes > 0 && onDisk.bytes !== meta.bytes) {
-        // The log is the authority for how full it is, which is what keeps the
-        // per-session cap honest across restarts.
-        this.storeBytes = Math.max(0, this.storeBytes - meta.bytes);
-        meta.bytes = onDisk.bytes;
-        this.storeBytes += onDisk.bytes;
-      }
-      if (onDisk.openTurn && !meta.endedMidTurn) {
-        meta.endedMidTurn = true;
-        meta.truncated = true;
-        this.report(
-          "E_STORE_CORRUPT_LOG",
-          `session ${storeId} ended mid-turn, most likely an unclean shutdown; its transcript is a prefix`,
-        );
-      }
-      void this.writeMeta(meta).catch((cause: unknown) => {
-        this.report("E_STORE_WRITABLE", `could not persist reconciliation: ${String(cause)}`);
-      });
-    }
-  }
-
-  /** Reads a log's last sequence, byte count, and whether a turn is still open. */
-  private async scanTail(
-    storeId: string,
-  ): Promise<{ firstSeq: number; lastSeq: number; bytes: number; openTurn: boolean } | null> {
-    let handle: fsp.FileHandle;
-    try {
-      handle = await fsp.open(this.eventsPath(storeId), fs.constants.O_RDONLY);
-    } catch {
-      return null;
-    }
-    try {
-      const stat = await handle.stat();
-      if (!stat.isFile() || stat.size === 0) {
-        return { firstSeq: 0, lastSeq: 0, bytes: 0, openTurn: false };
-      }
-      const buffer = Buffer.allocUnsafe(stat.size);
-      const { bytesRead } = await handle.read(buffer, 0, stat.size, 0);
-      const text = buffer.subarray(0, bytesRead).toString("utf8");
-      const lines = text.split("\n").filter((line) => line.length > 0);
-      let lastSeq = 0;
-      // The lowest record that survived, because `firstSeq` is what a reader
-      // starts from: a stale meta that claims the log begins later than it
-      // really does silently hides the opening of the conversation.
-      let firstSeq = 0;
-      // The last record decides. A turn-scoped record with nothing terminal
-      // after it means the turn never finished, which is exactly the state a hard
-      // kill leaves behind. Tracking whether turn.started was seen was not enough:
-      // a log that began mid-stream has turn content and no opening event.
-      let lastType: string | null = null;
-      for (const line of lines) {
-        let parsed: unknown;
-        try {
-          parsed = JSON.parse(line);
-        } catch {
-          continue;
-        }
-        const record = StoredEventRecordSchema.safeParse(parsed);
-        if (!record.success) continue;
-        if (record.data.seq > lastSeq) lastSeq = record.data.seq;
-        if (firstSeq === 0 || record.data.seq < firstSeq) firstSeq = record.data.seq;
-        lastType = record.data.event.type;
-      }
-      const openTurn =
-        lastType === "turn.started" || lastType === "turn.delta" || lastType === "tool.updated";
-      return { firstSeq, lastSeq, bytes: stat.size, openTurn };
-    } finally {
-      await handle.close();
-    }
+  private chargeStoreBytes(): void {
+    const db = this.handle();
+    // The same two numbers the append path accumulates, taken from the rows that
+    // hold them. Measuring the events table directly instead would count the
+    // stored payload while the append path counts the payload plus its wrapper,
+    // so the store total would shrink by the difference on every restart and the
+    // cap would mean a different thing depending on when you asked.
+    const events = db
+      .prepare("SELECT COALESCE(SUM(bytes), 0) AS total FROM sessions")
+      .get() as MetaRow;
+    const spooled = db
+      .prepare(
+        "SELECT COALESCE(SUM(size + manifest_bytes), 0) AS total FROM attachments",
+      )
+      .get() as MetaRow;
+    this.storeBytes = asInt(events, "total") + asInt(spooled, "total");
   }
 
   /**
-   * Truncates a log that does not end in a newline. Without this, the next
-   * append concatenates onto the fragment and produces one line that destroys
-   * both the torn record and the good one after it, permanently.
+   * Brings every session row back into agreement with its own events.
    *
-   * Safe here and only here: no writer holds a handle yet, because this runs
-   * before `ready`.
+   * This is the one repair the database still needs, and it survives here for a
+   * reason that has nothing to do with text files: `endedMidTurn` is a fact about
+   * the last event, and nothing recomputes it as turns are appended. A summary
+   * that lags its events is not trusted; the events win.
    */
-  private async repairTornTails(): Promise<void> {
-    let entries: fs.Dirent[];
-    try {
-      entries = await fsp.readdir(this.root, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    for (const entry of entries) {
-      if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
-      const logPath = path.join(this.root, entry.name, EVENTS_FILE);
-      let handle: fsp.FileHandle | null = null;
+  private reconcile(): void {
+    const db = this.handle();
+    const rows = db
+      .prepare(
+        `SELECT s.store_id AS store_id, s.first_seq AS first_seq, s.last_seq AS last_seq,
+                (SELECT MIN(seq) FROM events e WHERE e.store_id = s.store_id) AS min_seq,
+                (SELECT MAX(seq) FROM events e WHERE e.store_id = s.store_id) AS max_seq,
+                (SELECT payload FROM events e WHERE e.store_id = s.store_id
+                  ORDER BY seq DESC LIMIT 1) AS tail
+           FROM sessions s`,
+      )
+      .all() as MetaRow[];
+    for (const row of rows) {
+      const storeId = asText(row, "store_id");
+      if (storeId === null) continue;
       try {
-        handle = await fsp.open(logPath, fs.constants.O_RDWR);
-        const stat = await handle.stat();
-        if (!stat.isFile() || stat.size === 0) continue;
-        const buffer = Buffer.allocUnsafe(stat.size);
-        const { bytesRead } = await handle.read(buffer, 0, stat.size, 0);
-        if (bytesRead === 0 || buffer[bytesRead - 1] === 0x0a) continue;
-        const cut = buffer.subarray(0, bytesRead).lastIndexOf(0x0a);
-        if (cut === -1) {
-          // Nothing complete at all: the log is one torn record.
-          await handle.truncate(0);
-          this.report("E_STORE_WRITABLE", `discarded an entirely torn log in ${entry.name}`);
-          continue;
-        }
-        await handle.truncate(cut + 1);
+        this.reconcileOne(row, storeId);
+      } catch (cause) {
+        // Per session, not per store. One row that cannot be repaired costs that
+        // session its repair, never the process its boot: the old store caught
+        // here too, and a single unwritable row turning into `exit(1)` is how a
+        // read-only disk became a server that would not start.
         this.report(
           "E_STORE_WRITABLE",
-          `repaired a torn final record in ${entry.name}, dropping ${bytesRead - (cut + 1)} bytes`,
+          `could not reconcile ${storeId}: ${String(cause)}`,
         );
-      } catch (cause) {
-        this.report("E_STORE_WRITABLE", `could not inspect ${entry.name}: ${String(cause)}`);
-      } finally {
-        await handle?.close().catch(() => {});
       }
     }
   }
 
-  private assertOpen(): void {
-    if (!this.ready) {
-      throw new SessionStoreError("E_STORE_WRITABLE", "the session store is not open");
-    }
-  }
-
-  private dirFor(storeId: string): string {
-    const name = sessionDirName(storeId);
-    const reason = unsafeNameReason(name);
-    if (reason !== null) {
-      throw new SessionStoreError("E_STORE_PATH_ESCAPE", `unsafe session directory name (${reason})`);
-    }
-    const dir = path.join(this.root, name);
-    assertInside(this.root, dir);
-    return dir;
-  }
-
-  private eventsPath(storeId: string): string {
-    const dir = this.dirFor(storeId);
-    const target = path.join(dir, EVENTS_FILE);
-    assertInside(dir, target);
-    return target;
-  }
-
-  private metaPath(storeId: string): string {
-    const dir = this.dirFor(storeId);
-    const target = path.join(dir, META_FILE);
-    assertInside(dir, target);
-    return target;
-  }
-
-  /**
-   * A path two levels below the root. The spool needs its own containment check
-   * because `assertInside` judges a direct child, and an attachment is a grandchild.
-   */
-  private subPath(storeId: string, dirName: string, fileName: string): string {
-    const sessionDir = this.dirFor(storeId);
-    const dir = path.join(sessionDir, dirName);
-    assertInside(sessionDir, dir);
-    const target = path.join(dir, fileName);
-    assertInside(dir, target);
-    return target;
-  }
-
-  private attachmentPath(storeId: string, attachmentId: string): string {
-    return this.subPath(storeId, ATTACHMENT_BYTES_DIR, this.safeAttachmentName(attachmentId));
-  }
-
-  private attachmentManifestPath(storeId: string, attachmentId: string): string {
-    return this.subPath(
-      storeId,
-      ATTACHMENT_MANIFEST_DIR,
-      `${this.safeAttachmentName(attachmentId)}.json`,
-    );
-  }
-
-  /**
-   * The one place an attachment id becomes a path component. It is caller-named
-   * in every direction, so it goes through the same predicate as a session
-   * directory: a rejected id is never a path, only a 400-shaped error.
-   */
-  private safeAttachmentName(attachmentId: string): string {
-    const reason = unsafeNameReason(attachmentId);
-    if (reason !== null) {
-      throw new SessionStoreError(
-        "E_STORE_PATH_ESCAPE",
-        `unsafe attachment id (${reason})`,
-      );
-    }
-    return attachmentId;
-  }
-
-  /** Rebuilds the whole index from disk. The only thing that keeps it honest. */
-  async rescan(): Promise<number> {
-    this.index.clear();
-    this.storeBytes = 0;
-    let entries: fs.Dirent[];
-    try {
-      entries = await fsp.readdir(this.root, { withFileTypes: true });
-    } catch {
-      return 0;
-    }
-    for (const entry of entries) {
-      if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
-      const meta = await this.readMeta(path.join(this.root, entry.name));
-      if (meta !== null) {
-        this.index.set(meta.storeId, meta);
-        this.storeBytes += meta.bytes;
-      }
-    }
-    this.evict(false);
-    return this.index.size;
-  }
-
-  private async readMeta(dir: string): Promise<MetaFile | null> {
-    let text: string;
-    try {
-      text = await fsp.readFile(path.join(dir, META_FILE), "utf8");
-    } catch {
-      // A session directory with no readable meta is not a session. Skipping
-      // it keeps one corrupt file from hiding every other session.
-      return null;
-    }
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(text);
-    } catch {
-      this.report("E_STORE_META_CORRUPT", `unreadable meta in ${path.basename(dir)}`);
-      return null;
-    }
-    const result = MetaFileSchema.safeParse(parsed);
-    if (!result.success) {
-      // An unknown version is refused, never coerced forward: a silently
-      // defaulted field renders a session list full of empty cards.
+  /** Brings one session row back into agreement with its own events. */
+  private reconcileOne(row: MetaRow, storeId: string): void {
+    const db = this.handle();
+    const claimedLast = asInt(row, "last_seq");
+    const claimedFirst = asInt(row, "first_seq");
+    const minSeq = row["min_seq"] === null ? null : asInt(row, "min_seq");
+    const maxSeq = row["max_seq"] === null ? null : asInt(row, "max_seq");
+    // A row that claims records and holds none is repaired to hold none, not left
+    // claiming them. The import can produce exactly this from a legacy session
+    // whose meta was written and whose log never was, and a summary that promises
+    // 400 records the store does not have makes every read of that task fail for
+    // ever with no repair path.
+    if ((maxSeq === null && claimedLast > 0) || (minSeq === null && claimedFirst > 0)) {
       this.report(
-        "E_STORE_META_CORRUPT",
-        `unusable meta in ${path.basename(dir)}: ${result.error.issues[0]?.message ?? "unknown"}`,
+        "E_STORE_CORRUPT_LOG",
+        `session ${storeId} claims ${String(claimedLast)} record(s) and holds none`,
       );
-      return null;
+      // Truncated, because the repair makes the row honest about holding nothing
+      // and "honest about nothing" is not the same as "complete". Left false, a
+      // task that lost 400 records reads as a caught-up, empty, undamaged
+      // transcript, which is the one answer a user cannot act on.
+      this.writeReconciled(storeId, 0, 0, false, true);
+      return;
     }
-    return result.data;
-  }
-
-  private async writeMeta(meta: MetaFile): Promise<void> {
-    const dir = this.dirFor(meta.storeId);
-    await fsp.mkdir(dir, { recursive: true, mode: 0o700 });
-    const target = this.metaPath(meta.storeId);
-    // O_EXCL defeats a pre-planted symlink at the temp path: a harness running
-    // agent-supplied code shares this uid, so a predictable temp name is an
-    // arbitrary-file-overwrite primitive. O_NOFOLLOW is undefined on win32.
-    const noFollow = fs.constants.O_NOFOLLOW ?? 0;
-    const tmp = path.join(dir, `.${META_FILE}.${randomUUID()}.tmp`);
-    const handle = await fsp.open(
-      tmp,
-      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | noFollow,
-      0o600,
+    let changed = false;
+    if (maxSeq !== null && maxSeq !== claimedLast) {
+      this.report(
+        "E_STORE_CORRUPT_LOG",
+        `stored meta for ${storeId} claimed ${String(claimedLast)} records but the log holds ${String(maxSeq)}`,
+      );
+      changed = true;
+    }
+    if (minSeq !== null && minSeq !== claimedFirst) {
+      // The lowest sequence actually stored, not the highest. `firstSeq` is what
+      // a reader starts from, so a stale value here silently hides the opening
+      // of the conversation.
+      this.report(
+        "E_STORE_CORRUPT_LOG",
+        `stored meta for ${storeId} claimed records from ${String(claimedFirst)} but the log begins at ${String(minSeq)}`,
+      );
+      changed = true;
+    }
+    const openTurn = endsMidTurn(asText(row, "tail"));
+    if (openTurn) {
+      this.report(
+        "E_STORE_CORRUPT_LOG",
+        `session ${storeId} ended mid-turn, most likely an unclean shutdown; its transcript is a prefix`,
+      );
+      changed = true;
+    }
+    if (!changed) return;
+    this.writeReconciled(
+      storeId,
+      minSeq ?? claimedFirst,
+      maxSeq ?? claimedLast,
+      openTurn,
     );
-    try {
-      await handle.writeFile(`${JSON.stringify(meta)}\n`, "utf8");
-      // Data durable before the rename, or the rename can publish a name whose
-      // contents are not on disk.
-      await handle.sync();
-    } finally {
-      await handle.close();
-    }
-    try {
-      await fsp.rename(tmp, target);
-    } catch (cause) {
-      await fsp.rm(tmp, { force: true }).catch(() => {});
-      throw cause;
-    }
-    // The rename itself must be durable, or a crash can leave meta.json absent
-    // even though the rename reported success. Directory fsync is POSIX-only.
-    if (process.platform !== "win32") {
-      const dirHandle = await fsp.open(dir, fs.constants.O_RDONLY);
-      try {
-        await dirHandle.sync();
-      } catch {
-        // Not every filesystem supports it; the rename already happened.
-      } finally {
-        await dirHandle.close();
-      }
-    }
   }
 
-  private writerFor(storeId: string): Writer {
-    const existing = this.writers.get(storeId);
-    if (existing !== undefined) return existing;
-    const meta = this.index.get(storeId);
-    // Seeded from the durable byte count, not from zero. Otherwise every process
-    // restart grants the session a fresh full budget on top of what is already
-    // on disk, which was measured growing the log without bound across restarts.
-    const created: Writer = {
-      queue: Promise.resolve(),
-      handle: null,
-      bytes: meta?.bytes ?? 0,
-      truncated: meta?.truncated === true,
-      stopped: false,
-    };
-    this.writers.set(storeId, created);
-    return created;
+  /**
+   * Writes back a reconciled summary, with the byte total re-measured from the
+   * events rather than trusted: the old meta carried the size of a JSONL file and
+   * this row carries the size of the events alone, so the two cannot be added.
+   */
+  private writeReconciled(
+    storeId: string,
+    firstSeq: number,
+    lastSeq: number,
+    openTurn: boolean,
+    /** Force the prefix flag, for the repair that discards records the row claimed. */
+    forceTruncated = false,
+  ): void {
+    this.handle()
+      .prepare(
+        `UPDATE sessions
+            SET first_seq = ?, last_seq = ?,
+                bytes = (SELECT COALESCE(SUM(bytes), 0) FROM events WHERE store_id = ?),
+                truncated = CASE WHEN ? = 1 THEN 1 ELSE truncated END,
+                ended_mid_turn = ?
+          WHERE store_id = ?`,
+      )
+      // Placeholders, in order: firstSeq, lastSeq, the subquery's store id, the
+      // prefix flag, the mid-turn flag, and the row being written.
+      .run(firstSeq, lastSeq, storeId, forceTruncated || openTurn ? 1 : 0, openTurn ? 1 : 0, storeId);
   }
 
   /**
@@ -644,65 +661,118 @@ export class SessionStore {
    * user hits the ceiling and can only recover by editing ~/.local/share by
    * hand, which is not a reverse state.
    *
-   * The overflow is computed once, before the loop. Reading the live index size
-   * inside the loop meant each deletion shrank the bound and the loop stopped
-   * one session short, after which every create() failed with no way out.
+   * The overflow is computed once, before the loop. Reading the live count inside
+   * the loop meant each deletion shrank the bound and the loop stopped one
+   * session short, after which every create() failed with no way out.
    *
-   * `makeRoom` is what separates the two callers. A boot prunes only by age, so
-   * a workspace that is simply large keeps its recent work. A create that is
-   * already at the cap prunes the oldest regardless of age, because refusing
-   * every new session forever is the same dead end from the other direction.
+   * Age is checked first and the cap second, so a workspace that is merely large
+   * keeps its recent work: nothing is pruned for being old until it is also
+   * something the cap can do without. Once the cap is reached the oldest goes
+   * regardless, because refusing every new session for ever is the same dead end
+   * from the other direction.
+   *
+   * The age rule is the one part of this that a boot used to run on its own. It no
+   * longer does, so a workspace nobody starts new work in keeps its transcripts
+   * indefinitely. That is deliberate: pruning somebody's history during a boot
+   * they did not ask for is a worse surprise than a store that has to be used
+   * before it tidies up, and the cap still bounds the disk either way.
    */
-  private evict(makeRoom: boolean): number {
-    let removed = 0;
+  private evict(): number {
+    const db = this.handle();
     const nowMs = this.now();
-    const live = new Set(this.writers.keys());
-    const byAge = [...this.index.values()].sort(
-      (a, b) => Date.parse(a.updatedAt) - Date.parse(b.updatedAt),
-    );
-    // `remaining` is the count still in the index, decremented as we go. Reading
-    // the live index size inside the loop meant each deletion shrank the bound
-    // and the loop stopped one session short, after which every create() failed
-    // with no way out.
-    let remaining = this.index.size;
-    for (const meta of byAge) {
+    const rows = db
+      .prepare("SELECT store_id FROM sessions ORDER BY updated_at ASC, store_id ASC")
+      .all() as MetaRow[];
+    let removed = 0;
+    let remaining = rows.length;
+    for (const row of rows) {
+      const storeId = asText(row, "store_id");
+      if (storeId === null) continue;
+      const meta = this.meta(storeId);
+      if (meta === null) {
+        // A row this build cannot read is still occupying a slot. Counting it as
+        // absent here would let the cap be exceeded by exactly the rows nobody
+        // can list.
+        remaining -= 1;
+        continue;
+      }
       const idle = nowMs - Date.parse(meta.updatedAt);
-      const overCap = remaining > this.maxSessions;
-      // A create that is already at the cap prunes the oldest regardless of age:
-      // refusing every new session forever is the same dead end from the other
-      // direction.
-      const needRoom = makeRoom && remaining >= this.maxSessions;
-      if (!overCap && !needRoom && idle <= this.idleEvictMs) break;
-      if (live.has(meta.storeId)) continue;
-      const reason = overCap || needRoom ? "session-cap" : `idle for ${Math.round(idle / 86_400_000)}d`;
-      this.index.delete(meta.storeId);
-      this.storeBytes = Math.max(0, this.storeBytes - meta.bytes);
-      this.releaseSpool(meta.storeId);
+      const needRoom = remaining >= this.maxSessions;
+      if (!needRoom && idle <= this.idleEvictMs) break;
+      // A live seat is never evicted out from under itself: the appends it is
+      // still making would land in a session that no longer exists.
+      //
+      // Before the count, not after. A skipped row still occupies a slot, so
+      // decrementing for one made the loop believe it had made room when it had
+      // deleted nothing, and it stopped one row early. A store at its cap whose
+      // oldest session was the live one then refused every create for the rest of
+      // the process, with no way out but deleting a session by hand.
+      if (this.live.has(storeId)) continue;
       remaining -= 1;
+      const reason = needRoom
+        ? "session-cap"
+        : `idle for ${String(Math.round(idle / 86_400_000))}d`;
+      this.deleteRows(storeId);
       removed += 1;
       // Reported, because this deletes a user's whole transcript. Silently
       // pruning a session list looks identical to losing work.
-      this.report("E_STORE_EVICTED", `pruned stored session ${meta.storeId} (${reason})`);
-      void fsp
-        .rm(this.dirFor(meta.storeId), { recursive: true, force: true })
-        .catch(() => {});
+      this.report("E_STORE_EVICTED", `pruned stored session ${storeId} (${reason})`);
     }
     return removed;
   }
 
   /**
-   * Async because the meta write must be durable before the caller is told the
-   * session exists. A fire-and-forget create lost the session to an immediate
-   * rescan, a crash, or a second process, leaving an orphan directory that
-   * rescan then skipped forever.
+   * Marks a session as being written to, dropping the least recently written pin
+   * once there are more than the cap could ever need.
+   */
+  private pinLive(storeId: string): void {
+    this.live.delete(storeId);
+    this.live.set(storeId, this.now());
+    while (this.live.size > this.maxSessions) {
+      const oldest = this.live.keys().next();
+      if (oldest.done === true) break;
+      this.live.delete(oldest.value);
+    }
+  }
+
+  /**
+   * Deletes a session and everything the cascade hangs off it, in one statement.
+   *
+   * The budget is adjusted by what this session actually held, for the same reason
+   * remove() does it that way: re-measuring the whole store on every eviction is a
+   * full scan, and a cap that only ever grows is a cap that eventually refuses
+   * every write in a store that is mostly empty.
+   */
+  private deleteRows(storeId: string): void {
+    const held = this.handle()
+      .prepare(
+        `SELECT s.bytes AS bytes,
+                COALESCE((SELECT SUM(a.size + a.manifest_bytes) FROM attachments a
+                           WHERE a.store_id = s.store_id), 0) AS spooled
+           FROM sessions s WHERE s.store_id = ?`,
+      )
+      .get(storeId) as MetaRow | undefined;
+    this.handle().prepare("DELETE FROM sessions WHERE store_id = ?").run(storeId);
+    if (held !== undefined) {
+      this.storeBytes = Math.max(0, this.storeBytes - asInt(held, "bytes") - asInt(held, "spooled"));
+    }
+    this.stopped.delete(storeId);
+    this.live.delete(storeId);
+  }
+
+  /**
+   * Async because the caller is told the session exists only once the row is
+   * durable. A fire-and-forget create lost the session to an immediate rescan, a
+   * crash, or a second process, leaving a record the store had forgotten.
    */
   async create(input: CreateSessionInput): Promise<SessionSummary> {
     this.assertOpen();
-    this.evict(true);
-    if (this.index.size >= this.maxSessions) {
+    this.evict();
+    const count = this.count();
+    if (count >= this.maxSessions) {
       throw new SessionStoreError(
         "E_STORE_QUOTA",
-        `the session store holds its maximum of ${this.maxSessions} sessions`,
+        `the session store holds its maximum of ${this.maxSessions} sessions, and every one of them is being written to`,
       );
     }
     const nowMs = this.now();
@@ -725,51 +795,72 @@ export class SessionStore {
       titleSource: input.title === undefined ? "none" : "prompt",
       endedMidTurn: false,
     };
+    const db = this.handle();
     try {
-      await this.writeMeta(meta);
+      db.prepare(
+        `INSERT INTO sessions (${SESSION_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        meta.storeId,
+        meta.harness,
+        meta.harnessSessionId,
+        meta.projectId,
+        meta.projectName,
+        meta.cwd,
+        meta.title,
+        meta.createdAt,
+        meta.updatedAt,
+        meta.turnCount,
+        meta.firstSeq,
+        meta.lastSeq,
+        meta.bytes,
+        0,
+        meta.titleSource,
+        0,
+      );
     } catch (cause) {
       // Refused rather than reported into existence: a summary for a session
       // that cannot be written is a session the user will never find again.
-      throw cause instanceof SessionStoreError
-        ? cause
-        : new SessionStoreError("E_STORE_WRITABLE", `could not create the session: ${String(cause)}`);
+      throw new SessionStoreError("E_STORE_WRITABLE", `could not create the session: ${String(cause)}`);
     }
-    this.index.set(meta.storeId, meta);
     return this.toSummary(meta);
   }
 
+  private count(): number {
+    const row = this.handle().prepare("SELECT COUNT(*) AS total FROM sessions").get() as MetaRow;
+    return asInt(row, "total");
+  }
+
   /**
-   * Appends one event. Never throws and never rejects into a caller: the emit
-   * path in session-service.ts is synchronous, so an un-awaited fs rejection
-   * here becomes an unhandledRejection and Node exits — measured exit code 1 on
-   * ENOENT — taking every live harness child with it.
+   * Appends one event. Never throws: the emit path in session-service.ts is
+   * synchronous, so an exception here becomes an unhandled error and takes every
+   * live harness child with it.
    *
-   * The index is advanced synchronously and only the I/O is queued. A reader
-   * that lands between two appends must see a consistent cursor, and a seq
-   * derived from an asynchronously-updated counter would hand two rapid appends
-   * the same number and leave a permanent gap after them.
+   * The event and the session row move in one transaction, so the sequence
+   * counter cannot advance past a record that was not written, and a reader
+   * between two appends sees a consistent cursor. The old log needed a queued
+   * writer and a rollback for exactly this.
    */
   append(storeId: string, event: ServerEvent): void {
-    if (!this.ready) return;
+    if (!this.ready || this.db === null) return;
     if (!isPersistedEventType(event.type)) return;
-    const meta = this.index.get(storeId);
-    // A write for an unknown id is dropped, never mkdir -p'd: a defensive
+    // A write for an unknown id is dropped, never re-created: a defensive
     // recreate would resurrect a session the user just deleted.
-    if (meta === undefined) return;
-    const writer = this.writerFor(storeId);
-    if (writer.stopped) return;
+    const meta = this.meta(storeId);
+    if (meta === undefined || meta === null) return;
+    if (this.stopped.has(storeId)) return;
+    this.pinLive(storeId);
 
+    let payload: string;
     let line: string;
-    let record: StoredEventRecord;
     try {
-      record = {
+      const validated = StoredEventRecordSchema.parse({
         v: RECORD_VERSION,
         seq: meta.lastSeq + 1,
         ts: nowIso(this.now()),
         event,
-      };
-      const validated = StoredEventRecordSchema.parse(record);
-      line = `${JSON.stringify(validated)}\n`;
+      });
+      line = JSON.stringify(validated);
+      payload = JSON.stringify(validated.event);
     } catch (cause) {
       this.report("E_STORE_LINE_TOO_LONG", `refusing an unrecordable event: ${String(cause)}`);
       return;
@@ -779,92 +870,105 @@ export class SessionStore {
     if (bytes > MAX_LINE_BYTES) {
       this.report(
         "E_STORE_LINE_TOO_LONG",
-        `dropped a ${bytes}-byte record over the ${MAX_LINE_BYTES}-byte cap`,
+        `dropped a ${String(bytes)}-byte record over the ${String(MAX_LINE_BYTES)}-byte cap`,
       );
       return;
     }
     if (meta.bytes + bytes > this.maxSessionBytes) {
-      if (!writer.truncated) {
-        writer.truncated = true;
-        writer.stopped = true;
-        meta.truncated = true;
-        this.report(
-          "E_STORE_QUOTA",
-          `session ${storeId} reached its ${this.maxSessionBytes}-byte cap; the transcript is now a prefix`,
-        );
-        void this.flushMeta(storeId).catch(() => {});
-      }
+      this.markTruncated(
+        storeId,
+        `session ${storeId} reached its ${String(this.maxSessionBytes)}-byte cap; the transcript is now a prefix`,
+      );
       return;
     }
     if (this.storeBytes + bytes > this.maxStoreBytes) {
       // Mirrors the per-session branch: the log is a prefix from here, and the
       // summary must say so. Silently dropping events while reporting a complete
       // transcript is how a user loses work without being told.
-      if (!meta.truncated) {
-        meta.truncated = true;
-        void this.flushMeta(storeId).catch(() => {});
-      }
-      writer.stopped = true;
-      this.report(
-        "E_STORE_QUOTA",
-        `the session store reached its ${this.maxStoreBytes}-byte cap; session ${storeId} is now a prefix`,
+      this.markTruncated(
+        storeId,
+        `the session store reached its ${String(this.maxStoreBytes)}-byte cap; session ${storeId} is now a prefix`,
       );
       return;
     }
 
-    writer.bytes += bytes;
-    meta.bytes += bytes;
-    this.storeBytes += bytes;
-    meta.lastSeq = record.seq;
-    if (meta.firstSeq === 0) meta.firstSeq = record.seq;
-    meta.updatedAt = record.ts;
-    if (event.type === "turn.completed") meta.turnCount += 1;
-
-    const failedSeq = record.seq;
-    // The queue body resolves the writer and the index at write time rather than
-    // capturing them, so a rescan that replaces the index cannot leave a writer
-    // mutating a detached object. It also never rejects, so one failure cannot
-    // poison every append queued behind it.
-    const run = async (): Promise<void> => {
+    const db = this.handle();
+    const seq = meta.lastSeq + 1;
+    const ts = nowIso(this.now());
+    try {
+      db.exec("BEGIN IMMEDIATE");
+      db.prepare(
+        "INSERT INTO events (store_id, seq, ts, payload, bytes) VALUES (?, ?, ?, ?, ?)",
+      ).run(storeId, seq, ts, payload, bytes);
+      db.prepare(
+        `UPDATE sessions
+            SET last_seq = ?, first_seq = CASE WHEN first_seq = 0 THEN ? ELSE first_seq END,
+                bytes = bytes + ?, updated_at = ?,
+                turn_count = turn_count + ?
+          WHERE store_id = ?`,
+      ).run(seq, seq, bytes, ts, event.type === "turn.completed" ? 1 : 0, storeId);
+      db.exec("COMMIT");
+    } catch (cause) {
+      // The transaction rolled back, so no hole exists and the next append is
+      // still free to issue the same sequence number. The one thing that is not
+      // recoverable in place is a write that keeps failing, so the session is
+      // marked a prefix and refused from here on.
       try {
-        const live = this.writers.get(storeId);
-        if (live === undefined) return;
-        if (live.handle === null) {
-          live.handle = await fsp.open(
-            this.eventsPath(storeId),
-            fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_APPEND,
-            0o600,
-          );
-        }
-        await live.handle.writeFile(line, "utf8");
-      } catch (cause) {
-        this.failWrite(storeId, failedSeq, cause);
+        db.exec("ROLLBACK");
+      } catch {
+        // No transaction was open, which is itself fine.
       }
-    };
-    writer.queue = writer.queue.then(run, run);
+      if (isRetryable(cause)) {
+        // Someone else has the file. Nothing about the session is wrong and no
+        // hole exists, because the transaction rolled back whole. Recording stops
+        // here for this one event and resumes on the next, and the turn itself is
+        // untouched: the browser is still streaming, only this record is not kept.
+        //
+        // The old store behaved this way, reopening its handle and writing the
+        // next record at the same sequence number. Stopping instead is what turned
+        // a one-millisecond lock into the permanent, silent loss of a live turn
+        // that still reported itself complete.
+        // Counted, not just reported. The transaction rolled back, so there is no
+        // gap for a reader to notice, and without a count the transcript reads as
+        // whole while quietly missing events. The summary is left untruncated
+        // because the log is not a prefix: a later turn appends normally and the
+        // only consequence is this one event, which is what `dropped` reports.
+        this.storeDrifted.set(storeId, (this.storeDrifted.get(storeId) ?? 0) + 1);
+        this.report(
+          "E_STORE_WRITABLE",
+          `the session store was busy, so one record of ${storeId} was not kept: ${String(cause)}`,
+        );
+        return;
+      }
+      this.stopped.add(storeId);
+      this.setTruncated(storeId);
+      this.report("E_STORE_WRITABLE", `lost the next record of ${storeId}: ${String(cause)}`);
+      return;
+    }
+    this.storeBytes += bytes;
   }
 
   /**
-   * A write that failed leaves a hole that can never be repaired in place, so
-   * the honest response is to stop the writer and say the log is a prefix.
+   * Stops a session's writer and says so in the summary.
    *
-   * Rolling the index back to the seq of the record that actually failed — not
-   * to the live lastSeq, which by then has already been handed to records still
-   * queued behind it — is what stops the next append from reissuing a seq that
-   * is already on disk.
+   * Used for both quota branches. A refusal that reported itself without stopping
+   * would retry the same write on the next event and produce a stream of
+   * identical errors for a condition that will not resolve itself.
    */
-  private failWrite(storeId: string, failedSeq: number, cause: unknown): void {
-    const writer = this.writers.get(storeId);
-    if (writer !== undefined) {
-      writer.handle = null;
-      writer.truncated = true;
+  private markTruncated(storeId: string, message: string): void {
+    this.stopped.add(storeId);
+    this.setTruncated(storeId);
+    this.report("E_STORE_QUOTA", message);
+  }
+
+  private setTruncated(storeId: string): void {
+    try {
+      this.handle()
+        .prepare("UPDATE sessions SET truncated = 1 WHERE store_id = ?")
+        .run(storeId);
+    } catch (cause) {
+      this.report("E_STORE_WRITABLE", `could not mark ${storeId} truncated: ${String(cause)}`);
     }
-    const meta = this.index.get(storeId);
-    if (meta !== undefined) meta.truncated = true;
-    this.report(
-      "E_STORE_WRITABLE",
-      `lost record ${failedSeq} of ${storeId}: ${String(cause)}`,
-    );
   }
 
   /**
@@ -875,20 +979,25 @@ export class SessionStore {
    * harness-influenced text, so it goes through the same sanitizer as a create.
    */
   setTitle(storeId: string, title: string, updatedAt?: string | null): void {
-    const meta = this.index.get(storeId);
-    if (meta === undefined) return;
+    const meta = this.meta(storeId);
+    if (meta === null || meta === undefined) return;
     const sanitized = sanitizeTitle(title);
-    if (sanitized !== meta.title) {
-      meta.title = sanitized;
-      meta.titleSource = "harness";
-    }
     // The harness knows better than we do when it was last active, and the
-    // sidebar orders by this. Only accepted when parseable, so a malformed
-    // value cannot make the row un-evictable by age.
-    if (typeof updatedAt === "string" && Number.isFinite(Date.parse(updatedAt))) {
-      meta.updatedAt = updatedAt;
+    // sidebar orders by this. Only accepted when parseable, so a malformed value
+    // cannot make the row un-evictable by age.
+    const stamp =
+      typeof updatedAt === "string" && Number.isFinite(Date.parse(updatedAt))
+        ? updatedAt
+        : meta.updatedAt;
+    try {
+      this.handle()
+        .prepare(
+          "UPDATE sessions SET title = ?, title_source = ?, updated_at = ? WHERE store_id = ?",
+        )
+        .run(sanitized, sanitized === meta.title ? meta.titleSource : "harness", stamp, storeId);
+    } catch (cause) {
+      this.report("E_STORE_WRITABLE", `could not record a session title: ${String(cause)}`);
     }
-    void this.flushMeta(storeId).catch(() => {});
   }
 
   /**
@@ -897,73 +1006,77 @@ export class SessionStore {
    * own title on every turn.
    */
   titleFromPrompt(storeId: string, prompt: string): void {
-    const meta = this.index.get(storeId);
-    if (meta === undefined) return;
+    const meta = this.meta(storeId);
+    if (meta === null || meta === undefined) return;
     // Gated on the flag rather than on the rendered string: comparing against the
     // placeholder meant a prompt of literally "Untitled task" re-armed this, and
     // turn two silently renamed the session.
     if (meta.titleSource !== "none") return;
     const sanitized = sanitizeTitle(prompt);
     if (sanitized === meta.title) return;
-    meta.title = sanitized;
-    meta.titleSource = "prompt";
-    void this.flushMeta(storeId).catch(() => {});
+    try {
+      this.handle()
+        .prepare("UPDATE sessions SET title = ?, title_source = 'prompt' WHERE store_id = ?")
+        .run(sanitized, storeId);
+    } catch (cause) {
+      this.report("E_STORE_WRITABLE", `could not record a session title: ${String(cause)}`);
+    }
   }
 
   /**
-   * Makes the summary durable, so the sidebar sees a finished task.
+   * Kept because the recorder interface promises a durable summary before the
+   * browser is told a session exists, and because a WAL checkpoint is the only
+   * way to ask for durability without paying for it on every record.
    *
-   * Serialised through the same queue as the appends, and snapshot only after it
-   * drains. Awaiting the queue and then stringifying the live meta object wrote a
-   * summary describing records whose lines were still queued, which on a power
-   * loss left the meta permanently ahead of its own log.
+   * In WAL mode with synchronous=NORMAL a committed transaction is already
+   * visible to every reader in the process; this makes it survive a power loss
+   * too, which is the only thing a caller asking for a flush actually wants.
    */
   async flushMeta(storeId: string): Promise<void> {
-    const writer = this.writers.get(storeId);
-    if (writer === undefined) {
-      const meta = this.index.get(storeId);
-      if (meta === undefined) return;
-      try {
-        await this.writeMeta({ ...meta });
-      } catch (cause) {
-        this.report("E_STORE_WRITABLE", `could not write meta: ${String(cause)}`);
-      }
-      return;
+    if (this.db === null) return;
+    try {
+      this.handle().exec("PRAGMA wal_checkpoint(PASSIVE)");
+    } catch (cause) {
+      this.report("E_STORE_WRITABLE", `could not flush the session store: ${String(cause)}`);
     }
-    const run = async (): Promise<void> => {
-      const meta = this.index.get(storeId);
-      if (meta === undefined) return;
-      try {
-        await this.writeMeta({ ...meta });
-      } catch (cause) {
-        this.report("E_STORE_WRITABLE", `could not write meta: ${String(cause)}`);
-      }
-    };
-    writer.queue = writer.queue.then(run, run);
-    await writer.queue;
   }
 
   async flushAll(): Promise<void> {
-    await Promise.all([...this.writers.keys()].map((id) => this.flushMeta(id)));
+    if (this.db === null) return;
+    try {
+      // TRUNCATE, not PASSIVE: this runs at shutdown, where the point is to leave
+      // one self-contained file behind rather than a log beside it.
+      this.handle().exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    } catch (cause) {
+      this.report("E_STORE_WRITABLE", `could not flush the session store: ${String(cause)}`);
+    }
   }
 
   list(): SessionSummary[] {
-    // Newest first, by the timestamp of the last write. `lastSeq` is a per-session
-    // record count, not a store-wide clock: ordering on it put a long old task
-    // above a short new one, which is the opposite of what the sidebar claims.
-    // The storeId breaks a tie between two sessions written in the same
-    // millisecond, so the order is total and repeatable.
-    const summaries = [...this.index.values()]
-      .map((meta) => this.toSummary(meta))
-      .sort(
-        (a, b) => b.updatedAt.localeCompare(a.updatedAt) || b.lastSeq - a.lastSeq || b.storeId.localeCompare(a.storeId),
-      );
-    return summaries.slice(0, MAX_LISTED_SESSIONS);
+    const rows = this.handle()
+      .prepare(
+        `SELECT ${SESSION_COLUMNS} FROM sessions ORDER BY updated_at DESC, store_id DESC`,
+      )
+      .all() as MetaRow[];
+    const summaries: SessionSummary[] = [];
+    for (const row of rows) {
+      const meta = rowToMeta(row);
+      if (meta === null) {
+        this.report(
+          "E_STORE_META_CORRUPT",
+          `unusable stored session ${asText(row, "store_id") ?? "unknown"}`,
+        );
+        continue;
+      }
+      summaries.push(this.toSummary(meta));
+      if (summaries.length >= MAX_LISTED_SESSIONS) break;
+    }
+    return summaries;
   }
 
   summary(storeId: string): SessionSummary | null {
-    const meta = this.index.get(storeId);
-    return meta === undefined ? null : this.toSummary(meta);
+    const meta = this.meta(storeId);
+    return meta === null ? null : this.toSummary(meta);
   }
 
   /**
@@ -971,15 +1084,24 @@ export class SessionStore {
    * summary — the title's source, or whether a boot found an unclean end.
    */
   meta(storeId: string): MetaFile | null {
-    return this.index.get(storeId) ?? null;
+    if (this.db === null) return null;
+    const row = this.handle()
+      .prepare(`SELECT ${SESSION_COLUMNS} FROM sessions WHERE store_id = ?`)
+      .get(storeId) as MetaRow | undefined;
+    if (row === undefined) return null;
+    const meta = rowToMeta(row);
+    if (meta === null) {
+      this.report("E_STORE_META_CORRUPT", `unusable stored session ${storeId}`);
+    }
+    return meta;
   }
 
   /** Just the fields continuation needs, and nothing about storage. */
   stored(
     storeId: string,
   ): { projectId: string; cwd: string; harnessSessionId: string } | null {
-    const meta = this.index.get(storeId);
-    if (meta === undefined) return null;
+    const meta = this.meta(storeId);
+    if (meta === null) return null;
     return {
       projectId: meta.projectId,
       cwd: meta.cwd,
@@ -1007,26 +1129,31 @@ export class SessionStore {
   /**
    * Reads a page of records after `since`.
    *
-   * Reads never mutate the log. Truncating a torn tail here is catastrophic:
-   * with no newline written yet, "cut at the last newline" is offset zero, so a
-   * plain GET would truncate the live log to nothing. The one place that repairs
-   * a tail is repairTornTails, which runs at open with no writer attached.
+   * Four replay states, each with its own repair, and the cursor arithmetic that
+   * produces them: `cursor-too-old` means the client's position predates the
+   * oldest retained record, `cursor-invalid` means the cursor is past the end or
+   * a hole was found, and both send the reader back to the start rather than
+   * returning partial history that looks complete.
    */
   async read(
     storeId: string,
     since: number | null,
     limit: number = MAX_EVENTS_PER_PAGE,
   ): Promise<SessionEventsResponse> {
-    const meta = this.index.get(storeId);
-    if (meta === undefined) {
+    const meta = this.meta(storeId);
+    if (meta === null || meta === undefined) {
       throw new SessionStoreError("E_STORE_UNKNOWN_SESSION", `no stored session ${storeId}`);
     }
     const cappedLimit = Math.max(1, Math.min(limit, MAX_EVENTS_PER_PAGE));
     const { firstSeq, lastSeq } = meta;
-    // 0 is the "start over" cursor: it means everything after seq 0, which is
-    // the whole log for any firstSeq. Every path that cannot serve the request
-    // returns it, so a client following nextSince rehydrates from the start
-    // rather than concluding it has caught up with a log it never read.
+    // Records the store itself failed to keep. Reported on every page rather than
+    // folded into the gap count, because these are not holes in the sequence and a
+    // reader comparing numbers would never find them.
+    const drift = this.storeDrifted.get(storeId) ?? 0;
+    // 0 is the "start over" cursor: it means everything after seq 0, which is the
+    // whole log for any firstSeq. Every path that cannot serve the request returns
+    // it, so a client following nextSince rehydrates from the start rather than
+    // concluding it has caught up with a log it never read.
     const startOver = 0;
     const base = {
       storeId,
@@ -1045,8 +1172,8 @@ export class SessionStore {
     }
     if (since !== null && since > lastSeq) {
       // A cursor past the end is a reset or a foreign cursor. An empty page here
-      // would be indistinguishable from caught-up, and the client would wait
-      // forever.
+      // would be indistinguishable from caught-up, and the client would wait for
+      // ever.
       return { ...base, status: "cursor-invalid", hasMore: false, events: [] };
     }
     const from = since === null ? firstSeq : since + 1;
@@ -1059,143 +1186,138 @@ export class SessionStore {
         events: [],
       };
     }
+    // The summary claims records the events table does not hold. The transaction
+    // cannot produce this, but a database restored from a snapshot can, and an
+    // empty page here is indistinguishable from caught-up, so a client would wait
+    // for ever for records that are not coming. Measured against the highest
+    // sequence actually stored rather than the page, so the loss is reported even
+    // when the missing records are past the page boundary.
+    const highest = this.handle()
+      .prepare("SELECT MAX(seq) AS top FROM events WHERE store_id = ?")
+      .get(storeId) as MetaRow;
+    const top = highest["top"] === null ? null : asInt(highest, "top");
+    if (top === null || top < lastSeq) {
+      const missing = lastSeq - (top ?? firstSeq - 1);
+      return {
+        ...base,
+        status: "cursor-invalid",
+        nextSince: startOver,
+        hasMore: false,
+        dropped: Math.max(1, missing),
+        events: [],
+      };
+    }
 
-    const scan = await this.readLines(storeId, from, lastSeq);
+    // Two rows past the cap, because the byte budget and not the row count is
+    // usually what ends a page, and the loop needs to see the row that broke it.
+    const rows = this.handle()
+      .prepare(
+        "SELECT seq, ts, payload FROM events WHERE store_id = ? AND seq >= ? ORDER BY seq ASC LIMIT ?",
+      )
+      .all(storeId, from, cappedLimit + 2) as MetaRow[];
+
     const events: SessionEventsResponse["events"] = [];
-    let dropped = scan.skipped + (scan.windowExceeded ? 1 : 0);
+    let dropped = 0;
     let bytes = 0;
     let expected = from;
     let hasMore = false;
     let nextSince = since ?? startOver;
-    for (const record of scan.records) {
-      if (record.seq < expected) {
-        // A log that steps backwards. The clamp keeps `dropped` non-negative:
-        // a negative count failed the response schema and turned a readable
-        // session into a permanent 500 from the API.
-        dropped += 1;
-        continue;
-      }
-      if (record.seq > expected) {
-        // A gap is data loss. It is reported and stepped over rather than
-        // aborting the page: one unreadable record must not make every page
-        // empty, which left a client permanently unable to read its transcript.
-        dropped += record.seq - expected;
-        expected = record.seq;
-      }
-      const size = Buffer.byteLength(JSON.stringify(record), "utf8");
-      if (events.length >= cappedLimit || (events.length > 0 && bytes + size > MAX_PAGE_BYTES)) {
+    for (const row of rows) {
+      if (events.length >= cappedLimit) {
         hasMore = true;
         break;
       }
-      events.push({ seq: record.seq, ts: record.ts, event: record.event });
+      const seq = asInt(row, "seq");
+      if (seq < expected) {
+        // A log that steps backwards. The clamp keeps `dropped` non-negative: a
+        // negative count failed the response schema and turned a readable session
+        // into a permanent 500 from the API.
+        dropped += 1;
+        continue;
+      }
+      if (seq > expected) {
+        // A gap is data loss. It is reported and stepped over rather than aborting
+        // the page: one unreadable record must not make every page empty, which
+        // left a client permanently unable to read its transcript.
+        dropped += seq - expected;
+        expected = seq;
+      }
+      const ts = asText(row, "ts") ?? "";
+      const payload = asText(row, "payload");
+      if (payload === null) {
+        dropped += 1;
+        expected = seq + 1;
+        continue;
+      }
+      const event = looseEvent(payload);
+      if (event === null) {
+        // Unreadable and unparseable: reported and stepped over, never fatal. One
+        // bad record must not make every page empty, which left a client
+        // permanently unable to read its transcript.
+        dropped += 1;
+        expected = seq + 1;
+        continue;
+      }
+      const size = Buffer.byteLength(payload, "utf8");
+      if (events.length > 0 && bytes + size > MAX_PAGE_BYTES) {
+        hasMore = true;
+        break;
+      }
+      events.push({ seq, ts, event });
       bytes += size;
-      nextSince = record.seq;
-      expected = record.seq + 1;
+      nextSince = seq;
+      expected = seq + 1;
     }
-    if (scan.sawPartialTail) dropped += 1;
+    if (events.length === 0 && rows.length > 0) {
+      // Every row on this page was unreadable, and the cursor cannot advance past
+      // one. Refusing to say there is more strands everything after it, and the
+      // browser stops with a transcript that ends where the first bad record
+      // begins. Saying there is more with an unchanged cursor is the mirror image:
+      // a client that follows it asks the same question and gets the same answer.
+      //
+      // So the unreadable page is terminal, and says so in the only way the
+      // contract can express: no more pages, and every record that could not be
+      // rendered counted as lost. A transcript that stops at an unreadable record
+      // is visibly shorter than one that lies about being complete.
+      hasMore = false;
+    } else if (rows.length > events.length && !hasMore) {
+      hasMore = nextSince > (since ?? startOver);
+    }
+    const totalDropped = dropped + drift;
     return {
       storeId,
-      status: events.length === 0 && !hasMore ? (dropped > 0 ? "cursor-invalid" : "up-to-date") : "appended",
+      // "appended" with no events is a lie: nothing was appended to this reader.
+      // A page that served nothing is either caught up or entirely unreadable, and
+      // those have different repairs, which is what the two statuses say.
+      status:
+        events.length === 0
+          ? totalDropped > 0
+            ? "cursor-invalid"
+            : "up-to-date"
+          : "appended",
       firstSeq,
       lastSeq,
       nextSince,
       hasMore,
-      dropped,
+      dropped: totalDropped,
       events,
     };
-  }
-
-  private async readLines(
-    storeId: string,
-    fromSeq: number,
-    lastSeq: number,
-  ): Promise<{
-    records: StoredEventRecord[];
-    skipped: number;
-    sawPartialTail: boolean;
-    windowExceeded: boolean;
-  }> {
-    const empty = { records: [], skipped: 0, sawPartialTail: false, windowExceeded: false };
-    const target = this.eventsPath(storeId);
-    let handle: fsp.FileHandle;
-    try {
-      handle = await fsp.open(target, fs.constants.O_RDONLY);
-    } catch (cause) {
-      this.report("E_STORE_WRITABLE", `could not read ${storeId}: ${String(cause)}`);
-      // The index says records exist, so an unreadable log is not "caught up".
-      return { ...empty, skipped: this.index.get(storeId)?.lastSeq ?? 0 };
-    }
-    try {
-      const stat = await handle.stat();
-      if (!stat.isFile()) return empty;
-      if (stat.size === 0) {
-        const claimed = this.index.get(storeId)?.lastSeq ?? 0;
-        if (claimed > 0) {
-          this.report("E_STORE_WRITABLE", `log for ${storeId} is empty but the index claims ${claimed} records`);
-          return { ...empty, skipped: claimed };
-        }
-        return empty;
-      }
-      // A log larger than the window means the tail is unreachable. Said out
-      // loud, rather than returning a page that looks complete.
-      if (stat.size > MAX_READ_WINDOW_BYTES) {
-        this.report(
-          "E_STORE_WRITABLE",
-          `log for ${storeId} is ${stat.size} bytes, past the ${MAX_READ_WINDOW_BYTES}-byte read window`,
-        );
-        return { ...empty, skipped: lastSeq, windowExceeded: true };
-      }
-      const buffer = Buffer.allocUnsafe(stat.size);
-      const { bytesRead } = await handle.read(buffer, 0, stat.size, 0);
-      const text = buffer.subarray(0, bytesRead).toString("utf8");
-      const lastNewline = text.lastIndexOf("\n");
-      // Everything after the final newline is an in-flight append and is not
-      // yet a record.
-      const complete = lastNewline === -1 ? "" : text.slice(0, lastNewline);
-      const sawPartialTail = lastNewline === -1 && bytesRead > 0;
-      const records: StoredEventRecord[] = [];
-      let skipped = 0;
-      if (complete.length === 0) return { records, skipped, sawPartialTail, windowExceeded: false };
-      for (const line of complete.split("\n")) {
-        if (line.length === 0) continue;
-        let parsed: unknown;
-        try {
-          parsed = JSON.parse(line);
-        } catch {
-          skipped += 1;
-          continue;
-        }
-        const result = StoredEventRecordSchema.safeParse(parsed);
-        // An unreadable line is skipped and counted, not fatal: one bad record
-        // must not hide the rest of the transcript.
-        if (!result.success) {
-          skipped += 1;
-          continue;
-        }
-        if (result.data.seq < fromSeq) continue;
-        if (result.data.seq > lastSeq) break;
-        records.push(result.data);
-      }
-      return { records, skipped, sawPartialTail, windowExceeded: false };
-    } finally {
-      await handle.close();
-    }
   }
 
   // --- attachments ---
   // k5 holds the bytes; the harness is handed a prompt block. Nothing here ever
   // lets a stored path reach the wire, because the manifest is the only thing the
-  // turn carries and it names no file.
+  // turn carries and it names no file. There are no paths at all now: the bytes
+  // and the manifest that describes them are one row, so they cannot disagree.
 
   /**
-   * Writes one attachment into the session's spool and returns the manifest k5
-   * will believe about it.
+   * Writes one attachment and returns the manifest k5 will believe about it.
    *
    * `kind` and `size` are derived from the bytes the server just received, never
    * from what the client claimed in `?mime=`: a client that says "text/plain"
    * about a binary would otherwise make the harness inline garbage as text, and
-   * the durable transcript would record a size that never arrived. Only `name`
-   * is the client's, because only the client knows it.
+   * the durable transcript would record a size that never arrived. Only `name` is
+   * the client's, because only the client knows it.
    */
   async spoolAttachment(
     storeId: string,
@@ -1207,11 +1329,13 @@ export class SessionStore {
     },
   ): Promise<AttachmentManifestEntry> {
     this.assertOpen();
-    const dir = await this.liveSessionDir(storeId);
+    if (this.meta(storeId) === null) {
+      throw new SessionStoreError("E_STORE_UNKNOWN_SESSION", `no stored session ${storeId}`);
+    }
     if (input.bytes.length > MAX_ATTACHMENT_BYTES) {
       throw new SessionStoreError(
         "E_STORE_QUOTA",
-        `an attachment of ${input.bytes.length} bytes is over the ${MAX_ATTACHMENT_BYTES}-byte cap`,
+        `an attachment of ${String(input.bytes.length)} bytes is over the ${String(MAX_ATTACHMENT_BYTES)}-byte cap`,
       );
     }
     // Checked against the whole-store ceiling rather than only the per-file cap:
@@ -1220,7 +1344,7 @@ export class SessionStore {
     if (this.storeBytes + input.bytes.length > this.maxStoreBytes) {
       throw new SessionStoreError(
         "E_STORE_QUOTA",
-        `the session store reached its ${this.maxStoreBytes}-byte cap; ${storeId} has no room for an attachment`,
+        `the session store reached its ${String(this.maxStoreBytes)}-byte cap; ${storeId} has no room for an attachment`,
       );
     }
     const manifest = AttachmentManifestEntrySchema.safeParse({
@@ -1239,74 +1363,75 @@ export class SessionStore {
         `unusable attachment manifest: ${manifest.error.issues[0]?.message ?? "unknown"}`,
       );
     }
-    for (const sub of [ATTACHMENT_BYTES_DIR, ATTACHMENT_MANIFEST_DIR]) {
-      await fsp.mkdir(path.join(dir, sub), { recursive: true, mode: 0o700 });
+    // The id is no longer a path component, so there is nothing for it to escape.
+    // It is still a caller-named key, and it is still the thing a URL segment
+    // names, so the shapes that would make a stored row impossible to address
+    // again are refused here rather than relied on upstream. The separator check
+    // is explicit because the predicate judges one segment by design and cannot
+    // see one.
+    if (input.attachmentId.includes("/") || input.attachmentId.includes("\\")) {
+      throw new SessionStoreError("E_STORE_PATH_ESCAPE", "unsafe attachment id (separator)");
     }
+    const reason = unsafeNameReason(input.attachmentId);
+    if (reason !== null) {
+      throw new SessionStoreError("E_STORE_PATH_ESCAPE", `unsafe attachment id (${reason})`);
+    }
+    const charged = manifest.data.size + Buffer.byteLength(JSON.stringify(manifest.data), "utf8");
     try {
-      await this.publishFile(this.attachmentPath(storeId, input.attachmentId), input.bytes);
-      await this.publishFile(
-        this.attachmentManifestPath(storeId, input.attachmentId),
-        `${JSON.stringify(manifest.data)}\n`,
-      );
+      this.handle()
+        .prepare(
+          `INSERT INTO attachments
+             (store_id, attachment_id, name, mime_type, kind, size, manifest_bytes, body)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          storeId,
+          input.attachmentId,
+          input.name,
+          input.mimeType,
+          manifest.data.kind,
+          manifest.data.size,
+          Buffer.byteLength(JSON.stringify(manifest.data), "utf8"),
+          input.bytes,
+        );
     } catch (cause) {
-      throw cause instanceof SessionStoreError
-        ? cause
-        : new SessionStoreError(
-            "E_STORE_WRITABLE",
-            `could not spool an attachment for ${storeId}: ${String(cause)}`,
-          );
+      throw new SessionStoreError(
+        "E_STORE_WRITABLE",
+        `could not spool an attachment for ${storeId}: ${String(cause)}`,
+      );
     }
-    // Accrued only after both files are published, so a failed write charges
-    // nothing. The manifest is charged with the bytes because it shares the disk.
-    const charged = manifest.data.size + Buffer.byteLength(`${JSON.stringify(manifest.data)}\n`);
+    // Accrued only after the row is written, so a failed write charges nothing.
     this.storeBytes += charged;
-    this.spoolBytes.set(storeId, (this.spoolBytes.get(storeId) ?? 0) + charged);
     return manifest.data;
-  }
-
-  /** Gives a session's spooled bytes back to the store budget. */
-  private releaseSpool(storeId: string): void {
-    const held = this.spoolBytes.get(storeId);
-    if (held === undefined) return;
-    this.storeBytes = Math.max(0, this.storeBytes - held);
-    this.spoolBytes.delete(storeId);
   }
 
   /**
    * The manifest a spooled attachment was stored under, keyed by the id alone.
    *
    * The browser names an attachment by id, so this is the only way the name and
-   * mime it was given at upload can reach the turn that uses it. It is re-read
-   * rather than remembered: an in-memory table would lose every attachment across
-   * a restart, and the turn would then silently run without the bytes the user
-   * attached.
+   * mime it was given at upload can reach the turn that uses it. Re-read from the
+   * row rather than remembered: an in-memory table would lose every attachment
+   * across a restart, and the turn would then silently run without the bytes the
+   * user attached.
    */
   async attachmentManifest(
     storeId: string,
     attachmentId: string,
   ): Promise<AttachmentManifestEntry> {
-    // The path is resolved outside the try, so a refused id stays a path refusal
-    // rather than being reported as an attachment that is merely not there.
-    const target = this.attachmentManifestPath(storeId, attachmentId);
-    let text: string;
-    try {
-      text = await fsp.readFile(target, "utf8");
-    } catch (cause) {
+    const row = this.attachmentRow(storeId, attachmentId);
+    if (row === null) {
       throw new SessionStoreError(
         "E_STORE_UNKNOWN_ATTACHMENT",
-        `no attachment ${attachmentId} in session ${storeId}: ${String(cause)}`,
+        `no attachment ${attachmentId} in session ${storeId}`,
       );
     }
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(text);
-    } catch (cause) {
-      throw new SessionStoreError(
-        "E_STORE_UNKNOWN_ATTACHMENT",
-        `the manifest for ${attachmentId} is unreadable: ${String(cause)}`,
-      );
-    }
-    const manifest = AttachmentManifestEntrySchema.safeParse(parsed);
+    const manifest = AttachmentManifestEntrySchema.safeParse({
+      attachmentId: asText(row, "attachment_id") ?? attachmentId,
+      name: asText(row, "name") ?? "",
+      mimeType: asText(row, "mime_type") ?? "",
+      kind: asText(row, "kind") ?? "binary",
+      size: asInt(row, "size"),
+    });
     if (!manifest.success) {
       throw new SessionStoreError(
         "E_STORE_UNKNOWN_ATTACHMENT",
@@ -1317,137 +1442,408 @@ export class SessionStore {
   }
 
   async readAttachment(storeId: string, attachmentId: string): Promise<Buffer> {
-    const target = this.attachmentPath(storeId, attachmentId);
-    try {
-      return await fsp.readFile(target);
-    } catch (cause) {
+    const row = this.attachmentRow(storeId, attachmentId);
+    if (row === null) {
       throw new SessionStoreError(
         "E_STORE_UNKNOWN_ATTACHMENT",
-        `no attachment ${attachmentId} in session ${storeId}: ${String(cause)}`,
+        `no attachment ${attachmentId} in session ${storeId}`,
       );
     }
+    const body = row["body"];
+    if (body instanceof Uint8Array) return Buffer.from(body);
+    if (body instanceof ArrayBuffer) return Buffer.from(new Uint8Array(body));
+    throw new SessionStoreError(
+      "E_STORE_UNKNOWN_ATTACHMENT",
+      `the bytes for ${attachmentId} are not in the expected shape`,
+    );
   }
 
   /** The reverse state for an upload that was never used. */
   async discardAttachment(storeId: string, attachmentId: string): Promise<boolean> {
-    const target = this.attachmentPath(storeId, attachmentId);
-    let existed = true;
-    let charged = 0;
-    try {
-      // The size is read before the unlink, because afterwards there is nothing
-      // left to measure and the store would keep charging for bytes it no longer
-      // has on disk.
-      const stat = await fsp.stat(target);
-      existed = true;
-      charged = stat.size;
-      try {
-        const manifest = await this.attachmentManifest(storeId, attachmentId);
-        charged += Buffer.byteLength(`${JSON.stringify(manifest)}\n`);
-      } catch {
-        // The bytes are gone either way; charging only the payload is better than
-        // charging nothing and drifting high.
-      }
-    } catch {
-      existed = false;
-    }
-    await fsp.rm(target, { force: true });
-    await fsp.rm(this.attachmentManifestPath(storeId, attachmentId), { force: true });
-    if (charged > 0) {
-      this.storeBytes = Math.max(0, this.storeBytes - charged);
-      this.spoolBytes.set(storeId, Math.max(0, (this.spoolBytes.get(storeId) ?? 0) - charged));
-    }
-    return existed;
+    if (this.db === null) return false;
+    const row = this.attachmentRow(storeId, attachmentId);
+    if (row === null) return false;
+    // The charge is read before the delete, because afterwards there is nothing
+    // left to measure and the store would keep charging for bytes it no longer has.
+    const charged = asInt(row, "size") + asInt(row, "manifest_bytes");
+    this.handle()
+      .prepare("DELETE FROM attachments WHERE store_id = ? AND attachment_id = ?")
+      .run(storeId, attachmentId);
+    this.storeBytes = Math.max(0, this.storeBytes - charged);
+    return true;
   }
 
-  private async liveSessionDir(storeId: string): Promise<string> {
-    if (this.index.get(storeId) === undefined) {
-      throw new SessionStoreError("E_STORE_UNKNOWN_SESSION", `no stored session ${storeId}`);
-    }
-    const dir = this.dirFor(storeId);
-    // Stat, never mkdir -p: spooling into a session the user deleted would be a
-    // deleted session quietly back, which is the same resurrection `append`
-    // refuses at the index lookup.
-    try {
-      await fsp.stat(dir);
-    } catch {
-      throw new SessionStoreError(
-        "E_STORE_UNKNOWN_SESSION",
-        `stored session ${storeId} has no directory on disk`,
-      );
-    }
-    return dir;
-  }
-
-  /**
-   * Publishes a file by rename, so a reader never sees half of one.
-   *
-   * The temp name is unpredictable and opened O_EXCL, for the same reason
-   * writeMeta's is: a harness running agent-supplied code shares this uid, so a
-   * predictable temp name is an arbitrary-file-overwrite primitive. A torn
-   * attachment would be worse than a missing one, because the manifest says it
-   * is there.
-   */
-  private async publishFile(target: string, contents: Buffer | string): Promise<void> {
-    const noFollow = fs.constants.O_NOFOLLOW ?? 0;
-    const tmp = path.join(
-      path.dirname(target),
-      `.${path.basename(target)}.${randomUUID()}.tmp`,
-    );
-    const handle = await fsp.open(
-      tmp,
-      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | noFollow,
-      0o600,
-    );
-    try {
-      await handle.writeFile(contents);
-      await handle.sync();
-    } finally {
-      await handle.close();
-    }
-    try {
-      await fsp.rename(tmp, target);
-    } catch (cause) {
-      await fsp.rm(tmp, { force: true }).catch(() => {});
-      throw cause;
-    }
+  private attachmentRow(storeId: string, attachmentId: string): MetaRow | null {
+    if (this.db === null) return null;
+    // Resolved through a query rather than a path, so there is no path to escape
+    // and a hostile id is a missing row rather than a file read.
+    const row = this.handle()
+      .prepare(
+        "SELECT attachment_id, name, mime_type, kind, size, manifest_bytes, body FROM attachments WHERE store_id = ? AND attachment_id = ?",
+      )
+      .get(storeId, attachmentId) as MetaRow | undefined;
+    return row === undefined ? null : row;
   }
 
   /** Removes k5's own record. Never touches the harness's session. */
   async remove(storeId: string): Promise<boolean> {
-    const meta = this.index.get(storeId);
-    if (meta === undefined) return false;
-    // Removed from the index first, so a concurrent append is refused at the
-    // index lookup and can never recreate what we are about to delete.
-    this.index.delete(storeId);
-    this.storeBytes = Math.max(0, this.storeBytes - meta.bytes);
-    this.releaseSpool(storeId);
-    const writer = this.writers.get(storeId);
-    if (writer !== undefined) {
-      writer.stopped = true;
-      await writer.queue;
-      if (writer.handle !== null) {
-        await writer.handle.close().catch(() => {});
-        writer.handle = null;
-      }
-      this.writers.delete(storeId);
-    }
-    await fsp.rm(this.dirFor(storeId), { recursive: true, force: true });
+    if (this.db === null) return false;
+    // The session's own contribution is read first, and the budget is adjusted by
+    // that. Re-measuring the whole store instead means a full scan of every
+    // payload's length on every delete, which is linear in the size of the store
+    // and runs on the event loop: one DELETE of a small task blocked the server
+    // for the better part of a second on a store holding a gigabyte.
+    const before = this.handle()
+      .prepare(
+        `SELECT s.bytes AS bytes,
+                COALESCE((SELECT SUM(a.size + a.manifest_bytes) FROM attachments a
+                           WHERE a.store_id = s.store_id), 0) AS spooled
+           FROM sessions s WHERE s.store_id = ?`,
+      )
+      .get(storeId) as MetaRow | undefined;
+    if (before === undefined) return false;
+    // The delete itself is a single statement, so the cascade cannot leave events
+    // behind. The read above is for the budget only.
+    const result = this.handle().prepare("DELETE FROM sessions WHERE store_id = ?").run(storeId);
+    if (Number(result.changes) === 0) return false;
+    // The cascade took the events and the attachment bytes with the session.
+    this.storeBytes = Math.max(0, this.storeBytes - asInt(before, "bytes") - asInt(before, "spooled"));
+    this.stopped.delete(storeId);
+    this.live.delete(storeId);
+    this.storeDrifted.delete(storeId);
     return true;
   }
 
-  /** Closes every open handle. A closed handle must not accept another append. */
-  async close(): Promise<void> {
-    for (const [id, writer] of this.writers) {
-      writer.stopped = true;
-      await writer.queue;
-      if (writer.handle !== null) {
-        await writer.handle.close().catch(() => {});
-        writer.handle = null;
-      }
-      this.writers.delete(id);
+  // --- migration from the pre-SQLite store ---
+  //
+  // One import, at open, guarded by the presence of a legacy directory. The old
+  // layout is left in place afterwards: it is a user's transcripts, and deleting
+  // somebody's history because an import succeeded is not a trade this makes on
+  // their behalf. A second open finds nothing to import and pays only a readdir.
+
+  /**
+   * Imports every pre-SQLite session directory it finds.
+   *
+   * Skipped entirely when k5.db already holds sessions, so the import is a
+   * first-open migration and not something that runs against a live store. A
+   * session that is already present is left alone, which makes a re-import after
+   * a partial failure a no-op rather than a duplicate.
+   */
+  private async importLegacyJsonl(): Promise<void> {
+    // Gated on a marker, not on the store being empty.
+    //
+    // "Empty" is the wrong test: a crash, a full disk, or a kill part-way through
+    // an import leaves a database holding one session and the remaining legacy
+    // directories untouched. Gating on emptiness meant the next boot imported
+    // nothing at all, so the rest of a user's transcripts became unreachable with
+    // no diagnostic and no way back, because the legacy files are deliberately
+    // never deleted.
+    //
+    // The marker is written only after every directory has been walked, so it
+    // means "this root has been fully imported", and the per-session existence
+    // check is what makes re-running idempotent.
+    if (this.importDone()) return;
+    let entries: fs.Dirent[];
+    try {
+      entries = await fsp.readdir(this.root, { withFileTypes: true });
+    } catch {
+      return;
     }
+    const candidates = entries.filter((entry) => entry.isDirectory() && !entry.name.startsWith("."));
+    // Nothing to import means the marker is not written. Writing it on an empty root
+    // is a one-way door: a user who later restores a backup of their old session
+    // directories into this root gets a store that reports no tasks while the
+    // transcripts sit right there, unreadable, with nothing to say so.
+    if (candidates.length === 0) return;
+    let sessions = 0;
+    let records = 0;
+    let unreadable = 0;
+    for (const entry of candidates) {
+      const imported = await this.importLegacySession(path.join(this.root, entry.name), entry.name);
+      if (imported === null) continue;
+      sessions += 1;
+      records += imported.records;
+      unreadable += imported.unreadable;
+    }
+    this.markImportDone();
+    if (sessions > 0) {
+      this.report(
+        "E_STORE_WRITABLE",
+        `imported ${String(sessions)} pre-SQLite session(s) and ${String(records)} record(s) from ${this.root}`,
+      );
+    }
+    if (unreadable > 0) {
+      this.report(
+        "E_STORE_CORRUPT_RECORD",
+        `${String(unreadable)} record(s) in ${this.root} did not survive the import; the old files are still there`,
+      );
+    }
+  }
+
+  /** True once this root has been walked in full, whether or not it held anything. */
+  private importDone(): boolean {
+    const row = this.handle()
+      .prepare("SELECT value FROM store_flags WHERE flag = 'legacy-import-done'")
+      .get() as MetaRow | undefined;
+    return row !== undefined;
+  }
+
+  private markImportDone(): void {
+    this.handle()
+      .prepare("INSERT OR REPLACE INTO store_flags (flag, value) VALUES ('legacy-import-done', '1')")
+      .run();
+  }
+
+  /** One legacy directory. Returns what was imported, or null if it was not a session. */
+  private async importLegacySession(
+    dir: string,
+    label: string,
+  ): Promise<{ records: number; unreadable: number } | null> {
+    let raw: string;
+    try {
+      raw = await fsp.readFile(path.join(dir, "meta.json"), "utf8");
+    } catch {
+      // A directory with no readable meta is not a session. Skipping it keeps one
+      // bad file from hiding every other session, here as it did before.
+      return null;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      this.report("E_STORE_META_CORRUPT", `unreadable legacy meta in ${label}`);
+      return null;
+    }
+    const meta = LegacyMetaSchema.safeParse(parsed);
+    if (!meta.success) {
+      // An unknown shape is refused, never coerced forward: a silently defaulted
+      // field renders a session list full of empty cards.
+      this.report(
+        "E_STORE_META_CORRUPT",
+        `unusable legacy meta in ${label}: ${meta.error.issues[0]?.message ?? "unknown"}`,
+      );
+      return null;
+    }
+    if (this.meta(meta.data.storeId) !== null) return null;
+
+    const legacy = await readLegacyEvents(path.join(dir, "events.jsonl"));
+    const db = this.handle();
+    let imported = 0;
+    // A line the record schema refuses is dropped, because a transcript carrying a
+    // record no browser can render is worse than one missing it. It is counted
+    // rather than discarded quietly: the whole reason to import at all is that
+    // this is somebody's history, and a silent drop reads as a successful move.
+    if (legacy.skipped > 0) {
+      this.report(
+        "E_STORE_CORRUPT_RECORD",
+        `skipped ${String(legacy.skipped)} unreadable record(s) while importing ${label}`,
+      );
+    }
+    try {
+      db.exec("BEGIN IMMEDIATE");
+      db.prepare(
+        `INSERT INTO sessions (${SESSION_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        meta.data.storeId,
+        meta.data.harness,
+        meta.data.harnessSessionId,
+        meta.data.projectId,
+        meta.data.projectName,
+        meta.data.cwd,
+        meta.data.title,
+        meta.data.createdAt,
+        meta.data.updatedAt,
+        meta.data.turnCount,
+        meta.data.firstSeq,
+        meta.data.lastSeq,
+        meta.data.bytes,
+        meta.data.truncated ? 1 : 0,
+        meta.data.titleSource,
+        meta.data.endedMidTurn ? 1 : 0,
+      );
+      const insert = db.prepare(
+        "INSERT OR REPLACE INTO events (store_id, seq, ts, payload, bytes) VALUES (?, ?, ?, ?, ?)",
+      );
+      for (const record of legacy.records) {
+        insert.run(
+          meta.data.storeId,
+          record.seq,
+          record.ts,
+          record.payload,
+          record.bytes,
+        );
+        imported += 1;
+      }
+      db.exec("COMMIT");
+    } catch (cause) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {
+        // No transaction was open, which is itself fine.
+      }
+      this.report("E_STORE_WRITABLE", `could not import ${label}: ${String(cause)}`);
+      return null;
+    }
+    return { records: imported, unreadable: legacy.skipped };
+  }
+
+  /** Every row is committed by the time this returns; only the WAL is left to fold in. */
+  async close(): Promise<void> {
+    const db = this.db;
+    if (db === null) return;
     this.ready = false;
+    this.db = null;
+    try {
+      db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    } catch {
+      // The rows are already durable; a checkpoint that will not run is not a
+      // reason to refuse to close.
+    }
+    db.close();
   }
 }
 
-export type { ReplayStatus };
+/**
+ * Whether a session's last event left a turn open.
+ *
+ * A turn-scoped record with nothing terminal after it means the turn never
+ * finished, which is exactly the state a hard kill leaves behind. Checking
+ * whether `turn.started` was seen is not enough: a transcript that begins
+ * mid-stream has turn content and no opening event, so the last record decides.
+ */
+function endsMidTurn(tail: string | null): boolean {
+  if (tail === null) return false;
+  const event = looseEvent(tail);
+  if (event === null) {
+    // An unreadable tail is not evidence of anything, and the row it came from
+    // is already refused by rowToMeta on the next read.
+    return false;
+  }
+  return (
+    event.type === "turn.started" ||
+    event.type === "turn.delta" ||
+    event.type === "tool.updated"
+  );
+}
+
+/**
+ * The last resort for a payload that no longer satisfies the stored record
+ * schema: a forward-compatible read of a `type`/`sessionId` pair. Anything else
+ * is refused, because rendering half an event is worse than reporting it lost.
+ */
+function looseEvent(payload: string): ServerEvent | null {
+  try {
+    const parsed: unknown = JSON.parse(payload);
+    if (typeof parsed !== "object" || parsed === null) return null;
+    const type = (parsed as { type?: unknown }).type;
+    const sessionId = (parsed as { sessionId?: unknown }).sessionId;
+    if (typeof type !== "string" || typeof sessionId !== "string") return null;
+    const candidate = { ...(parsed as Record<string, unknown>), type, sessionId };
+    const result = StoredEventRecordSchema.shape.event.safeParse(candidate);
+    return result.success ? result.data : null;
+  } catch {
+    return null;
+  }
+}
+
+// --- migration from the pre-SQLite store ---
+//
+// One import, at open, guarded by the presence of a legacy directory. The old
+// layout is left in place afterwards: it is a user's transcripts, and deleting
+// somebody's history because an import succeeded is not a trade this makes on
+// their behalf. A second open finds nothing to import and pays only a readdir.
+
+interface LegacyMeta {
+  readonly storeId: string;
+  readonly harness: string;
+  readonly harnessSessionId: string;
+  readonly projectId: string;
+  readonly projectName: string | null;
+  readonly cwd: string;
+  readonly title: string;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+  readonly turnCount: number;
+  readonly firstSeq: number;
+  readonly lastSeq: number;
+  readonly bytes: number;
+  readonly truncated: boolean;
+  readonly titleSource: "none" | "prompt" | "harness";
+  readonly endedMidTurn: boolean;
+}
+
+const LegacyMetaSchema = z
+  .object({
+    // The old meta carried a version, and refusing it as an unknown key is what
+    // made this refuse every real legacy file rather than the two that happen to
+    // parse.
+    v: z.literal(META_VERSION),
+    storeId: z.string().min(1).max(64),
+    harness: z.string().min(1).max(64),
+    harnessSessionId: z.string().min(1).max(256),
+    projectId: z.string().min(1).max(256),
+    projectName: z.string().min(1).max(200).nullable(),
+    cwd: z.string().min(1).max(4096),
+    title: z.string().min(1).max(200),
+    createdAt: z.string().min(1).max(64),
+    updatedAt: z.string().min(1).max(64),
+    turnCount: z.number().int().nonnegative(),
+    firstSeq: z.number().int().nonnegative(),
+    lastSeq: z.number().int().nonnegative(),
+    bytes: z.number().int().nonnegative(),
+    truncated: z.boolean(),
+    titleSource: z.enum(["none", "prompt", "harness"]),
+    endedMidTurn: z.boolean(),
+  })
+  .strict();
+
+/**
+ * Reads a legacy log whole, dropping a torn final line exactly as a reader did.
+ *
+ * The line is stored verbatim as the event payload, so an imported record
+ * re-serialises byte for byte and the byte accounting the old meta carried stays
+ * true.
+ */
+async function readLegacyEvents(
+  file: string,
+): Promise<{ records: { seq: number; ts: string; payload: string; bytes: number }[]; skipped: number }> {
+  let text: string;
+  try {
+    text = await fsp.readFile(file, "utf8");
+  } catch {
+    return { records: [], skipped: 0 };
+  }
+  // Everything after the final newline is an in-flight append and was never a
+  // record, so it is not imported.
+  const lastNewline = text.lastIndexOf("\n");
+  const complete = lastNewline === -1 ? "" : text.slice(0, lastNewline);
+  const out: { seq: number; ts: string; payload: string; bytes: number }[] = [];
+  let skipped = 0;
+  for (const line of complete.split("\n")) {
+    if (line.length === 0) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(line);
+    } catch {
+      skipped += 1;
+      continue;
+    }
+    const record = StoredEventRecordSchema.safeParse(parsed);
+    if (!record.success) {
+      skipped += 1;
+      continue;
+    }
+    out.push({
+      seq: record.data.seq,
+      ts: record.data.ts,
+      // The event on its own: `payload` is the event, because that is what every
+      // row written by append() holds.
+      payload: JSON.stringify(record.data.event),
+      // The line as it stood on disk, newline included. The old accounting
+      // measured the file, so importing the old numbers keeps the session's byte
+      // count true to what it was before the move.
+      bytes: Buffer.byteLength(line, "utf8") + 1,
+    });
+  }
+  return { records: out, skipped };
+}

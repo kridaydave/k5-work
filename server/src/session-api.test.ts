@@ -11,6 +11,7 @@ import { createApp, type K5App } from "./app.js";
 import { loadServerConfig } from "./env.js";
 import { SessionStoreError } from "./store/errors.js";
 import { SessionStore } from "./store/session-store.js";
+import type { DatabaseSync } from "node:sqlite";
 import type { AcceptedConnection, ConnectionHandlers } from "./ws/gateway.js";
 
 interface Harness {
@@ -31,11 +32,52 @@ function tempHome(prefix: string): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
 
-async function sessionDirName(root: string): Promise<string> {
-  const entries = await fsp.readdir(root, { withFileTypes: true });
-  const dir = entries.find((entry) => entry.isDirectory());
-  assert.ok(dir, "expected a session directory");
-  return dir.name;
+/**
+ * A second connection to the store, for the tests that need a state the store
+ * itself will not produce.
+ *
+ * The busy timeout matters: without it this connection fails with SQLITE_BUSY the
+ * moment the store holds the write lock, which is a test failure that looks like a
+ * bug in the thing under test.
+ */
+async function withSecondConnection(
+  root: string,
+  run: (db: DatabaseSync) => void,
+): Promise<void> {
+  const { DatabaseSync: Sqlite } = await import("node:sqlite");
+  const db = new Sqlite(path.join(root, "k5.db"), { timeout: 5_000 });
+  try {
+    db.exec("PRAGMA foreign_keys = ON");
+    run(db);
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * Deletes a session row without telling the store, which is the case where a store
+ * that recreated on demand would hand the user back a session they deleted.
+ *
+ * There is no cached row to mislead anything here: the store re-reads the session
+ * on every call, so this models a deletion from another process, not a stale view.
+ */
+async function removeBehindStoresBack(root: string, storeId: string): Promise<void> {
+  await withSecondConnection(root, (db) => {
+    db.prepare("DELETE FROM sessions WHERE store_id = ?").run(storeId);
+  });
+}
+
+/** Counts the rows a table holds, for asserting that a refused write left nothing. */
+async function rowCount(
+  root: string,
+  table: "events" | "attachments" | "sessions",
+): Promise<number> {
+  let total = 0;
+  await withSecondConnection(root, (db) => {
+    const row = db.prepare(`SELECT COUNT(*) AS total FROM ${table}`).get() as { total: number };
+    total = Number(row.total);
+  });
+  return total;
 }
 
 /**
@@ -370,6 +412,7 @@ test("a wrong method is refused with an Allow header naming what is supported", 
       method: "DELETE",
     });
     assert.equal(sub.status, 405);
+    assert.equal(sub.allow, "GET", "and it says so, rather than inheriting its parent's DELETE");
   } finally {
     await harness.close();
   }
@@ -424,7 +467,7 @@ test("an upload is answered with a manifest the server derived, and the bytes ar
     assert.equal(manifest.mimeType, "text/plain");
     assert.equal(manifest.kind, "binary", "kind comes from the bytes, not the declared mime");
     assert.equal(manifest.size, 4);
-    assert.equal(manifest.attachmentId.length > 0, true);
+    assert.ok(manifest.attachmentId.length > 0, "the server mints the id, never the client");
     // And the id really addresses the bytes on disk, which is what a later prompt
     // depends on.
     assert.deepEqual(await harness.store.readAttachment(session.storeId, manifest.attachmentId), png);
@@ -468,10 +511,9 @@ test("an upload over the byte cap is refused, and an unknown session is a 404", 
       { method: "POST", body: Buffer.alloc(MAX_ATTACHMENT_BYTES + 1) },
     );
     assert.equal(tooLarge.status, 413, "the cap is enforced before the bytes are stored");
-    const dir = path.join(harness.root, await sessionDirName(harness.root));
-    assert.deepEqual(
-      (await fsp.readdir(dir)).filter((name) => name !== "meta.json" && name !== "events.jsonl"),
-      [],
+    assert.equal(
+      await rowCount(harness.root, "attachments"),
+      0,
       "and nothing was written",
     );
 
@@ -520,10 +562,10 @@ test("a session removed mid-flight does not come back through an upload", async 
       cwd: "/tmp/p",
       title: "Vanishing",
     });
-    // Removed behind the store's back, so the index still names it: a store that
-    // mkdir -p'd here would hand the user back a session they deleted.
-    const dir = path.join(harness.root, await sessionDirName(harness.root));
-    await fsp.rm(dir, { recursive: true, force: true });
+    // Removed behind the store's back, so the store's handle still believes it
+    // exists: a store that inserted on demand would hand the user back a session
+    // they deleted.
+    await removeBehindStoresBack(harness.root, session.storeId);
 
     const query = new URLSearchParams({ name: "a.txt", mime: "text/plain" });
     const refused = await send(
@@ -532,17 +574,29 @@ test("a session removed mid-flight does not come back through an upload", async 
       { method: "POST", body: Buffer.from("x") },
     );
     assert.equal(refused.status, 404);
-    assert.deepEqual(await fsp.readdir(harness.root), [], "the directory must stay gone");
+    assert.equal(
+      await rowCount(harness.root, "sessions"),
+      0,
+      "and the session must stay gone",
+    );
 
     // And the honest removal refuses the same way, without recreating anything.
-    assert.equal(await harness.store.remove(session.storeId), true);
+    const second = await harness.store.create({
+      harness: "opencode",
+      harnessSessionId: "ses_2",
+      projectId: "p",
+      projectName: null,
+      cwd: "/tmp/p",
+      title: "Vanishing too",
+    });
+    assert.equal(await harness.store.remove(second.storeId), true);
     const afterRemove = await send(
       harness.url,
-      `/api/sessions/${session.storeId}/attachments?${query.toString()}`,
+      `/api/sessions/${second.storeId}/attachments?${query.toString()}`,
       { method: "POST", body: Buffer.from("x") },
     );
     assert.equal(afterRemove.status, 404);
-    assert.deepEqual(await fsp.readdir(harness.root), []);
+    assert.equal(await rowCount(harness.root, "sessions"), 0);
   } finally {
     await harness.close();
   }

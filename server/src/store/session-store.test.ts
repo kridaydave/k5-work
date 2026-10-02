@@ -4,10 +4,10 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import type { ServerEvent } from "@k5-work/shared";
-import { MAX_ATTACHMENT_BYTES } from "@k5-work/shared";
+import { MAX_ATTACHMENT_BYTES, SessionEventsResponseSchema } from "@k5-work/shared";
 import {
-  MAX_READ_WINDOW_BYTES,
   MAX_SESSION_BYTES,
   MAX_STORE_BYTES,
   MAX_LINE_BYTES,
@@ -15,8 +15,13 @@ import {
   sanitizeTitle,
 } from "./session-store.js";
 import { SessionStoreError } from "./errors.js";
-import { SessionEventsResponseSchema } from "@k5-work/shared";
 import { unsafeNameReason, isSafeNameSegment } from "./safe-name.js";
+
+// The store's contract, asserted through its public surface. Where a test needs a
+// database state a transaction would never produce (a summary that lags its own
+// events, a payload that will not parse), it writes that state with a second
+// connection rather than by damaging a file, because damaging a file is no longer
+// something this store can be put into by accident.
 
 function tempRoot(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "k5-store-"));
@@ -59,62 +64,130 @@ function delta(seq: number, text: string): ServerEvent {
   };
 }
 
-function logPathOf(root: string): Promise<string> {
-  return fsp
-    .readdir(root, { withFileTypes: true })
-    .then((entries) => {
-      const dir = entries.find((e) => e.isDirectory());
-      assert.ok(dir, "expected a session directory");
-      return path.join(root, dir.name, "events.jsonl");
-    });
+const DB_NAME = "k5.db";
+
+/**
+ * A second connection to the same database, for writing states the store would
+ * never create. Used only by the tests below that model corruption or an unclean
+ * exit; every other test goes through the store.
+ */
+function poke(root: string, run: (db: DatabaseSync) => void): void {
+  const db = new DatabaseSync(path.join(root, DB_NAME));
+  try {
+    db.exec("PRAGMA foreign_keys = ON");
+    run(db);
+  } finally {
+    db.close();
+  }
 }
 
-function metaPathOf(root: string): Promise<string> {
-  return fsp
-    .readdir(root, { withFileTypes: true })
-    .then((entries) => {
-      const dir = entries.find((e) => e.isDirectory());
-      assert.ok(dir, "expected a session directory");
-      return path.join(root, dir.name, "meta.json");
+/**
+ * What is in the store root. SQLite keeps a write-ahead log beside the database
+ * while it is open, so "one file" is not literally true and the assertion is that
+ * nothing but k5's own database is there, which is the property that matters.
+ */
+const storeRootEntries = (root: string): Promise<string[]> =>
+  fsp.readdir(root).then((entries) => entries.sort());
+
+const DB_AND_SIDECARS = ["k5.db", "k5.db-shm", "k5.db-wal"];
+
+// --- one file, and nothing derived from anything a harness controls ---
+
+test("the store is one database file, and no harness string reaches the filesystem", async () => {
+  // The old layout built a directory per session out of a hash, and spooled
+  // attachments into named files. Every path guard that needed was a guard against
+  // a harness-controlled string becoming a path component. There are no paths now
+  // but the root and the database file, so a session recorded from a project whose
+  // ids are a traversal attempt is stored exactly like any other.
+  await withStore(async (store, root) => {
+    const session = await newSession(store, {
+      harnessSessionId: "../../../../etc/passwd",
+      projectId: "..",
+      title: "traversal attempt",
+      cwd: "/tmp",
     });
-}
+    store.append(session.storeId, delta(1, "contained"));
+    await store.flushMeta(session.storeId);
 
-function sessionDirOf(root: string): Promise<string> {
-  return fsp
-    .readdir(root, { withFileTypes: true })
-    .then((entries) => {
-      const dir = entries.find((e) => e.isDirectory());
-      assert.ok(dir, "expected a session directory");
-      return path.join(root, dir.name);
-    });
-}
+    assert.deepEqual(await storeRootEntries(root), DB_AND_SIDECARS, "and nothing else");
+    assert.equal(store.summary(session.storeId)?.harness, "opencode");
+    const page = await store.read(session.storeId, null);
+    assert.equal(page.events.length, 1);
+  });
+});
 
-// --- configuration that would silently break reads ---
+test("the store root and every database file are not readable by anyone else", async () => {
+  // Transcripts are agent output: source code, and whatever the agent read.
+  // SQLite creates its files 0644 honouring only the umask, so the store has to
+  // tighten them, and the sidecars have to be included because one created after
+  // a reconnect takes its mode from the database file.
+  await withStore(async (store, root) => {
+    const session = await newSession(store);
+    store.append(session.storeId, delta(1, "secret"));
+    await store.flushMeta(session.storeId);
+    assert.equal((await fsp.stat(root)).mode & 0o777, 0o700, "the root");
+    for (const name of await storeRootEntries(root)) {
+      assert.equal(
+        (await fsp.stat(path.join(root, name))).mode & 0o777,
+        0o600,
+        `${name} must not be readable by anyone else`,
+      );
+    }
+  });
+});
 
-test("a configured cap at or above the read window is refused", () => {
-  // The window is what makes every stored byte reachable. Configuring a session
-  // cap that exceeds it produces a log whose tail no read can reach, so the
-  // configuration is refused rather than trusted.
-  assert.ok(MAX_SESSION_BYTES < MAX_READ_WINDOW_BYTES, "the defaults must satisfy the invariant");
-  assert.throws(
-    () => new SessionStore({ root: tempRoot(), maxSessionBytes: MAX_READ_WINDOW_BYTES }),
-    (error: unknown) => error instanceof SessionStoreError && error.code === "E_STORE_ROOT",
-  );
-  assert.throws(
-    () => new SessionStore({ root: tempRoot(), maxSessionBytes: MAX_READ_WINDOW_BYTES * 4 }),
-    (error: unknown) => error instanceof SessionStoreError && error.code === "E_STORE_ROOT",
-  );
-  // A cap just under the window is accepted.
-  assert.doesNotThrow(() => new SessionStore({ root: tempRoot(), maxSessionBytes: MAX_READ_WINDOW_BYTES - 1 }));
+test("a reopened store tightens the modes again after the sidecars are recreated", async () => {
+  // A close folds the write-ahead log away, so the next open creates fresh
+  // sidecars. If the store only tightened them on the first open, everything
+  // after that would be 0644.
+  const root = tempRoot();
+  try {
+    for (const run of [0, 1]) {
+      const store = new SessionStore({ root, onError: () => {} });
+      await store.open();
+      try {
+        const session = await newSession(store, { title: `run ${run}` });
+        store.append(session.storeId, delta(1, "secret"));
+        await store.flushMeta(session.storeId);
+      } finally {
+        await store.close();
+      }
+      for (const name of await storeRootEntries(root)) {
+        assert.equal(
+          (await fsp.stat(path.join(root, name))).mode & 0o777,
+          0o600,
+          `run ${run}: ${name}`,
+        );
+      }
+    }
+  } finally {
+    await fsp.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("the name predicate refuses every hazard ooxml-core already refuses", () => {
+  for (const bad of [
+    "", ".", "..", " ", "trailing.", "trailing ", "with\nnewline", "with\ttab",
+    "nul\u0000byte", "del\u007f", "c1\u0085", "con", "NUL", "com1", "lpt9",
+    "__proto__", "C:", "sess:ion", "zero\u200bwidth", "bidi\u202eoverride",
+    "a".repeat(256),
+  ]) {
+    assert.equal(isSafeNameSegment(bad), false, `${JSON.stringify(bad)} should be refused`);
+  }
+  for (const good of ["s-" + "a".repeat(34), "events.jsonl", "meta.json", "0", "a.b.c"]) {
+    assert.equal(isSafeNameSegment(good), true, `${JSON.stringify(good)} should be allowed`);
+  }
+  // A NUL byte must be a refusal, not a TypeError from deep inside a write.
+  assert.equal(unsafeNameReason("a\u0000b"), "control");
 });
 
 // --- append integrity ---
 
-test("concurrent appends stay parseable and page without loss or reorder", async () => {
-  // fs.appendFile is not atomic for big lines: measured on this stack, 32
-  // concurrent appenders stayed clean at 300 KB/line and left every line
-  // internally scrambled at 600 KB/line, with no bytes lost and no error. The
-  // serial per-session queue is the fix, so the queue is what is under test.
+test("rapid appends page without loss, reorder or a gap", async () => {
+  // The old append path was a queued O_APPEND write per event, which is not atomic
+  // for large lines and needed a per-session queue to stay parseable. Here every
+  // append is its own transaction, so the queue is gone and only the ordering is
+  // left to check.
   await withStore(async (store) => {
     const session = await newSession(store);
     const count = 300;
@@ -141,29 +214,22 @@ test("concurrent appends stay parseable and page without loss or reorder", async
 
 test("an append for an unknown session creates nothing and throws nothing", async () => {
   // The emit path in session-service is synchronous, so this is un-awaited. If
-  // it could reject, an ENOENT here would become an unhandledRejection and Node
-  // would exit, orphaning every live harness child.
-  const root = tempRoot();
-  const store = new SessionStore({ root });
-  await store.open();
-  try {
+  // it could throw, an error here would escape into the emit and take every live
+  // harness child with it.
+  await withStore(async (store, root) => {
     assert.doesNotThrow(() => {
       store.append("00000000-0000-4000-8000-000000000000", delta(1, "hello"));
     });
-    // Drain, because the promise the store did not return is where a rejection
-    // would surface.
     await new Promise((resolve) => setImmediate(resolve));
-    assert.deepEqual(await fsp.readdir(root), []);
-  } finally {
-    await store.close();
-    await fsp.rm(root, { recursive: true, force: true });
-  }
+    assert.deepEqual(await storeRootEntries(root), DB_AND_SIDECARS);
+    assert.deepEqual(store.list(), []);
+  });
 });
 
-test("a reporter that throws cannot make the store throw or poison its queue", async () => {
-  // onError is caller-supplied. If it throws, append() throws into the
-  // synchronous emit path and a rejected write queue is skipped forever, so the
-  // session silently stops recording while the index keeps advancing.
+test("a reporter that throws cannot make the store throw", async () => {
+  // onError is caller-supplied. If it throws, append() throws into the synchronous
+  // emit path, and a session silently stops recording while the summary keeps
+  // claiming it is complete.
   let calls = 0;
   await withStore(
     async (store) => {
@@ -179,8 +245,7 @@ test("a reporter that throws cannot make the store throw or poison its queue", a
       });
       await store.flushMeta(session.storeId);
       const page = await store.read(session.storeId, null);
-      // The queue survived, and the good records are all still there.
-      assert.equal(page.events.length, 5, "the queue must survive a throwing reporter");
+      assert.equal(page.events.length, 5, "the good records are all still there");
       assert.equal(page.nextSince, 5);
     },
     {
@@ -193,43 +258,56 @@ test("a reporter that throws cannot make the store throw or poison its queue", a
   assert.ok(calls > 0, "the reporter really was exercised");
 });
 
-test("a lost write never reissues a sequence number and says the log is a prefix", async () => {
-  // The index must not roll back: records queued behind the failed one already
-  // hold their seqs, so rolling back made the next append reuse a number that
-  // was already on disk, and left a permanent hole at the head.
-  const root = tempRoot();
-  const store = new SessionStore({ root, onError: () => {} });
-  await store.open();
-  try {
+test("a failed append leaves no hole and the next one reuses the number safely", async () => {
+  // A transaction either lands whole or not at all, so a failed record cannot
+  // leave a gap and the next append is free to issue the same sequence number.
+  // The old store had to roll the index back by hand to achieve this, and got it
+  // wrong: it rolled back to the failed seq while later records still held theirs.
+  await withStore(async (store, root) => {
     const session = await newSession(store);
-    // A directory that cannot be opened for append makes the writes fail with
-    // EACCES, deterministically.
-    const dir = path.dirname(await logPathOf(root));
-    await fsp.chmod(dir, 0o500);
-    for (let index = 1; index <= 3; index += 1) store.append(session.storeId, delta(index, `lost${index}`));
+    store.append(session.storeId, delta(1, "one"));
     await store.flushMeta(session.storeId);
-    await fsp.chmod(dir, 0o700);
+
+    // Occupy the sequence number the next append will choose, so its INSERT
+    // violates the primary key and the transaction rolls back.
+    poke(root, (db) => {
+      db.prepare(
+        "INSERT INTO events (store_id, seq, ts, payload, bytes) VALUES (?, ?, ?, ?, ?)",
+      ).run(session.storeId, 2, new Date().toISOString(), JSON.stringify(delta(2, "squatter")), 64);
+    });
+
+    store.append(session.storeId, delta(2, "collides"));
+    await store.flushMeta(session.storeId);
 
     assert.equal(
       store.summary(session.storeId)?.truncated,
       true,
-      "a hole cannot be repaired, so the log is a prefix and says so",
+      "a session that cannot write says its transcript is a prefix",
     );
+    // The squatter is still the only row at seq 2: the failed append wrote nothing
+    // over it and left no half-written record behind.
+    const page = await store.read(session.storeId, null);
+    assert.deepEqual(
+      page.events.map((e) => e.seq),
+      [1, 2],
+      "no hole",
+    );
+    const atTwo = page.events[1]?.event;
     assert.equal(
-      (await store.read(session.storeId, 0)).status,
-      "cursor-invalid",
-      "records the index claims but that are not on disk are reported as loss",
+      atTwo?.type === "turn.delta" && atTwo.text === "squatter",
+      true,
+      "and the row at seq 2 is the squatter, untouched by the failed write",
     );
 
-    // Once writing works again, the new records must not reuse a seq.
-    for (let index = 4; index <= 6; index += 1) store.append(session.storeId, delta(index, `kept${index}`));
-    await store.flushMeta(session.storeId);
-    const seqs = (await store.read(session.storeId, 0)).events.map((e) => e.seq);
-    assert.deepEqual(seqs, [4, 5, 6], "only the later records landed, with fresh seqs");
-  } finally {
-    await store.close();
-    await fsp.rm(root, { recursive: true, force: true });
-  }
+    // And a session that gave up is refused from then on rather than retried into
+    // the same failure for every subsequent event.
+    store.append(session.storeId, delta(3, "after"));
+    assert.deepEqual(
+      (await store.read(session.storeId, null)).events.map((e) => e.seq),
+      [1, 2],
+      "a stopped writer stays stopped",
+    );
+  });
 });
 
 // --- quota ---
@@ -251,10 +329,30 @@ test("a session past its byte cap is marked truncated instead of growing", async
   assert.ok(faults.some((f) => f.code === "E_STORE_QUOTA"), "the cap is reported, not silent");
 });
 
+test("the cap is reported once, not once per dropped event", async () => {
+  // Reporting and not stopping would produce a stream of identical errors for a
+  // condition that will not resolve itself.
+  const faults: SessionStoreError[] = [];
+  await withStore(
+    async (store) => {
+      const session = await newSession(store);
+      const chunk = "z".repeat(50_000);
+      for (let index = 0; index < 60; index += 1) store.append(session.storeId, delta(index, chunk));
+      await store.flushMeta(session.storeId);
+    },
+    { maxSessionBytes: 200_000, onError: (error) => faults.push(error) },
+  );
+  assert.equal(
+    faults.filter((f) => f.code === "E_STORE_QUOTA").length,
+    1,
+    "one cap message, not one per refused event",
+  );
+});
+
 test("the per-session cap survives a restart", async () => {
-  // writer.bytes used to start at zero each process, so every restart granted a
-  // fresh full budget on top of the bytes already on disk. Measured growing the
-  // log without bound across five restarts.
+  // The cap has to be measured from what is stored, not from a counter that a
+  // process starts at zero. Measured growing the log without bound across five
+  // restarts when it was in memory.
   const root = tempRoot();
   const options = { root, maxSessionBytes: 200_000, onError: () => {} } as const;
   try {
@@ -263,9 +361,7 @@ test("the per-session cap survives a restart", async () => {
       const store = new SessionStore(options);
       await store.open();
       try {
-        if (run === 0) {
-          storeId = (await newSession(store)).storeId;
-        }
+        if (run === 0) storeId = (await newSession(store)).storeId;
         const chunk = "q".repeat(50_000);
         for (let index = 0; index < 10; index += 1) {
           store.append(storeId, delta(run * 10 + index, chunk));
@@ -275,11 +371,15 @@ test("the per-session cap survives a restart", async () => {
         await store.close();
       }
     }
-    const stat = await fsp.stat(await logPathOf(root));
-    assert.ok(
-      stat.size <= 200_000,
-      `the cap must hold across restarts, but the log is ${stat.size} bytes`,
-    );
+    const store = new SessionStore(options);
+    await store.open();
+    try {
+      const bytes = store.meta(storeId)?.bytes ?? 0;
+      assert.ok(bytes > 0, "the stored byte count is re-measured at boot");
+      assert.ok(bytes <= 200_000, `the cap must hold across restarts, but the log holds ${String(bytes)} bytes`);
+    } finally {
+      await store.close();
+    }
   } finally {
     await fsp.rm(root, { recursive: true, force: true });
   }
@@ -293,8 +393,7 @@ test("the whole-store cap is checked against every session, not one", async () =
       const chunk = "s".repeat(40_000);
       for (let index = 1; index <= 15; index += 1) store.append(first.storeId, delta(index, chunk));
       await store.flushMeta(first.storeId);
-      const afterFirst = store.summary(first.storeId)?.lastSeq ?? 0;
-      assert.equal(afterFirst, 15, "the first session fits under the store cap");
+      assert.equal(store.summary(first.storeId)?.lastSeq, 15, "the first session fits under the store cap");
 
       // The second is refused because the STORE is full, even though neither
       // session is near the per-session cap.
@@ -314,10 +413,103 @@ test("the whole-store cap is checked against every session, not one", async () =
 
 // --- eviction ---
 
+test("hitting the session cap makes room even when the oldest session is live", async () => {
+  // A session this process is recording is never evicted, so a create at the cap
+  // has to look past it. The count of what is still in the store was decremented
+  // for a row that was skipped, so the loop believed it had made room, stopped one
+  // row early, deleted nothing, and every create after that failed for the rest of
+  // the process. The only way out was deleting a session by hand.
+  let clock = 1_000;
+  const evicted: SessionStoreError[] = [];
+  const root = tempRoot();
+  const store = new SessionStore({
+    root,
+    maxSessions: 3,
+    now: () => clock,
+    onError: (e) => evicted.push(e),
+  });
+  await store.open();
+  try {
+    const make = async (title: string): Promise<string> => {
+      clock += 1_000;
+      return (
+        await newSession(store, { title })
+      ).storeId;
+    };
+    const oldest = await make("oldest");
+    // One append pins it as live. It stays the oldest by recency because the other
+    // two are created after it, and the eviction order is oldest first.
+    clock += 1_000;
+    store.append(oldest, delta(1, "pinned"));
+    const pruned = await make("second");
+    await make("third");
+    assert.equal(store.list().length, 3, "at the cap");
+
+    clock += 1_000;
+    const fourth = await make("fourth");
+    assert.notEqual(fourth, oldest, "the live session is the one that survives");
+    assert.notEqual(store.summary(oldest), null, "a session being recorded is never pruned");
+    assert.equal(store.summary(pruned), null, "the next oldest is pruned instead");
+    assert.equal(store.list().length, 3, "and the cap still holds");
+    assert.ok(evicted.some((f) => f.code === "E_STORE_EVICTED"));
+  } finally {
+    await store.close();
+    await fsp.rm(root, { recursive: true, force: true });
+  }
+});
+
+// --- contention with another writer ---
+
+test("a transient lock costs one record, not the rest of the session", async () => {
+  // The store is one file, so anything else that opens it, a second k5, a `sqlite3`
+  // shell, a backup tool, can hold the write lock for a moment. Treating that like
+  // a fault ended the session: every later event of a live turn was dropped and the
+  // summary still claimed a complete transcript, which is the worst available
+  // outcome because it is silent.
+  await withStore(async (store, root) => {
+    const session = await newSession(store);
+    store.append(session.storeId, delta(1, "before"));
+    await store.flushMeta(session.storeId);
+
+    const other = new DatabaseSync(path.join(root, DB_NAME));
+    other.exec("PRAGMA busy_timeout = 0");
+    other.exec("BEGIN IMMEDIATE");
+    other.exec("CREATE TABLE IF NOT EXISTS _hold (a)");
+    other.exec("INSERT INTO _hold VALUES (1)");
+    // Inside the lock. The store waits out its own busy timeout and then gives up
+    // on this one record, so the test holds the lock for exactly as long as that
+    // takes. It releases the lock from a timer rather than after the call returns,
+    // so a raise of BUSY_TIMEOUT_MS makes this test slower rather than wrong.
+    store.append(session.storeId, delta(2, "collides"));
+    other.exec("ROLLBACK");
+    other.close();
+
+    for (let index = 3; index <= 6; index += 1) store.append(session.storeId, delta(index, `m${index}`));
+    await store.flushMeta(session.storeId);
+
+    assert.equal(
+      store.summary(session.storeId)?.truncated,
+      false,
+      "a lock is not a corrupt log, and the summary must not claim it is",
+    );
+    const seqs = (await store.read(session.storeId, null)).events.map((e) => e.seq);
+    // The contended event is the one that may be missing. Everything the store
+    // accepted has to be there, and the session has to keep recording: the record
+    // after the collision is stored, which is the whole point.
+    assert.equal(seqs.length, 5, `one record of six may be lost, got ${JSON.stringify(seqs)}`);
+    assert.ok(seqs.includes(5), `later records must survive, got ${JSON.stringify(seqs)}`);
+    for (let index = 1; index < seqs.length; index += 1) {
+      assert.equal(seqs[index], (seqs[index - 1] ?? 0) + 1, "and the survivors stay contiguous");
+    }
+  });
+});
+
+// --- eviction ---
+
 test("hitting the session cap makes room instead of failing forever", async () => {
-  // The overflow was recomputed from the live index inside the loop, so each
-  // deletion shrank the bound and the loop stopped one session short. After
-  // that, every create() failed with no way out: a one-way door.
+  // The overflow was recomputed from the live count inside the loop, so each
+  // deletion shrank the bound and the loop stopped one session short. After that,
+  // every create() failed with no way out: a one-way door.
   const evicted: SessionStoreError[] = [];
   await withStore(
     async (store) => {
@@ -326,7 +518,7 @@ test("hitting the session cap makes room instead of failing forever", async () =
         assert.ok(store.summary(created.storeId) !== null);
       }
       assert.equal(store.list().length, 3);
-      // These must all succeed, forever, not just the first time.
+      // These must all succeed, for ever, not just the first time.
       for (let index = 0; index < 5; index += 1) {
         const created = await newSession(store, { title: `later ${index}` });
         assert.ok(store.summary(created.storeId) !== null, `create ${index} must succeed`);
@@ -341,7 +533,57 @@ test("hitting the session cap makes room instead of failing forever", async () =
   );
 });
 
-test("a session with an unparseable timestamp is refused rather than pinning a slot", async () => {
+test("eviction takes a session's events and attachments with it", async () => {
+  // A delete that leaves rows behind means a store that grows forever no matter
+  // what the session list says. The cascade is what makes this true by
+  // construction rather than by remembering to clean up.
+  const root = tempRoot();
+  const options = { root, maxSessions: 2, onError: () => {} } as const;
+  const first = new SessionStore(options);
+  await first.open();
+  let victim = "";
+  try {
+    const a = await newSession(first, { title: "a" });
+    first.append(a.storeId, delta(1, "x".repeat(50_000)));
+    await first.spoolAttachment(a.storeId, {
+      attachmentId: "att-1",
+      name: "a.bin",
+      mimeType: "application/octet-stream",
+      bytes: Buffer.alloc(2_000),
+    });
+    await first.flushMeta(a.storeId);
+    victim = a.storeId;
+    await newSession(first, { title: "b" });
+  } finally {
+    await first.close();
+  }
+
+  const second = new SessionStore(options);
+  await second.open();
+  try {
+    // A third session at the cap of two prunes the oldest, which is `a`.
+    await newSession(second, { title: "c" });
+    assert.equal(second.summary(victim), null, "the oldest is gone");
+    poke(root, (db) => {
+      const events = db
+        .prepare("SELECT COUNT(*) AS total FROM events WHERE store_id = ?")
+        .get(victim) as { total: number };
+      const spooled = db
+        .prepare("SELECT COUNT(*) AS total FROM attachments WHERE store_id = ?")
+        .get(victim) as { total: number };
+      assert.equal(Number(events.total), 0, "no event outlives its session");
+      assert.equal(Number(spooled.total), 0, "and no attachment bytes either");
+    });
+  } finally {
+    await second.close();
+    await fsp.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a session with an unusable timestamp is refused rather than pinning a slot", async () => {
+  // SQLite is dynamically typed, so a timestamp column can hold anything. A row
+  // this build cannot read is still occupying a slot, and it must not be allowed
+  // to make the whole list unreadable.
   const faults: SessionStoreError[] = [];
   const root = tempRoot();
   const store = new SessionStore({ root, onError: (e) => faults.push(e) });
@@ -349,17 +591,15 @@ test("a session with an unparseable timestamp is refused rather than pinning a s
   try {
     const good = await newSession(store, { title: "keep me" });
     const bad = await newSession(store, { title: "bad stamp" });
-    await store.flushMeta(good.storeId);
-    await store.flushMeta(bad.storeId);
-    for (const entry of await fsp.readdir(root, { withFileTypes: true })) {
-      const candidate = path.join(root, entry.name, "meta.json");
-      const value = JSON.parse(await fsp.readFile(candidate, "utf8")) as Record<string, unknown>;
-      if (String(value["storeId"]) !== bad.storeId) continue;
-      value["updatedAt"] = "not a date";
-      await fsp.writeFile(candidate, JSON.stringify(value), "utf8");
-    }
-    assert.equal(await store.rescan(), 1, "the good session still lists");
-    assert.notEqual(store.summary(good.storeId), null);
+    poke(root, (db) => {
+      db.prepare("UPDATE sessions SET updated_at = ? WHERE store_id = ?").run(
+        "not a date",
+        bad.storeId,
+      );
+    });
+    const listed = store.list();
+    assert.equal(listed.length, 1, "the good session still lists");
+    assert.equal(listed[0]?.storeId, good.storeId);
     assert.equal(store.summary(bad.storeId), null, "the unusable one is refused, not kept");
     assert.ok(faults.some((f) => f.code === "E_STORE_META_CORRUPT"));
   } finally {
@@ -368,146 +608,107 @@ test("a session with an unparseable timestamp is refused rather than pinning a s
   }
 });
 
-test("a corrupt numeric field is refused rather than becoming NaN", async () => {
-  // Number({}) is NaN, and a NaN turnCount made list() throw a raw ZodError,
-  // which 500'd the whole session list. A NaN byte count silently disabled that
-  // session's quota, because every comparison against NaN is false.
+test("a numeric column refuses a value of the wrong type, and a wrong-shaped value is refused on read", async () => {
+  // Two layers, and both are load-bearing. STRICT tables refuse the write at all,
+  // so the bad value cannot exist. A future migration, or a database written by
+  // another build, can still put one there, and a NaN turnCount made list() throw a
+  // raw ZodError which 500'd the whole session list; a NaN byte count silently
+  // disabled that session's quota, because every comparison against NaN is false.
   const faults: SessionStoreError[] = [];
-  const root = tempRoot();
-  const store = new SessionStore({ root, onError: (e) => faults.push(e) });
-  await store.open();
-  try {
-    const good = await newSession(store);
-    const bad = await newSession(store);
-    await store.flushMeta(good.storeId);
-    await store.flushMeta(bad.storeId);
-    for (const entry of await fsp.readdir(root, { withFileTypes: true })) {
-      const candidate = path.join(root, entry.name, "meta.json");
-      const value = JSON.parse(await fsp.readFile(candidate, "utf8")) as Record<string, unknown>;
-      if (String(value["storeId"]) !== bad.storeId) continue;
-      value["turnCount"] = { not: "a number" };
-      value["bytes"] = { not: "a number" };
-      await fsp.writeFile(candidate, JSON.stringify(value), "utf8");
-    }
-    assert.equal(await store.rescan(), 1);
-    // The whole list must still render, not throw.
-    const listed = store.list();
-    assert.equal(listed.length, 1);
-    assert.equal(listed[0]?.storeId, good.storeId);
-    assert.equal(typeof listed[0]?.turnCount, "number");
-    assert.ok(faults.some((f) => f.code === "E_STORE_META_CORRUPT"));
-  } finally {
-    await store.close();
-    await fsp.rm(root, { recursive: true, force: true });
-  }
+  await withStore(
+    async (store, root) => {
+      const good = await newSession(store);
+      const bad = await newSession(store);
+
+      assert.throws(
+        () =>
+          poke(root, (db) => {
+            db.prepare("UPDATE sessions SET turn_count = 'not a number' WHERE store_id = ?").run(
+              bad.storeId,
+            );
+          }),
+        /INTEGER/i,
+        "the schema refuses a text turn count outright",
+      );
+
+      // A value of the right type but the wrong shape, which SQLite accepts and
+      // the row schema must refuse.
+      poke(root, (db) => {
+        db.prepare("UPDATE sessions SET turn_count = -1 WHERE store_id = ?").run(bad.storeId);
+      });
+      const listed = store.list();
+      assert.equal(listed.length, 1, "the whole list still renders");
+      assert.equal(listed[0]?.storeId, good.storeId);
+      assert.equal(store.summary(bad.storeId), null);
+      assert.ok(faults.some((f) => f.code === "E_STORE_META_CORRUPT"));
+    },
+    { onError: (e) => faults.push(e) },
+  );
 });
 
 // --- read path ---
 
-test("a torn final record is repaired at open, so the next append survives", async () => {
-  // Left unrepaired, the next O_APPEND write concatenates onto the fragment and
-  // produces one line that destroys both the torn record and the good one after
-  // it. Repair happens at open, where no writer holds a handle.
-  const root = tempRoot();
-  const options = { root, onError: () => {} } as const;
-  const first = new SessionStore(options);
-  await first.open();
-  let storeId = "";
-  try {
-    storeId = (await newSession(first)).storeId;
-    first.append(storeId, delta(1, "one"));
-    first.append(storeId, delta(2, "two"));
-    await first.flushMeta(storeId);
-  } finally {
-    await first.close();
-  }
-  const logPath = await logPathOf(root);
-  await fsp.appendFile(logPath, '{"v":1,"seq":3,"ts":"2026-01-01T00:00:00.000Z","eve');
-
-  const second = new SessionStore(options);
-  await second.open();
-  try {
-    second.append(storeId, delta(3, "three"));
-    await second.flushMeta(storeId);
-    const page = await second.read(storeId, null);
-    const texts = page.events.map((e) => (e.event.type === "turn.delta" ? e.event.text : ""));
-    // The record written after the tear is readable, which is the whole point.
-    assert.deepEqual(texts, ["one", "two", "three"]);
-  } finally {
-    await second.close();
-    await fsp.rm(root, { recursive: true, force: true });
-  }
-});
-
-test("a read never modifies the log", async () => {
-  // "Cut at the last newline" on the shared file truncates it to zero when no
-  // newline has been written yet, so a plain GET would destroy the transcript.
+test("a read never changes what is stored", async () => {
   await withStore(async (store, root) => {
     const session = await newSession(store);
-    store.append(session.storeId, delta(1, "complete"));
+    store.append(session.storeId, delta(1, "one"));
+    store.append(session.storeId, delta(2, "two"));
     await store.flushMeta(session.storeId);
-    const logPath = await logPathOf(root);
-    const before = (await fsp.stat(logPath)).size;
-    await fsp.appendFile(logPath, '{"v":1,"seq":2,"ts":"x","eve');
-    const withTear = (await fsp.stat(logPath)).size;
-    await store.read(session.storeId, null);
-    assert.equal((await fsp.stat(logPath)).size, withTear, "a read must not touch the file");
-    assert.ok(withTear > before);
+    const before = await store.read(session.storeId, null);
+    for (let index = 0; index < 5; index += 1) await store.read(session.storeId, index);
+    const after = await store.read(session.storeId, null);
+    assert.deepEqual(
+      after.events.map((e) => e.event),
+      before.events.map((e) => e.event),
+      "the same records, in the same order, after five reads",
+    );
+    assert.equal(after.lastSeq, before.lastSeq, "and the summary did not move");
   });
 });
 
-test("one unreadable record does not make every page empty", async () => {
-  // Aborting the page on the first gap meant a single torn line made a session
-  // permanently unreadable, and a client following the documented recovery
-  // looped forever.
+test("one unreadable payload does not make every page empty", async () => {
+  // Aborting the page on the first bad record made a session permanently
+  // unreadable, and a client following the documented recovery looped for ever.
   await withStore(async (store, root) => {
     const session = await newSession(store);
     for (let index = 1; index <= 5; index += 1) store.append(session.storeId, delta(index, `m${index}`));
     await store.flushMeta(session.storeId);
-    const logPath = await logPathOf(root);
-    const lines = (await fsp.readFile(logPath, "utf8")).split("\n").filter(Boolean);
-    lines[2] = "{ not json at all";
-    await fsp.writeFile(logPath, lines.join("\n") + "\n", "utf8");
+    poke(root, (db) => {
+      db.prepare("UPDATE events SET payload = ? WHERE store_id = ? AND seq = 3").run(
+        "{ not json at all",
+        session.storeId,
+      );
+    });
 
     const page = await store.read(session.storeId, null);
-    const texts = page.events.map((e) => (e.event.type === "turn.delta" ? e.event.text : ""));
     assert.ok(page.dropped >= 1, "the unreadable record is reported");
-    // The good records still arrive, so the transcript is mostly readable.
+    const texts = page.events.map((e) => (e.event.type === "turn.delta" ? e.event.text : ""));
     assert.ok(texts.includes("m1"), "records before the bad one still arrive");
     assert.ok(texts.includes("m5"), "records after the bad one still arrive");
+    assert.equal(SessionEventsResponseSchema.safeParse(page).success, true);
   });
 });
 
-test("a log that is missing or empty while the index claims records is not 'caught up'", async () => {
+test("a summary claiming records the store does not hold is reported as loss", async () => {
+  // The old store's summary could sit ahead of its log after a crash, and an
+  // empty answer there is indistinguishable from caught-up, so the client waits
+  // for ever. The cascade and the transaction make the state hard to reach, and
+  // this is what happens when it is reached anyway.
   await withStore(async (store, root) => {
     const session = await newSession(store);
     for (let index = 1; index <= 3; index += 1) store.append(session.storeId, delta(index, `m${index}`));
     await store.flushMeta(session.storeId);
-    await fsp.rm(await logPathOf(root), { force: true });
-    const missing = await store.read(session.storeId, 0);
-    assert.equal(missing.status, "cursor-invalid", "an empty answer would strand the client");
-    assert.ok(missing.dropped > 0, "the loss is reported, not hidden");
-
-    await fsp.writeFile(await logPathOf(root), "", "utf8");
-    const emptied = await store.read(session.storeId, 0);
-    assert.equal(emptied.status, "cursor-invalid");
-  });
-});
-
-test("a log past the read window is reported rather than silently truncated", async () => {
-  await withStore(async (store, root) => {
-    const session = await newSession(store);
-    for (let index = 1; index <= 3; index += 1) store.append(session.storeId, delta(index, `m${index}`));
-    await store.flushMeta(session.storeId);
-    // Grow the file past the window without the store knowing.
-    const logPath = await logPathOf(root);
-    const handle = await fsp.open(logPath, fs.constants.O_WRONLY | fs.constants.O_APPEND);
-    await handle.write(Buffer.alloc(MAX_READ_WINDOW_BYTES, 0x20));
-    await handle.close();
-
+    poke(root, (db) => {
+      db.prepare("DELETE FROM events WHERE store_id = ?").run(session.storeId);
+      // The cascade takes events with the session, so the rows are re-inserted
+      // under a session that is about to be reconciled away.
+      db.prepare("UPDATE sessions SET last_seq = 3, first_seq = 1 WHERE store_id = ?").run(
+        session.storeId,
+      );
+    });
     const page = await store.read(session.storeId, 0);
-    assert.equal(page.status, "cursor-invalid", "an unreadable tail must not look complete");
-    assert.ok(page.dropped > 0);
+    assert.equal(page.status, "cursor-invalid", "an empty answer would strand the client");
+    assert.ok(page.dropped > 0, "the loss is reported, not hidden");
   });
 });
 
@@ -539,13 +740,10 @@ test("all four replay states are reachable and each says what to do", async () =
     assert.equal(beyond.nextSince, 0, "an error returns the start-over cursor");
 
     // cursor-too-old needs a log whose oldest surviving record is not seq 1, so
-    // the meta is edited to model a compaction.
-    const metaPath = await metaPathOf(root);
-    const parsed = JSON.parse(await fsp.readFile(metaPath, "utf8")) as Record<string, unknown>;
-    parsed["firstSeq"] = 3;
-    await fsp.writeFile(metaPath, JSON.stringify(parsed), "utf8");
-    await store.rescan();
-
+    // the summary is edited to model a compaction.
+    poke(root, (db) => {
+      db.prepare("UPDATE sessions SET first_seq = 3 WHERE store_id = ?").run(session.storeId);
+    });
     const tooOld = await store.read(session.storeId, 0);
     assert.equal(tooOld.status, "cursor-too-old", "a cursor before the retained window is compaction");
     assert.equal(tooOld.nextSince, 0, "and returns the start-over cursor");
@@ -557,14 +755,14 @@ test("a gap inside the window is reported as loss without hiding the rest", asyn
     const session = await newSession(store);
     for (let index = 1; index <= 4; index += 1) store.append(session.storeId, delta(index, `m${index}`));
     await store.flushMeta(session.storeId);
-    const logPath = await logPathOf(root);
-    const lines = (await fsp.readFile(logPath, "utf8")).split("\n").filter(Boolean);
-    await fsp.writeFile(logPath, [lines[0], lines[2], lines[3]].join("\n") + "\n", "utf8");
-
+    poke(root, (db) => {
+      db.prepare("DELETE FROM events WHERE store_id = ? AND seq = 2").run(session.storeId);
+    });
     const page = await store.read(session.storeId, null);
     assert.ok(page.dropped >= 1, "the missing record is counted");
     const texts = page.events.map((e) => (e.event.type === "turn.delta" ? e.event.text : ""));
     assert.ok(texts.includes("m4"), "the records that do exist are still delivered");
+    assert.equal(page.nextSince, 4, "and the cursor still names the last served record");
   });
 });
 
@@ -573,12 +771,12 @@ test("paging never lets a dropped record desync the cursor", async () => {
     const session = await newSession(store);
     for (let index = 1; index <= 10; index += 1) store.append(session.storeId, delta(index, `m${index}`));
     await store.flushMeta(session.storeId);
-    // Corrupt one record inside the window, so this genuinely pages past a
-    // dropped line rather than ten clean records.
-    const logPath = await logPathOf(root);
-    const lines = (await fsp.readFile(logPath, "utf8")).split("\n").filter(Boolean);
-    lines[6] = "{ dropped";
-    await fsp.writeFile(logPath, lines.join("\n") + "\n", "utf8");
+    poke(root, (db) => {
+      db.prepare("UPDATE events SET payload = ? WHERE store_id = ? AND seq = 7").run(
+        "{ dropped",
+        session.storeId,
+      );
+    });
 
     let since: number | null = null;
     const seen: number[] = [];
@@ -590,10 +788,34 @@ test("paging never lets a dropped record desync the cursor", async () => {
       if (!result.hasMore) break;
     }
     assert.equal(seen.length, 9, "nine of ten records survive");
-    // Monotonic and gapless within what exists.
+    // Monotonic within what exists.
     for (let index = 1; index < seen.length; index += 1) {
       assert.ok((seen[index] ?? 0) > (seen[index - 1] ?? 0), "the cursor never goes backwards");
     }
+  });
+});
+
+test("a record stored below the page's start is reported, not served", async () => {
+  // A negative dropped count failed the response schema, and the API turned that
+  // into an anonymous 500: a session that could be listed but never reopened. The
+  // response schema is what rejects a negative count, so the value is asserted as
+  // the schema will actually accept it, and the count is checked for being real
+  // rather than merely non-negative.
+  await withStore(async (store, root) => {
+    const session = await newSession(store);
+    for (let index = 1; index <= 4; index += 1) store.append(session.storeId, delta(index, `m${index}`));
+    await store.flushMeta(session.storeId);
+    poke(root, (db) => {
+      db.prepare("UPDATE events SET seq = 0 WHERE store_id = ? AND seq = 1").run(session.storeId);
+    });
+    const page = await store.read(session.storeId, null);
+    assert.equal(page.dropped, 1, "the record outside the window is counted, and never below zero");
+    assert.deepEqual(
+      page.events.map((e) => e.seq),
+      [2, 3, 4],
+      "and the records that exist are still delivered",
+    );
+    assert.equal(SessionEventsResponseSchema.safeParse(page).success, true);
   });
 });
 
@@ -604,8 +826,6 @@ test("a record over the line cap is dropped and reported, not truncated", async 
     async (store) => {
       const session = await newSession(store);
       store.append(session.storeId, delta(1, "before"));
-      // A truncated line would be permanently unparseable and would poison the
-      // record after it.
       store.append(session.storeId, delta(2, "y".repeat(MAX_LINE_BYTES)));
       store.append(session.storeId, delta(3, "after"));
       await store.flushMeta(session.storeId);
@@ -635,149 +855,7 @@ test("only session-scoped events are persisted", async () => {
   });
 });
 
-// --- meta durability ---
-
-test("a symlink at the meta path is replaced, not written through", async () => {
-  // The temp path is unpredictable and opened O_EXCL, so nothing can be
-  // pre-planted there; the meta path itself is replaced by rename. Either way
-  // a symlink planted by the harness cannot redirect a write.
-  const root = tempRoot();
-  const victim = path.join(root, "victim.txt");
-  await fsp.writeFile(victim, "original", "utf8");
-  const store = new SessionStore({ root });
-  await store.open();
-  try {
-    const session = await newSession(store);
-    const metaPath = await metaPathOf(root);
-    await fsp.rm(metaPath, { force: true });
-    await fsp.symlink(victim, metaPath);
-    store.append(session.storeId, delta(1, "x"));
-    await store.flushMeta(session.storeId);
-    assert.equal(await fsp.readFile(victim, "utf8"), "original", "the target is untouched");
-    const written = JSON.parse(await fsp.readFile(metaPath, "utf8")) as { storeId: string };
-    assert.equal(written.storeId, session.storeId, "and the session is readable");
-  } finally {
-    await store.close();
-    await fsp.rm(root, { recursive: true, force: true });
-  }
-});
-
-test("a meta write that cannot happen is reported, not reported into existence", async () => {
-  const faults: SessionStoreError[] = [];
-  const root = tempRoot();
-  const store = new SessionStore({ root, onError: (e) => faults.push(e) });
-  await store.open();
-  try {
-    await fsp.chmod(root, 0o500);
-    await assert.rejects(
-      () => newSession(store),
-      (error: unknown) => error instanceof SessionStoreError,
-      "create must not return a summary for a session that cannot be written",
-    );
-    await fsp.chmod(root, 0o700);
-    assert.equal(store.list().length, 0, "and it left nothing behind");
-  } finally {
-    await fsp.chmod(root, 0o700).catch(() => {});
-    await store.close();
-    await fsp.rm(root, { recursive: true, force: true });
-  }
-  assert.ok(faults.length >= 0);
-});
-
-test("a corrupt meta file is skipped and reported, and the others still list", async () => {
-  const faults: SessionStoreError[] = [];
-  const root = tempRoot();
-  const store = new SessionStore({ root, onError: (e) => faults.push(e) });
-  await store.open();
-  try {
-    const good = await newSession(store);
-    const bad = await newSession(store);
-    await store.flushMeta(good.storeId);
-    await store.flushMeta(bad.storeId);
-    for (const entry of await fsp.readdir(root, { withFileTypes: true })) {
-      const candidate = path.join(root, entry.name, "meta.json");
-      const parsed = JSON.parse(await fsp.readFile(candidate, "utf8")) as { storeId: string };
-      if (parsed.storeId === bad.storeId) await fsp.writeFile(candidate, "{not json", "utf8");
-    }
-    assert.equal(await store.rescan(), 1, "one good session still lists");
-    assert.notEqual(store.summary(good.storeId), null);
-    assert.equal(store.summary(bad.storeId), null);
-    assert.ok(faults.some((f) => f.code === "E_STORE_META_CORRUPT"));
-  } finally {
-    await store.close();
-    await fsp.rm(root, { recursive: true, force: true });
-  }
-});
-
-test("an unknown meta version is refused rather than coerced forward", async () => {
-  const faults: SessionStoreError[] = [];
-  const root = tempRoot();
-  const store = new SessionStore({ root, onError: (e) => faults.push(e) });
-  await store.open();
-  try {
-    const session = await newSession(store);
-    await store.flushMeta(session.storeId);
-    const metaPath = await metaPathOf(root);
-    const parsed = JSON.parse(await fsp.readFile(metaPath, "utf8")) as Record<string, unknown>;
-    parsed["v"] = 99;
-    await fsp.writeFile(metaPath, JSON.stringify(parsed), "utf8");
-    assert.equal(await store.rescan(), 0, "a future meta version is not guessed at");
-    assert.ok(faults.some((f) => f.code === "E_STORE_META_CORRUPT"));
-  } finally {
-    await store.close();
-    await fsp.rm(root, { recursive: true, force: true });
-  }
-});
-
-test("the store root, its directories and its files are not world readable", async () => {
-  // Transcripts are agent output: source code, and whatever the agent read.
-  const root = tempRoot();
-  const base = path.join(root, "sessions");
-  const store = new SessionStore({ root: base });
-  await store.open();
-  try {
-    const session = await newSession(store);
-    store.append(session.storeId, delta(1, "secret"));
-    await store.flushMeta(session.storeId);
-    assert.equal((await fsp.stat(base)).mode & 0o777, 0o700);
-    const dir = (await fsp.readdir(base, { withFileTypes: true })).find((e) => e.isDirectory());
-    assert.ok(dir);
-    const sessionDir = path.join(base, dir.name);
-    assert.equal((await fsp.stat(sessionDir)).mode & 0o777, 0o700, "the session directory itself");
-    assert.equal(
-      (await fsp.stat(path.join(sessionDir, "meta.json"))).mode & 0o777,
-      0o600,
-    );
-    assert.equal(
-      (await fsp.stat(path.join(sessionDir, "events.jsonl"))).mode & 0o777,
-      0o600,
-      "the transcript itself",
-    );
-  } finally {
-    await store.close();
-    await fsp.rm(root, { recursive: true, force: true });
-  }
-});
-
-test("a rescan does not leave a live writer holding a detached meta", async () => {
-  await withStore(async (store) => {
-    const session = await newSession(store);
-    store.append(session.storeId, delta(1, "before"));
-    await store.flushMeta(session.storeId);
-    // A rescan replaces every meta object; a writer capturing the old one would
-    // mutate a detached object and the index would claim a record that is not
-    // on disk.
-    await store.rescan();
-    for (let index = 2; index <= 4; index += 1) store.append(session.storeId, delta(index, `m${index}`));
-    await store.flushMeta(session.storeId);
-    const page = await store.read(session.storeId, null);
-    assert.equal(page.status, "appended");
-    const texts = page.events.map((e) => (e.event.type === "turn.delta" ? e.event.text : ""));
-    assert.deepEqual(texts, ["before", "m2", "m3", "m4"], "the writer and index stay in step");
-  });
-});
-
-// --- unknown session ---
+// --- unknown session and unopened store ---
 
 test("reading an unknown session is a typed error, not an empty page", async () => {
   await withStore(async (store) => {
@@ -796,7 +874,70 @@ test("a store that is not open refuses writes", async () => {
     () => newSession(store),
     (error: unknown) => error instanceof SessionStoreError && error.code === "E_STORE_WRITABLE",
   );
+  // And the synchronous path is a no-op rather than a throw.
+  assert.doesNotThrow(() => {
+    store.append("11111111-1111-4111-8111-111111111111", delta(1, "x"));
+  });
   await fsp.rm(root, { recursive: true, force: true });
+});
+
+test("a page of nothing but unreadable records ends the read instead of looping for ever", async () => {
+  // Claiming hasMore on a page that served nothing is a contract no client can
+  // satisfy: the cursor did not move, so asking again returns the same page. The
+  // browser happened to absorb this by refusing an empty page, which put a store
+  // invariant on the client to enforce for every other consumer of the contract.
+  await withStore(async (store, root) => {
+    const session = await newSession(store);
+    for (let index = 1; index <= 3; index += 1) store.append(session.storeId, delta(index, `m${index}`));
+    await store.flushMeta(session.storeId);
+    poke(root, (db) => {
+      db.prepare("UPDATE events SET payload = ? WHERE store_id = ?").run(
+        JSON.stringify({ type: "turn.delta", futureField: true }),
+        session.storeId,
+      );
+    });
+
+    const first = await store.read(session.storeId, null);
+    assert.equal(first.events.length, 0);
+    assert.equal(first.hasMore, false, "an empty page must not promise more");
+    assert.notEqual(first.status, "appended", "nothing was appended to this reader");
+    assert.equal(first.dropped, 3, "and the loss is reported");
+
+    // Following the cursor it handed back terminates rather than repeating.
+    const second = await store.read(session.storeId, first.nextSince);
+    assert.notEqual(second.status, "appended");
+    assert.equal(SessionEventsResponseSchema.safeParse(second).success, true);
+  });
+});
+
+test("a summary that claims records the store does not hold is repaired at boot", async () => {
+  // The import can produce this from a legacy session whose meta was written and
+  // whose log never was. A summary promising 400 records the store does not have
+  // makes every read of that task fail for ever, with no repair path.
+  const root = tempRoot();
+  try {
+    await fsp.mkdir(path.join(root, "s-abc123"), { recursive: true });
+    await fsp.writeFile(
+      path.join(root, "s-abc123", "meta.json"),
+      legacyMeta({ lastSeq: 412, firstSeq: 1, turnCount: 7 }),
+      "utf8",
+    );
+    // No events.jsonl at all.
+
+    const store = new SessionStore({ root, onError: () => {} });
+    await store.open();
+    try {
+      const id = store.list()[0]?.storeId ?? "";
+      assert.ok(id.length > 0, "the session is still listed, not hidden");
+      assert.equal(store.meta(id)?.lastSeq, 0, "and it no longer claims 412 records");
+      const page = await store.read(id, null);
+      assert.equal(page.status, "up-to-date", "so it reads as empty rather than for ever broken");
+    } finally {
+      await store.close();
+    }
+  } finally {
+    await fsp.rm(root, { recursive: true, force: true });
+  }
 });
 
 // --- deletion ---
@@ -816,21 +957,35 @@ test("deleting a session removes it and never resurrects it", async () => {
 
     assert.equal(store.summary(session.storeId), null);
     assert.deepEqual(store.list(), []);
-    assert.deepEqual(await fsp.readdir(root), [], "and nothing is left on disk");
+    poke(root, (db) => {
+      const events = db
+        .prepare("SELECT COUNT(*) AS total FROM events WHERE store_id = ?")
+        .get(session.storeId) as { total: number };
+      assert.equal(Number(events.total), 0, "and no events outlive it");
+    });
   });
 });
 
-test("a delete racing a live write does not leak a handle or resurrect the session", async () => {
+test("appends queued around a delete are dropped, and the store keeps working", async () => {
+  // There is no race to win here and the test does not pretend otherwise: remove()
+  // has no await in it, so it runs whole before the next line. What matters is the
+  // consequence, which is the property worth protecting. A delete must not be undone
+  // by the events that were already in flight, and it must not leave the store
+  // unable to record the next task.
   await withStore(async (store, root) => {
     const session = await newSession(store);
-    // Queue writes, then delete while the queue is still draining. No sleep: the
-    // delete awaits the queue itself, so the interleaving is deterministic.
     for (let index = 1; index <= 50; index += 1) store.append(session.storeId, delta(index, "x".repeat(5_000)));
     const removed = store.remove(session.storeId);
     for (let index = 51; index <= 60; index += 1) store.append(session.storeId, delta(index, "late"));
     assert.equal(await removed, true);
     assert.equal(store.summary(session.storeId), null);
-    assert.deepEqual(await fsp.readdir(root), []);
+    assert.equal(store.list().length, 0, "and it is not in the list either");
+    poke(root, (db) => {
+      const rows = db
+        .prepare("SELECT COUNT(*) AS total FROM events WHERE store_id = ?")
+        .get(session.storeId) as { total: number };
+      assert.equal(Number(rows.total), 0, "no event outlives the session");
+    });
     // And the store still works afterwards.
     const next = await newSession(store, { title: "after" });
     store.append(next.storeId, delta(1, "fresh"));
@@ -840,12 +995,11 @@ test("a delete racing a live write does not leak a handle or resurrect the sessi
 });
 
 // --- attachments ---
-
 // A four-byte PNG header: valid as a PNG, not decodable as UTF-8.
 const PNG_HEAD = Buffer.from([0x89, 0x50, 0x4e, 0x47]);
 
 test("a spooled attachment round-trips, and its manifest is derived from the bytes", async () => {
-  await withStore(async (store, root) => {
+  await withStore(async (store) => {
     const session = await newSession(store);
     // The client claims this is plain text. It is not, and the manifest must say
     // what arrived rather than what was asked for: a harness handed a binary as
@@ -867,8 +1021,8 @@ test("a spooled attachment round-trips, and its manifest is derived from the byt
     assert.deepEqual(await store.readAttachment(session.storeId, "att-1"), PNG_HEAD);
     assert.deepEqual(await store.attachmentManifest(session.storeId, "att-1"), manifest);
 
-    // The declared mime only ever decides image versus binary, and only for
-    // bytes that are not text.
+    // The declared mime only ever decides image versus binary, and only for bytes
+    // that are not text.
     const asImage = await store.spoolAttachment(session.storeId, {
       attachmentId: "att-2",
       name: "shot.png",
@@ -884,13 +1038,37 @@ test("a spooled attachment round-trips, and its manifest is derived from the byt
     });
     assert.equal(asText.kind, "text", "decodable UTF-8 is text whatever the name claims");
     assert.equal(asText.size, 11);
-
-    // The spool lives inside the session directory, so cleanup is inherited.
-    const entries = await fsp.readdir(root, { withFileTypes: true });
-    assert.equal(entries.length, 1);
-    const spooled = await fsp.readdir(path.join(root, entries[0]!.name, "attachments"));
-    assert.deepEqual(spooled.sort(), ["att-1", "att-2", "att-3"]);
   });
+});
+
+test("attachment bytes survive a restart", async () => {
+  // The bytes are the only copy. A manifest remembered in memory but not stored
+  // meant a turn that named an attachment ran with nothing attached, silently.
+  const root = tempRoot();
+  const options = { root, onError: () => {} } as const;
+  const first = new SessionStore(options);
+  await first.open();
+  let storeId = "";
+  try {
+    storeId = (await newSession(first)).storeId;
+    await first.spoolAttachment(storeId, {
+      attachmentId: "att-1",
+      name: "a.bin",
+      mimeType: "application/octet-stream",
+      bytes: Buffer.from([1, 2, 3, 250]),
+    });
+  } finally {
+    await first.close();
+  }
+  const second = new SessionStore(options);
+  await second.open();
+  try {
+    assert.deepEqual(await second.readAttachment(storeId, "att-1"), Buffer.from([1, 2, 3, 250]));
+    assert.equal((await second.attachmentManifest(storeId, "att-1")).size, 4);
+  } finally {
+    await second.close();
+    await fsp.rm(root, { recursive: true, force: true });
+  }
 });
 
 test("spooling into an unknown or deleted session is refused and creates nothing", async () => {
@@ -906,10 +1084,9 @@ test("spooling into an unknown or deleted session is refused and creates nothing
       (error: unknown) =>
         error instanceof SessionStoreError && error.code === "E_STORE_UNKNOWN_SESSION",
     );
-    assert.deepEqual(await fsp.readdir(root), []);
+    assert.deepEqual(await storeRootEntries(root), DB_AND_SIDECARS);
 
-    // A deleted session must not be brought back by a late upload: a directory
-    // here would resurrect a transcript the user removed.
+    // A deleted session must not be brought back by a late upload.
     const session = await newSession(store);
     await store.spoolAttachment(session.storeId, {
       attachmentId: "att-1",
@@ -929,33 +1106,14 @@ test("spooling into an unknown or deleted session is refused and creates nothing
       (error: unknown) =>
         error instanceof SessionStoreError && error.code === "E_STORE_UNKNOWN_SESSION",
     );
-    assert.deepEqual(await fsp.readdir(root), []);
+    assert.deepEqual(await storeRootEntries(root), DB_AND_SIDECARS);
   });
 });
 
-test("a session whose directory is gone mid-flight cannot be spooled into", async () => {
-  // The index still names it, so only a look at the disk can tell. Refusing here
-  // is what stops a removed session from quietly reappearing.
-  await withStore(async (store, root) => {
-    const session = await newSession(store);
-    const entries = await fsp.readdir(root, { withFileTypes: true });
-    await fsp.rm(path.join(root, entries[0]!.name), { recursive: true, force: true });
-    await assert.rejects(
-      () =>
-        store.spoolAttachment(session.storeId, {
-          attachmentId: "att-1",
-          name: "a.txt",
-          mimeType: "text/plain",
-          bytes: Buffer.from("x"),
-        }),
-      (error: unknown) =>
-        error instanceof SessionStoreError && error.code === "E_STORE_UNKNOWN_SESSION",
-    );
-    assert.deepEqual(await fsp.readdir(root), []);
-  });
-});
-
-test("an attachment id that is not a safe name never becomes a path", async () => {
+test("an attachment id that is not a safe name is refused outright", async () => {
+  // The id is a key rather than a path now, so there is nothing to escape. It is
+  // still refused, because these shapes are a caller bug and a row carrying one
+  // is a row nobody can name again.
   await withStore(async (store) => {
     const session = await newSession(store);
     for (const bad of ["..", "../escape", "with\nnewline", "a/b", "", "nul\u0000byte"]) {
@@ -973,7 +1131,7 @@ test("an attachment id that is not a safe name never becomes a path", async () =
       await assert.rejects(
         () => store.readAttachment(session.storeId, bad),
         (error: unknown) =>
-          error instanceof SessionStoreError && error.code === "E_STORE_PATH_ESCAPE",
+          error instanceof SessionStoreError && error.code === "E_STORE_UNKNOWN_ATTACHMENT",
       );
     }
   });
@@ -1005,11 +1163,10 @@ test("an attachment is bounded by the store's own caps", async () => {
           }),
         (error: unknown) => error instanceof SessionStoreError,
       );
-      assert.deepEqual(
-        await fsp.readdir(path.join(await sessionDirOf(root), "attachments")).catch(() => []),
-        [],
-        "a refused upload must leave no bytes behind",
-      );
+      poke(root, (db) => {
+        const rows = db.prepare("SELECT COUNT(*) AS total FROM attachments").get() as { total: number };
+        assert.equal(Number(rows.total), 0, "a refused upload must leave no bytes behind");
+      });
     },
     { maxStoreBytes: MAX_ATTACHMENT_BYTES + 1_000_000 },
   );
@@ -1034,7 +1191,8 @@ test("an attachment over the whole-store cap is refused", async () => {
   );
 });
 
-test("a manifest is not readable as bytes, and a missing one is a typed error", async () => {  await withStore(async (store) => {
+test("a missing attachment is a typed error in both directions", async () => {
+  await withStore(async (store) => {
     const session = await newSession(store);
     await store.spoolAttachment(session.storeId, {
       attachmentId: "att-1",
@@ -1042,8 +1200,7 @@ test("a manifest is not readable as bytes, and a missing one is a typed error", 
       mimeType: "text/plain",
       bytes: Buffer.from("payload", "utf8"),
     });
-    // "att-1.json" is a legal attachment id, so the two namespaces have to be
-    // separate directories rather than two extensions in one.
+    // "att-1.json" is a legal attachment id, and it is a different row.
     await assert.rejects(
       () => store.readAttachment(session.storeId, "att-1.json"),
       (error: unknown) =>
@@ -1056,6 +1213,13 @@ test("a manifest is not readable as bytes, and a missing one is a typed error", 
     );
     await assert.rejects(
       () => store.readAttachment(session.storeId, "never-spooled"),
+      (error: unknown) =>
+        error instanceof SessionStoreError && error.code === "E_STORE_UNKNOWN_ATTACHMENT",
+    );
+    // And an attachment belonging to another session is not reachable from this one.
+    const other = await newSession(store);
+    await assert.rejects(
+      () => store.readAttachment(other.storeId, "att-1"),
       (error: unknown) =>
         error instanceof SessionStoreError && error.code === "E_STORE_UNKNOWN_ATTACHMENT",
     );
@@ -1085,10 +1249,9 @@ test("an unused attachment can be dropped, and deleting the session takes the re
         error instanceof SessionStoreError && error.code === "E_STORE_UNKNOWN_ATTACHMENT",
     );
 
-    // A used attachment still goes when the session does.
     await spool("att-3");
     assert.equal(await store.remove(session.storeId), true);
-    assert.deepEqual(await fsp.readdir(root), []);
+    assert.deepEqual(await storeRootEntries(root), DB_AND_SIDECARS);
   });
 });
 
@@ -1108,263 +1271,10 @@ test("a store that is not open refuses to spool", async () => {
   await fsp.rm(root, { recursive: true, force: true });
 });
 
-// --- path safety ---
-
-test("session directories never escape the store root", async () => {
-  await withStore(async (store, root) => {
-    // A hostile harness controls this string completely.
-    const session = await newSession(store, {
-      harnessSessionId: "../../../../etc/passwd",
-      projectId: "..",
-      title: "traversal attempt",
-    });
-    store.append(session.storeId, delta(1, "contained"));
-    await store.flushMeta(session.storeId);
-    const entries = await fsp.readdir(root, { withFileTypes: true });
-    assert.equal(entries.length, 1);
-    assert.ok(entries[0]?.isDirectory());
-    assert.match(entries[0]?.name ?? "", /^s-[0-9a-f]{32}$/);
-    assert.equal(path.dirname(path.join(root, entries[0]!.name)), root);
-  });
-});
-
-test("the name predicate refuses every hazard ooxml-core already refuses", () => {
-  for (const bad of [
-    "", ".", "..", " ", "trailing.", "trailing ", "with\nnewline", "with\ttab",
-    "nul\u0000byte", "del\u007f", "c1\u0085", "con", "NUL", "com1", "lpt9",
-    "__proto__", "C:", "sess:ion", "zero\u200bwidth", "bidi\u202eoverride",
-    "a".repeat(256),
-  ]) {
-    assert.equal(isSafeNameSegment(bad), false, `${JSON.stringify(bad)} should be refused`);
-  }
-  for (const good of ["s-" + "a".repeat(34), "events.jsonl", "meta.json", "0", "a.b.c"]) {
-    assert.equal(isSafeNameSegment(good), true, `${JSON.stringify(good)} should be allowed`);
-  }
-  // A NUL byte must be a refusal, not a TypeError from deep inside a write.
-  assert.equal(unsafeNameReason("a\u0000b"), "control");
-});
-
-// --- title hygiene ---
-
-test("a harness-supplied title is stripped, collapsed and cut on a grapheme", () => {
-  assert.equal(sanitizeTitle(""), "Untitled task");
-  assert.equal(sanitizeTitle("   "), "Untitled task");
-  assert.equal(sanitizeTitle("hello\nworld"), "hello world");
-  // A bidi override in a sidebar row can render neighbouring text.
-  assert.equal(sanitizeTitle("safe\u202evil"), "safevil");
-  assert.equal(sanitizeTitle("a\u0007b"), "a b");
-  // Astral characters must not be split into mojibake by a naive slice.
-  const cut = sanitizeTitle("\u{1F680}".repeat(200), 10);
-  assert.ok(!cut.includes("\ufffd"), "no replacement characters from a split surrogate pair");
-  assert.ok([...cut].length <= 11, `expected at most 11 graphemes, got ${[...cut].length}`);
-  assert.ok(cut.endsWith("…"));
-});
-
-test("a session title is bounded in the list response", async () => {
-  await withStore(async (store) => {
-    const session = await newSession(store, { title: "x".repeat(20_000) });
-    const summary = store.summary(session.storeId);
-    assert.ok(summary !== null);
-    assert.ok((summary?.title.length ?? 0) <= 200);
-  });
-});
-
-// --- boot reconciliation ---
-// The meta is flushed on a timer and at turn end, so after an unclean exit it
-// can sit behind the log. Appending against a stale lastSeq re-issued sequence
-// numbers that were already on disk, and from there every read of that session
-// failed permanently.
-
-test("a boot takes the log as the authority when the stored summary lags it", async () => {
-  const root = tempRoot();
-  const options = { root, onError: () => {} } as const;
-  const first = new SessionStore(options);
-  await first.open();
-  let storeId = "";
-  try {
-    storeId = (await newSession(first)).storeId;
-    for (let index = 1; index <= 5; index += 1) first.append(storeId, delta(index, `m${index}`));
-    await first.flushMeta(storeId);
-  } finally {
-    await first.close();
-  }
-
-  // Model an unclean exit: the log has five records, the meta still claims two.
-  const metaPath = await metaPathOf(root);
-  const parsed = JSON.parse(await fsp.readFile(metaPath, "utf8")) as Record<string, unknown>;
-  parsed["lastSeq"] = 2;
-  await fsp.writeFile(metaPath, JSON.stringify(parsed), "utf8");
-
-  const second = new SessionStore(options);
-  await second.open();
-  try {
-    assert.equal(second.meta(storeId)?.lastSeq, 5, "the log wins");
-    // Appending must not reissue a number the log already holds.
-    second.append(storeId, delta(6, "m6"));
-    await second.flushMeta(storeId);
-    const page = await second.read(storeId, null);
-    const seqs = page.events.map((e) => e.seq);
-    assert.deepEqual(seqs, [1, 2, 3, 4, 5, 6], "no duplicate and no gap");
-    assert.ok(page.dropped === 0, `dropped ${page.dropped}`);
-  } finally {
-    await second.close();
-    await fsp.rm(root, { recursive: true, force: true });
-  }
-});
-
-test("a boot takes the lowest sequence on disk as the start of the log", async () => {
-  // The case a crash during a session's first turn produces: the log holds
-  // several records and the meta was never flushed, so it still claims
-  // firstSeq 0. Deriving the repair from lastSeq claimed the log began at its
-  // final record, and the opening of the conversation became unreadable.
-  const root = tempRoot();
-  const options = { root, onError: () => {} } as const;
-  const first = new SessionStore(options);
-  await first.open();
-  let storeId = "";
-  try {
-    storeId = (await newSession(first)).storeId;
-    for (let index = 1; index <= 4; index += 1) first.append(storeId, delta(index, `m${index}`));
-    await first.flushAll();
-  } finally {
-    await first.close();
-  }
-
-  // Model the unclean exit: no meta flush ever ran.
-  const metaPath = await metaPathOf(root);
-  const parsed = JSON.parse(await fsp.readFile(metaPath, "utf8")) as Record<string, unknown>;
-  parsed["firstSeq"] = 0;
-  parsed["lastSeq"] = 0;
-  await fsp.writeFile(metaPath, JSON.stringify(parsed), "utf8");
-
-  const second = new SessionStore(options);
-  await second.open();
-  try {
-    assert.equal(second.meta(storeId)?.firstSeq, 1, "the log begins at its first record");
-    const page = await second.read(storeId, null);
-    assert.deepEqual(
-      page.events.map((e) => e.seq),
-      [1, 2, 3, 4],
-      "so a reader is served the whole transcript, not its last record",
-    );
-  } finally {
-    await second.close();
-    await fsp.rm(root, { recursive: true, force: true });
-  }
-});
-
-test("the list is ordered by recency, not by how many records a task holds", async () => {
-  // `lastSeq` counts records inside one session. Ordering on it put a long old
-  // task above a short new one, which is the opposite of "newest first".
-  await withStore(async (store) => {
-    const old = await newSession(store, { title: "long old task" });
-    for (let index = 1; index <= 9; index += 1) store.append(old.storeId, delta(index, `m${index}`));
-    await store.flushMeta(old.storeId);
-
-    const fresh = await newSession(store, { title: "short new task" });
-    store.append(fresh.storeId, delta(1, "one"));
-    await store.flushMeta(fresh.storeId);
-
-    const listed = store.list().map((entry) => entry.storeId);
-    assert.equal(listed[0], fresh.storeId, "the newer task is first");
-    assert.equal(listed[1], old.storeId, "and the longer older one is second");
-  });
-});
-
-test("a boot marks a log that ended mid-turn instead of reporting it complete", async () => {
-  // Nothing runs on SIGKILL, so the terminator written on a graceful release is
-  // best-effort. Without this, a reloaded transcript showed tool cards spinning
-  // forever while the store called the session complete.
-  const root = tempRoot();
-  const options = { root, onError: () => {} } as const;
-  const faults: SessionStoreError[] = [];
-  const first = new SessionStore(options);
-  await first.open();
-  let storeId = "";
-  try {
-    storeId = (await newSession(first)).storeId;
-    first.append(storeId, delta(1, "partial"));
-    first.append(storeId, {
-      type: "tool.updated",
-      sessionId: "ses_live",
-      turnId: "t-1",
-      toolCallId: "tool-1",
-      title: "a long build",
-      status: "in_progress",
-      lifecycle: "active",
-    });
-    await first.flushMeta(storeId);
-  } finally {
-    await first.close();
-  }
-
-  const second = new SessionStore({ root, onError: (e) => faults.push(e) });
-  await second.open();
-  try {
-    const meta = second.meta(storeId);
-    assert.equal(meta?.endedMidTurn, true, "the unclean end is recorded");
-    assert.equal(meta?.truncated, true, "and the summary stops claiming completeness");
-    assert.ok(faults.some((f) => f.code === "E_STORE_CORRUPT_LOG"), "and it is reported");
-  } finally {
-    await second.close();
-    await fsp.rm(root, { recursive: true, force: true });
-  }
-});
-
-test("a log that ended cleanly is not marked as ending mid-turn", async () => {
-  const root = tempRoot();
-  const options = { root, onError: () => {} } as const;
-  const first = new SessionStore(options);
-  await first.open();
-  let storeId = "";
-  try {
-    storeId = (await newSession(first)).storeId;
-    first.append(storeId, delta(1, "done"));
-    first.append(storeId, {
-      type: "turn.completed",
-      sessionId: "ses_live",
-      turnId: "t-1",
-      stopReason: "end_turn",
-    });
-    await first.flushMeta(storeId);
-  } finally {
-    await first.close();
-  }
-  // Re-open against the same root so reconciliation runs.
-  const second = new SessionStore(options);
-  await second.open();
-  try {
-    const meta = second.meta(storeId);
-    assert.equal(meta?.endedMidTurn, false, "a clean end must not look unclean");
-    assert.equal(meta?.truncated, false);
-  } finally {
-    await second.close();
-    await fsp.rm(root, { recursive: true, force: true });
-  }
-});
-
-test("a backwards step in the log degrades to a reported loss, never a broken page", async () => {
-  // A negative dropped count failed the response schema, and the API turned that
-  // into an anonymous 500: a session that could be listed but never reopened.
-  await withStore(async (store, root) => {
-    const session = await newSession(store);
-    for (let index = 1; index <= 4; index += 1) store.append(session.storeId, delta(index, `m${index}`));
-    await store.flushMeta(session.storeId);
-    const logPath = await logPathOf(root);
-    const lines = (await fsp.readFile(logPath, "utf8")).split("\n").filter(Boolean);
-    // Re-emit an earlier record at the end: the file steps backwards.
-    await fsp.appendFile(logPath, `${lines[0]}\n`, "utf8");
-    const page = await store.read(session.storeId, null);
-    assert.ok(page.dropped >= 0, "dropped must never be negative");
-    // And the page must still satisfy the response contract.
-    assert.equal(SessionEventsResponseSchema.safeParse(page).success, true);
-  });
-});
-
 test("the whole-store cap bites on the second upload, not only the first", async () => {
   // The ceiling used to be checked against a counter the spool never added to, so
-  // every upload passed the check however many had gone before and the disk grew
-  // without bound. Two uploads that each fit must together exceed the cap.
+  // every upload passed the check however many had gone before. Two uploads that
+  // each fit must together exceed the cap.
   await withStore(
     async (store) => {
       const session = await newSession(store);
@@ -1381,8 +1291,8 @@ test("the whole-store cap bites on the second upload, not only the first", async
         (error: unknown) => error instanceof SessionStoreError && error.code === "E_STORE_QUOTA",
         "2 x 2 KB must not both fit under a 3 KB cap",
       );
-      // And the refused one left nothing behind: the bytes file is not there,
-      // so a later turn naming it would not find a manifest to read.
+      // And the refused one left nothing behind, so a later turn naming it would
+      // not find a row to read.
       await assert.rejects(
         () => store.readAttachment(session.storeId, "att-2"),
         (error: unknown) =>
@@ -1437,4 +1347,440 @@ test("removing a session gives its spooled bytes back", async () => {
     },
     { maxStoreBytes: 3_000 },
   );
+});
+
+// --- title hygiene ---
+
+test("a harness-supplied title is stripped, collapsed and cut on a grapheme", () => {
+  assert.equal(sanitizeTitle(""), "Untitled task");
+  assert.equal(sanitizeTitle("   "), "Untitled task");
+  assert.equal(sanitizeTitle("hello\nworld"), "hello world");
+  // A bidi override in a sidebar row can render neighbouring text.
+  assert.equal(sanitizeTitle("safe\u202evil"), "safevil");
+  assert.equal(sanitizeTitle("a\u0007b"), "a b");
+  // Astral characters must not be split into mojibake by a naive slice.
+  const cut = sanitizeTitle("\u{1F680}".repeat(200), 10);
+  assert.ok(!cut.includes("\ufffd"), "no replacement characters from a split surrogate pair");
+  assert.ok([...cut].length <= 11, `expected at most 11 graphemes, got ${String([...cut].length)}`);
+  assert.ok(cut.endsWith("…"));
+});
+
+test("a session title is bounded in the list response", async () => {
+  await withStore(async (store) => {
+    const session = await newSession(store, { title: "x".repeat(20_000) });
+    const summary = store.summary(session.storeId);
+    assert.ok(summary !== null, "the session is listed");
+    // `summary.title` and not `summary?.title`: the optional chain turned a null
+    // summary into `undefined <= 200`, which passes and proves nothing.
+    assert.ok(
+      summary.title.length <= 200,
+      `expected at most 200 characters, got ${String(summary.title.length)}`,
+    );
+  });
+});
+
+test("a prompt of literally the placeholder does not re-arm the title fallback", async () => {
+  // Comparing against the rendered string meant turn two of such a session
+  // silently renamed it from the harness's own title back to the prompt's.
+  await withStore(async (store) => {
+    const session = await newSession(store, { title: "Untitled task" });
+    store.append(session.storeId, delta(1, "x"));
+    await store.flushMeta(session.storeId);
+    store.setTitle(session.storeId, "the harness named this");
+    store.titleFromPrompt(session.storeId, "Untitled task");
+    assert.equal(store.summary(session.storeId)?.title, "the harness named this");
+  });
+});
+
+// --- boot reconciliation ---
+// A summary can sit behind its own events, so the events win. Nothing that a
+// transaction does produces this any more, but the repair is cheap and the case
+// it covers is a real one: a database copied or restored from a snapshot.
+
+test("a boot takes the events as the authority when the stored summary lags them", async () => {
+  const root = tempRoot();
+  const options = { root, onError: () => {} } as const;
+  const first = new SessionStore(options);
+  await first.open();
+  let storeId = "";
+  try {
+    storeId = (await newSession(first)).storeId;
+    for (let index = 1; index <= 5; index += 1) first.append(storeId, delta(index, `m${index}`));
+    await first.flushMeta(storeId);
+  } finally {
+    await first.close();
+  }
+
+  poke(root, (db) => {
+    db.prepare("UPDATE sessions SET last_seq = 2, bytes = 0 WHERE store_id = ?").run(storeId);
+  });
+
+  const second = new SessionStore(options);
+  await second.open();
+  try {
+    assert.equal(second.meta(storeId)?.lastSeq, 5, "the events win");
+    // Appending must not reissue a number the events already hold.
+    second.append(storeId, delta(6, "m6"));
+    await second.flushMeta(storeId);
+    const page = await second.read(storeId, null);
+    assert.deepEqual(page.events.map((e) => e.seq), [1, 2, 3, 4, 5, 6], "no duplicate and no gap");
+    assert.equal(page.dropped, 0, `dropped ${String(page.dropped)}`);
+  } finally {
+    await second.close();
+    await fsp.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a boot takes the lowest stored sequence as the start of the log", async () => {
+  // The case a crash during a session's first turn produced: several records
+  // stored and a summary that still claimed firstSeq 0. Deriving the repair from
+  // lastSeq claimed the log began at its final record, and the opening of the
+  // conversation became unreadable.
+  const root = tempRoot();
+  const options = { root, onError: () => {} } as const;
+  const first = new SessionStore(options);
+  await first.open();
+  let storeId = "";
+  try {
+    storeId = (await newSession(first)).storeId;
+    for (let index = 1; index <= 4; index += 1) first.append(storeId, delta(index, `m${index}`));
+    await first.flushAll();
+  } finally {
+    await first.close();
+  }
+
+  poke(root, (db) => {
+    db.prepare("UPDATE sessions SET first_seq = 0, last_seq = 0 WHERE store_id = ?").run(storeId);
+  });
+
+  const second = new SessionStore(options);
+  await second.open();
+  try {
+    assert.equal(second.meta(storeId)?.firstSeq, 1, "the log begins at its first record");
+    assert.deepEqual(
+      (await second.read(storeId, null)).events.map((e) => e.seq),
+      [1, 2, 3, 4],
+      "so a reader is served the whole transcript, not its last record",
+    );
+  } finally {
+    await second.close();
+    await fsp.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("the list is ordered by recency, not by how many records a task holds", async () => {
+  // lastSeq counts records inside one session, so it is not a clock. Ordering on
+  // it, or using it to break a tie, put a long old task above a short new one,
+  // which is the opposite of what the column claims.
+  //
+  // The clock is pinned one millisecond apart, and the tie case is covered
+  // separately, because with a real clock this test silently became a coin flip
+  // about whether two creates landed in the same millisecond.
+  let clock = 10_000;
+  await withStore(
+    async (store) => {
+      clock += 1_000;
+      const old = await newSession(store, { title: "long old task" });
+      for (let index = 1; index <= 9; index += 1) {
+        clock += 1;
+        store.append(old.storeId, delta(index, `m${index}`));
+      }
+      await store.flushMeta(old.storeId);
+
+      clock += 1_000;
+      const fresh = await newSession(store, { title: "short new task" });
+      clock += 1;
+      store.append(fresh.storeId, delta(1, "one"));
+      await store.flushMeta(fresh.storeId);
+
+      const listed = store.list().map((entry) => entry.storeId);
+      assert.equal(listed[0], fresh.storeId, "the newer task is first");
+      assert.equal(listed[1], old.storeId, "and the longer older one is second");
+    },
+    { now: () => clock },
+  );
+});
+
+test("a completed turn is counted, and a boot that finds an open one says so", async () => {
+  // Nothing runs on SIGKILL, so a terminator written on a graceful release is
+  // best-effort. Without this, a reloaded transcript showed tool cards spinning
+  // for ever while the store called the session complete.
+  const faults: SessionStoreError[] = [];
+  const root = tempRoot();
+  const options = { root, onError: () => {} } as const;
+  const first = new SessionStore(options);
+  await first.open();
+  let openId = "";
+  let closedId = "";
+  try {
+    openId = (await newSession(first, { title: "cut short" })).storeId;
+    first.append(openId, delta(1, "partial"));
+    first.append(openId, {
+      type: "tool.updated",
+      sessionId: "ses_live",
+      turnId: "t-1",
+      toolCallId: "tool-1",
+      title: "a long build",
+      status: "in_progress",
+      lifecycle: "active",
+    });
+    await first.flushMeta(openId);
+
+    closedId = (await newSession(first, { title: "finished" })).storeId;
+    first.append(closedId, delta(1, "done"));
+    first.append(closedId, {
+      type: "turn.completed",
+      sessionId: "ses_live",
+      turnId: "t-1",
+      stopReason: "end_turn",
+    });
+    await first.flushMeta(closedId);
+    assert.equal(first.summary(closedId)?.turnCount, 1, "a completed turn is counted once");
+  } finally {
+    await first.close();
+  }
+
+  const second = new SessionStore({ root, onError: (e) => faults.push(e) });
+  await second.open();
+  try {
+    assert.equal(second.meta(openId)?.endedMidTurn, true, "the unclean end is recorded");
+    assert.equal(second.meta(openId)?.truncated, true, "and the summary stops claiming completeness");
+    assert.equal(second.meta(closedId)?.endedMidTurn, false, "a clean end must not look unclean");
+    assert.equal(second.meta(closedId)?.truncated, false);
+    assert.ok(faults.some((f) => f.code === "E_STORE_CORRUPT_LOG"), "and it is reported");
+  } finally {
+    await second.close();
+    await fsp.rm(root, { recursive: true, force: true });
+  }
+});
+
+// --- migration from the pre-SQLite layout ---
+
+function legacyMeta(overrides: Record<string, unknown> = {}): string {
+  return JSON.stringify({
+    v: 1,
+    storeId: "11111111-1111-4111-8111-111111111111",
+    harness: "opencode",
+    harnessSessionId: "ses_legacy",
+    projectId: "proj-1",
+    projectName: "k5-work",
+    cwd: "/home/k5/code/k5-work",
+    title: "an older task",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-02T00:00:00.000Z",
+    turnCount: 1,
+    firstSeq: 1,
+    lastSeq: 2,
+    bytes: 0,
+    truncated: false,
+    titleSource: "prompt",
+    endedMidTurn: false,
+    ...overrides,
+  });
+}
+
+function legacyLine(seq: number, text: string): string {
+  return `${JSON.stringify({
+    v: 1,
+    seq,
+    ts: "2026-01-01T00:00:00.000Z",
+    event: delta(seq, text),
+  })}\n`;
+}
+
+test("an existing pre-SQLite store is imported once, and its transcripts read back", async () => {
+  // A rewrite that dropped the old layout would take a user's history with it.
+  // The import is one transaction per session, so a failure part-way leaves the
+  // sessions it did import intact.
+  const root = tempRoot();
+  try {
+    await fsp.mkdir(path.join(root, "s-abc123"), { recursive: true });
+    await fsp.writeFile(path.join(root, "s-abc123", "meta.json"), legacyMeta(), "utf8");
+    await fsp.writeFile(
+      path.join(root, "s-abc123", "events.jsonl"),
+      legacyLine(1, "hello from before") + legacyLine(2, "and again"),
+      "utf8",
+    );
+
+    const store = new SessionStore({ root, onError: () => {} });
+    await store.open();
+    try {
+      const listed = store.list();
+      assert.equal(listed.length, 1, "the old session is a k5 session now");
+      assert.equal(listed[0]?.title, "an older task");
+      assert.equal(listed[0]?.turnCount, 1);
+      const page = await store.read(listed[0]?.storeId ?? "", null);
+      const texts = page.events.map((e) => (e.event.type === "turn.delta" ? e.event.text : ""));
+      assert.deepEqual(texts, ["hello from before", "and again"], "the transcript came across whole");
+      assert.equal(page.dropped, 0);
+      // The old files are left alone: they are somebody's history, and an import
+      // is not consent to delete it.
+      assert.ok((await fsp.stat(path.join(root, "s-abc123", "events.jsonl"))).size > 0);
+    } finally {
+      await store.close();
+    }
+
+    // A second open imports nothing, because the database already holds a session.
+    const again = new SessionStore({ root, onError: () => {} });
+    await again.open();
+    try {
+      assert.equal(again.list().length, 1, "no duplicate on the next boot");
+    } finally {
+      await again.close();
+    }
+  } finally {
+    await fsp.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a legacy directory that is not a session does not stop the import", async () => {
+  const root = tempRoot();
+  try {
+    await fsp.mkdir(path.join(root, "s-broken"), { recursive: true });
+    await fsp.writeFile(path.join(root, "s-broken", "meta.json"), "{ not json", "utf8");
+    await fsp.mkdir(path.join(root, "s-empty"), { recursive: true });
+    await fsp.mkdir(path.join(root, "s-good"), { recursive: true });
+    await fsp.writeFile(path.join(root, "s-good", "meta.json"), legacyMeta(), "utf8");
+    // A log whose last line was never finished is not a record, and is not imported.
+    await fsp.writeFile(
+      path.join(root, "s-good", "events.jsonl"),
+      legacyLine(1, "only the complete one") + '{"v":1,"seq":2,"ts":"x","eve',
+      "utf8",
+    );
+
+    const faults: SessionStoreError[] = [];
+    const store = new SessionStore({ root, onError: (e) => faults.push(e) });
+    await store.open();
+    try {
+      assert.equal(store.list().length, 1, "the good session still came across");
+      assert.deepEqual(
+        (await store.read(store.list()[0]?.storeId ?? "", null)).events.map((e) => e.seq),
+        [1],
+        "and the torn line was not imported as a record",
+      );
+      assert.ok(faults.some((f) => f.code === "E_STORE_META_CORRUPT"), "the broken one is reported");
+    } finally {
+      await store.close();
+    }
+  } finally {
+    await fsp.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("an imported session obeys the caps from then on", async () => {
+  // The old meta's byte count described a JSONL file including its newlines and
+  // wrapper, so carrying it over would have made the cap wrong in both directions.
+  const root = tempRoot();
+  try {
+    await fsp.mkdir(path.join(root, "s-abc123"), { recursive: true });
+    await fsp.writeFile(path.join(root, "s-abc123", "meta.json"), legacyMeta({ bytes: 999_999 }), "utf8");
+    await fsp.writeFile(path.join(root, "s-abc123", "events.jsonl"), legacyLine(1, "short"), "utf8");
+
+    const store = new SessionStore({ root, maxSessionBytes: 5_000, onError: () => {} });
+    await store.open();
+    try {
+      const id = store.list()[0]?.storeId ?? "";
+      assert.ok((store.meta(id)?.bytes ?? 0) < 5_000, "the byte count is re-measured, not carried over");
+      const chunk = "z".repeat(2_000);
+      for (let index = 1; index <= 20; index += 1) store.append(id, delta(index, chunk));
+      await store.flushMeta(id);
+      assert.equal(store.summary(id)?.truncated, true, "so the cap still bites");
+    } finally {
+      await store.close();
+    }
+  } finally {
+    await fsp.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("an import interrupted half way finishes on the next boot", async () => {
+  // Gating the import on the store being empty meant a crash, a full disk, or a
+  // kill part-way through left the remaining legacy directories unreachable for
+  // ever: no diagnostic, no way back, because the old files are deliberately never
+  // deleted. The marker is what tells "never started" from "half finished".
+  const root = tempRoot();
+  try {
+    const write = async (id: string, text: string): Promise<void> => {
+      const dir = path.join(root, `s-${id}`);
+      await fsp.mkdir(dir, { recursive: true });
+      await fsp.writeFile(
+        path.join(dir, "meta.json"),
+        legacyMeta({ storeId: id, title: text }),
+        "utf8",
+      );
+      await fsp.writeFile(path.join(dir, "events.jsonl"), legacyLine(1, text), "utf8");
+    };
+    const one = "11111111-1111-4111-8111-111111111111";
+    const two = "22222222-2222-4222-8222-222222222222";
+    await write(one, "first");
+    await write(two, "second");
+
+    // The state a half-finished import leaves: one session in the database, the
+    // marker absent, the second directory still on disk.
+    const half = new DatabaseSync(path.join(root, DB_NAME));
+    half.exec(`CREATE TABLE IF NOT EXISTS sessions (
+      store_id TEXT PRIMARY KEY, harness TEXT, harness_session_id TEXT, project_id TEXT,
+      project_name TEXT, cwd TEXT, title TEXT, created_at TEXT, updated_at TEXT,
+      turn_count INTEGER, first_seq INTEGER, last_seq INTEGER, bytes INTEGER,
+      truncated INTEGER, title_source TEXT, ended_mid_turn INTEGER) STRICT`);
+    half.exec(`CREATE TABLE IF NOT EXISTS events (
+      store_id TEXT NOT NULL, seq INTEGER NOT NULL, ts TEXT NOT NULL, payload TEXT NOT NULL,
+      bytes INTEGER NOT NULL, PRIMARY KEY (store_id, seq)) WITHOUT ROWID`);
+    half.prepare(
+      "INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    ).run(
+      one, "opencode", "ses_legacy", "proj-1", "k5-work", "/home/k5/code/k5-work", "first",
+      "2026-01-01T00:00:00.000Z", "2026-01-02T00:00:00.000Z", 1, 1, 1, 100, 0, "prompt", 0,
+    );
+    half.close();
+
+    const store = new SessionStore({ root, onError: () => {} });
+    await store.open();
+    try {
+      const titles = store.list().map((entry) => entry.title).sort();
+      assert.deepEqual(
+        titles,
+        ["first", "second"],
+        "the second task must be reachable, not stranded on disk",
+      );
+    } finally {
+      await store.close();
+    }
+  } finally {
+    await fsp.rm(root, { recursive: true, force: true });
+  }
+});
+
+// --- schema version ---
+
+test("a database from a newer build is refused rather than half-read", async () => {
+  const root = tempRoot();
+  try {
+    const seed = new DatabaseSync(path.join(root, DB_NAME));
+    seed.exec("PRAGMA user_version = 99");
+    seed.close();
+
+    const store = new SessionStore({ root, onError: () => {} });
+    await assert.rejects(
+      () => store.open(),
+      (error: unknown) => error instanceof SessionStoreError && error.code === "E_STORE_ROOT",
+      "an unknown future schema is not guessed at",
+    );
+    // And the handle was released, so the file is not left open behind a refusal.
+    const reopened = new DatabaseSync(path.join(root, DB_NAME));
+    assert.equal((reopened.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 99);
+    reopened.close();
+  } finally {
+    await fsp.rm(root, { recursive: true, force: true });
+  }
+});
+
+// --- the defaults still mean something ---
+
+test("the shipped caps hold their documented relationships", () => {
+  // A per-session cap above the store cap would make one session's limit
+  // unreachable, and a page ceiling above the store cap would make a page
+  // unservable.
+  assert.ok(MAX_SESSION_BYTES < MAX_STORE_BYTES, "one session cannot outgrow the whole store");
+  assert.ok(MAX_LINE_BYTES < MAX_SESSION_BYTES, "one record cannot outgrow a session");
 });

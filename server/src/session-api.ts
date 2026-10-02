@@ -262,11 +262,15 @@ export function handleSessionApiRequest(
           // The reverse state for a durable store. Without it a user can never
           // remove a session, and AGENTS.md is explicit that a one-way door is a
           // bug: the store would accumulate transcripts with no way out.
-          res.setHeader("Allow", "GET, DELETE");
           if (tail !== "") {
+            // A sub-resource is read-only even though its parent is deletable, so
+            // it must not inherit the parent's Allow. Advertising DELETE on
+            // `/events` tells a client something this route will refuse.
+            res.setHeader("Allow", "GET");
             sendJson(res, 405, { error: "Method not allowed" });
             return;
           }
+          res.setHeader("Allow", "GET, DELETE");
           const removed = await store.remove(storeId);
           if (!removed) {
             sendJson(res, 404, { error: "No such stored session" });
