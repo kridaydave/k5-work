@@ -200,6 +200,24 @@ rather than two. The wire accepts it; whether the model can see it is a separate
 default model here has no vision and says so in plain words, which is a model capability
 and not a protocol failure.
 
+## A per-file cap is not a per-prompt cap
+
+The wire accepted eight attachments of 25 MB each. Nothing was wrong with any one of them,
+so nothing objected, and the service read every file into memory before it built a single
+block: 200 MB resident at once, and base64 expanding each one by four thirds before the
+bytes were serialised, so the real peak was nearer 270 MB. On a machine that also has to hold
+a dev server and a harness process, that is the spike that makes the process look like it
+leaked.
+
+A second ceiling now applies to one prompt's attachments added together. It is checked from
+the manifests, before the first byte is read, because a refusal that has already loaded the
+files it is refusing is a refusal that pays the cost it exists to avoid. The prompt is refused
+whole rather than trimmed: a turn that silently drops half its attachments is worse than one
+the user can retry after attaching less.
+
+The per-file cap stays, because a single large file is a thing a user genuinely wants to
+attach and 25 MB is a fair answer to that. It is the *count* of them that needs a bound.
+
 ## Spooled bytes are charged, and charged back
 
 The whole-store ceiling was checked against a counter the spool never incremented, so every
@@ -217,7 +235,7 @@ raced, and whatever landed is given back before the failure is reported.
 
 ## Bytes are never recorded, only a manifest
 
-A base64 image in `events.jsonl` would blow the store's 12 MiB per-session cap and render as
+A base64 image in the events table would blow the store's 12 MiB per-session cap and render as
 a wall of garbage in the user bubble. The transcript records name, mime, size and kind.
 
 ## A resolved posture needs a discriminator or it is a lie

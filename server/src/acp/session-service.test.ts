@@ -69,6 +69,8 @@ async function start(options: {
   idleTtlMs?: number;
   /** Wires a real durable store, so recording is exercised end to end. */
   record?: boolean;
+  /** Test-only override of the one-prompt attachment budget. */
+  maxPromptAttachmentBytes?: number;
   /**
    * The rule list a real resolver reports. Omitted means the resolver cannot be
    * read at all, which is the state every other scenario in this file is already
@@ -123,6 +125,9 @@ async function start(options: {
           resolve: (id) => (id === (options.projectId ?? "p-1") ? projectDir : null),
         },
         onChild: (child) => children.push(child),
+        ...(options.maxPromptAttachmentBytes === undefined
+          ? {}
+          : { maxPromptAttachmentBytes: options.maxPromptAttachmentBytes }),
         ...(store === null
           ? {}
           : {
@@ -987,7 +992,60 @@ describe("a prompt that carries attachments", () => {
     }
   });
 
-  it("refuses a turn whose attachment is not in the spool, and opens no turn", async () => {
+  it("refuses a prompt whose attachments are individually legal but jointly too large", async () => {
+  // Each attachment well under the 25 MB per-file cap, together over the
+  // one-prompt cap. Nothing was wrong with any single file, so nothing read them
+  // all before noticing: eight legal attachments is 200 MB of bytes in memory at
+  // once, and base64 pushes the real peak higher still. The budget is checked
+  // from the manifests, before a byte is read, so the refusal is cheap.
+  const harness = await start({
+    record: true,
+    scenario: "echo-blocks",
+    maxPromptAttachmentBytes: 3_000,
+  });
+  try {
+    const { store, storeId, sessionId, ws } = await openedSession(harness);
+    // Two real 2 KB files: each is fine on its own, together they are over the
+    // 3 KB budget this test runs with.
+    const ids = ["att-0", "att-1"];
+    for (const attachmentId of ids) {
+      await store.spoolAttachment(storeId, {
+        attachmentId,
+        name: `${attachmentId}.bin`,
+        mimeType: "application/octet-stream",
+        bytes: Buffer.alloc(2_000, 7),
+      });
+    }
+
+    ws.send(
+      JSON.stringify({
+        commandId: "c-big",
+        type: "session.prompt",
+        sessionId,
+        turnId: "t-1",
+        text: "all of it",
+        attachments: ids.map((attachmentId) => ({ attachmentId })),
+      }),
+    );
+    const refused = await waitForCommand(harness.events, "c-big");
+    assert.equal(refused.ok, false);
+    assert.equal(
+      refused.reason,
+      "payload-too-large",
+      "a prompt over the aggregate budget is refused as too large, not as missing",
+    );
+    assert.match(refused.message ?? "", /over the 3000-byte cap for one prompt/);
+    assert.equal(
+      harness.events.some((event) => event.type === "turn.started"),
+      false,
+      "nothing may start when the prompt is refused",
+    );
+  } finally {
+    await harness.close();
+  }
+});
+
+it("refuses a turn whose attachment is not in the spool, and opens no turn", async () => {
     // The user's bytes would never reach the model, so a turn that started anyway
     // would claim otherwise. Both halves matter: the refusal is visible, and
     // nothing started.

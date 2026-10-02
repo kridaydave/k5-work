@@ -1,5 +1,6 @@
 import path from "node:path";
 import {
+  MAX_PROMPT_ATTACHMENT_BYTES,
   resolveAccessProfile,
   type AttachmentManifestEntry,
   type BrowserCommand,
@@ -60,6 +61,13 @@ export interface SessionServiceOptions {
    * caller can assert that a list left nothing running.
    */
   onChild?: (child: AcpChild) => void;
+  /**
+   * Ceiling on one prompt's attachments added together.
+   *
+   * Overridable only so a test can prove the refusal without spooling 64 MB of
+   * real files. Production always takes the shared default.
+   */
+  maxPromptAttachmentBytes?: number;
   /** Maps a wire failure reason onto the closed CommandFailureReason union. */
   onAudit?: (entry: {
     sessionId: string | null;
@@ -719,7 +727,7 @@ export function createSessionHandlers(
     command: Extract<BrowserCommand, { type: "session.prompt" }>,
   ): Promise<
     | { manifest: AttachmentManifestEntry[]; plan: PlannedPrompt }
-    | { refusal: { reason: "not-found" | "capability-unsupported"; message: string } }
+    | { refusal: { reason: "not-found" | "capability-unsupported" | "payload-too-large"; message: string } }
   > {
     const storeId = state.storeId;
     const recorder = options.recorder;
@@ -731,12 +739,14 @@ export function createSessionHandlers(
         },
       };
     }
-    const attachments: { manifest: AttachmentManifestEntry; bytes: Buffer }[] = [];
+    // Manifests first, and in full, before a single byte is read. The budget is
+    // decided from their recorded sizes, so a prompt over it is refused without
+    // having loaded the files it is refusing — otherwise the refusal itself is
+    // what spikes the heap, on exactly the prompts that cannot afford it.
+    const manifests: AttachmentManifestEntry[] = [];
     for (const ref of command.attachments) {
       try {
-        const manifest = await recorder.attachmentManifest(storeId, ref.attachmentId);
-        const bytes = await recorder.readAttachment(storeId, ref.attachmentId);
-        attachments.push({ manifest, bytes });
+        manifests.push(await recorder.attachmentManifest(storeId, ref.attachmentId));
       } catch (err) {
         return {
           refusal: {
@@ -745,6 +755,22 @@ export function createSessionHandlers(
           },
         };
       }
+    }
+    const budget = options.maxPromptAttachmentBytes ?? MAX_PROMPT_ATTACHMENT_BYTES;
+    const totalBytes = manifests.reduce((sum, entry) => sum + entry.size, 0);
+    if (totalBytes > budget) {
+      return {
+        refusal: {
+          reason: "payload-too-large" as const,
+          message: `this prompt's attachments total ${totalBytes} bytes, over the ${budget}-byte cap for one prompt; attach fewer or smaller files`,
+        },
+      };
+    }
+
+    const attachments: { manifest: AttachmentManifestEntry; bytes: Buffer }[] = [];
+    for (const ref of command.attachments) {
+      const bytes = await recorder.readAttachment(storeId, ref.attachmentId);
+      attachments.push({ manifest: manifests[attachments.length]!, bytes });
     }
     const acp = state.acp;
     // The seat is the only thing that knows what the harness can accept, so the

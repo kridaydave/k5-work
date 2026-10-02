@@ -39,6 +39,22 @@ export type AttachmentId = z.infer<typeof AttachmentIdSchema>;
 export const MAX_ATTACHMENTS = 8;
 export const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
 
+/**
+ * Ceiling on one prompt's attachments added together.
+ *
+ * The per-attachment cap alone bounds nothing useful on its own: eight legal
+ * 25 MB attachments is 200 MB, and every one of them is held in memory at once
+ * while the prompt blocks are built. Base64 then expands each by four thirds
+ * before the bytes are serialised, so the real peak is nearer 270 MB than the
+ * 200 MB the store agrees to.
+ *
+ * A single attachment's cap is what a user attaching one large file has to live
+ * with; this is what the count of them adds up to. A prompt over it is refused
+ * whole rather than truncated, because a prompt that silently drops half its
+ * attachments is worse than one the user can retry.
+ */
+export const MAX_PROMPT_ATTACHMENT_BYTES = 64 * 1024 * 1024;
+
 export const AttachmentKindSchema = z.enum(["text", "image", "binary"]);
 export type AttachmentKind = z.infer<typeof AttachmentKindSchema>;
 
