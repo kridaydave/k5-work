@@ -1,5 +1,17 @@
 import path from "node:path";
+import os from "node:os";
 import { isIP } from "node:net";
+
+/**
+ * The server-wide ceiling on how long one request may take.
+ *
+ * Shared rather than repeated: the attachment upload answers a stalled client with
+ * its own 408 after this long, and the ordering is load-bearing. Node kills the
+ * socket at `requestTimeout`, so a shorter upload timer would never fire and a
+ * clean 408 would become a truncated connection instead. Two files holding the
+ * same number with only a comment tying them together is a cap that drifts.
+ */
+export const REQUEST_TIMEOUT_MS = 30_000;
 
 export class ServerConfigError extends Error {
   constructor(message: string) {
@@ -19,6 +31,12 @@ export interface ServerConfig {
   allowedOrigins: readonly string[] | null;
   allowedHosts: readonly string[];
   disableLiveSeats: boolean;
+  /**
+   * Root of the durable session store. Injected rather than derived at import
+   * time for the same reason workspaceRoot is: module-scope filesystem work
+   * would run when module-graph.test.ts imports every compiled module.
+   */
+  storeRoot: string;
 }
 
 export function isLoopbackHost(host: string): boolean {
@@ -97,6 +115,79 @@ function deriveLoopbackHosts(): string[] {
 export interface LoadServerConfigOptions {
   env?: NodeJS.ProcessEnv;
   workspaceRoot: string;
+  /**
+   * Home directory to resolve the store root against. Injected rather than read
+   * from os.homedir() so the XDG rules below are testable without a real home.
+   */
+  homeDir?: string;
+}
+
+/**
+ * Resolves the durable store root.
+ *
+ * The XDG base directory spec says a *relative* XDG_DATA_HOME is invalid and
+ * must be ignored in favour of the default. Resolving it instead would anchor
+ * the store to process.cwd(), which differs under `npm run dev`, systemd and a
+ * process manager, so the same machine would keep three different transcripts.
+ * `~` is not expanded by path.resolve, so a literal `~` directory would be
+ * created instead of being reported.
+ *
+ * The result is then checked against the directories it must never be, because
+ * XDG_DATA_HOME=/tmp/../etc resolves to /etc and a store inside /etc is
+ * perfectly writable.
+ */
+export function resolveStoreRoot(
+  env: NodeJS.ProcessEnv = process.env,
+  homeDir: string = os.homedir(),
+): string {
+  const raw = env.XDG_DATA_HOME?.trim();
+  let base: string;
+  if (raw === undefined || raw === "") {
+    base = path.join(homeDir, ".local", "share");
+  } else if (raw.startsWith("~")) {
+    throw new ServerConfigError(
+      `XDG_DATA_HOME must be an absolute path, got a home-relative value: ${JSON.stringify(raw)}`,
+    );
+  } else if (!path.isAbsolute(raw)) {
+    // Ignored per spec, but an operator who set this deserves to be told.
+    throw new ServerConfigError(
+      `XDG_DATA_HOME must be an absolute path, got a relative value: ${JSON.stringify(raw)}`,
+    );
+  } else {
+    base = raw;
+  }
+
+  // The check is on the base, not on the joined root. resolve(base, "k5-work")
+  // can never equal its own base, so testing the root could never fire; what
+  // actually matters is that the operator has not pointed the store at a system
+  // directory or at $HOME itself, since XDG_DATA_HOME=/etc would otherwise
+  // create /etc/k5-work and scatter transcripts through a system tree.
+  //
+  // $HOME/.local/share is deliberately NOT forbidden: it is the spec's own
+  // default, so refusing it would stop every ordinary boot.
+  const resolvedBase = path.resolve(base);
+  const home = path.resolve(homeDir);
+  const forbidden = new Set(
+    [
+      "/",
+      "/etc",
+      "/usr",
+      "/var",
+      "/bin",
+      "/sbin",
+      "/lib",
+      "/lib64",
+      "/boot",
+      "/opt",
+      home,
+    ].map((candidate) => path.resolve(candidate)),
+  );
+  if (forbidden.has(resolvedBase)) {
+    throw new ServerConfigError(
+      `XDG_DATA_HOME resolves to a directory the session store must never live under: ${resolvedBase}`,
+    );
+  }
+  return path.join(resolvedBase, "k5-work");
 }
 
 export function loadServerConfig(options: LoadServerConfigOptions): ServerConfig {
@@ -139,6 +230,7 @@ export function loadServerConfig(options: LoadServerConfigOptions): ServerConfig
     })(),
     allowedHosts,
     disableLiveSeats: env.K5_DISABLE_LIVE_SEATS === "true",
+    storeRoot: resolveStoreRoot(env, options.homeDir ?? os.homedir()),
   };
 }
 

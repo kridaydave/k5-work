@@ -3,14 +3,25 @@ import {
   Composer,
   type ComposerSettings,
   type PromptSubmission,
+  type RestoredSubmission,
 } from "@/components/Composer";
 import { Markdown } from "@/components/Markdown";
 import { PathPromptModal } from "@/components/PathPromptModal";
 import { Sidebar, type Session } from "@/components/Sidebar";
+import { ShieldCheckIcon } from "@/components/icons";
+import { ToolCard } from "@/components/ToolCard";
 import { Wallpaper } from "@/components/Wallpaper";
 import { WindowChrome } from "@/components/WindowChrome";
+import type {
+  AttachmentRef,
+  PostureGrant,
+  ProjectedTranscript,
+  ResolvedPostureReport,
+} from "@k5-work/shared";
+import { uploadAttachments } from "@/hooks/useAttachments";
 import { useK5Socket } from "@/hooks/useK5Socket";
 import { useProjects } from "@/hooks/useProjects";
+import { readStoredTranscript, useStoredSessions } from "@/hooks/useStoredSessions";
 import { cn } from "@/utils/cn";
 
 // Only `full` is servable: OpenCode 1.18.31 resolves a blanket `*: allow` and
@@ -24,6 +35,41 @@ const DEFAULT_COMPOSER_SETTINGS: ComposerSettings = {
   mode: "",
   permissions: "full",
 };
+
+/** How much of the streamed thought text is shown, oldest characters dropped. */
+const THOUGHT_TAIL_CHARS = 400;
+
+/**
+ * What the seat's harness actually resolved, in words the resolver supports.
+ *
+ * The unverified check comes first and returns early on purpose. An unreadable
+ * posture reaches the browser as `wildcardAllow: true` with nothing behind it,
+ * so a caller that read that flag before asking whether it was earned would
+ * render an unevidenced claim of unrestricted access — which is the exact lie
+ * this replaced. A named list and a blanket wildcard are also not the same fact
+ * and are never phrased the same way.
+ */
+function describePosture(posture: ResolvedPostureReport | null): {
+  summary: string;
+  grants: PostureGrant[];
+} {
+  if (posture === null || !posture.verified) {
+    return { summary: "Permissions not verified for this seat", grants: [] };
+  }
+  if (posture.wildcardAllow) {
+    return { summary: "Every tool allowed, with no scope", grants: [] };
+  }
+  // Every grant is listed, not only the named ones: a `*` grant carrying a
+  // pattern is a subtree allow, and hiding it would understate the posture.
+  const grants = posture.grants;
+  return {
+    summary:
+      grants.length === 1
+        ? "1 permission granted"
+        : `${String(grants.length)} permissions granted`,
+    grants,
+  };
+}
 
 export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
@@ -43,45 +89,187 @@ export default function App() {
     selectProject,
     openPath,
   } = useProjects();
-  const k5 = useK5Socket();
-  const { state } = k5;
-  // The Composer clears its textarea on send and onSend returns void, so a
-  // prompt issued while the seat is still opening must be held here rather than
-  // dropped. Bounded to one turn: a second queued prompt is refused visibly
-  // rather than silently lost.
-  const queuedPrompt = useRef<string | null>(null);
+  // The durable task list, read over HTTP with no harness process involved. The
+  // sidebar is populated from disk, not from the live session alone, so a reload
+  // shows the history that is actually there.
+  const {
+    sessions: storedSessions,
+    error: storedSessionsError,
+    remove: removeStored,
+    refresh: refreshStored,
+  } = useStoredSessions();
+  // Re-read the transcript after a reconnect, before the new socket can deliver
+  // anything: a turn that finished while the socket was down would otherwise be
+  // silently lost, because the socket never replays and the store is the record.
+  const [rehydrated, setRehydrated] = useState<ProjectedTranscript | null>(null);
+  // The task on screen, mirrored in a ref because the read is asynchronous and
+  // its callback cannot see the render that started it.
+  const openStoreId = useRef<string | null>(null);
+  const rehydrate = useCallback(async (storeId: string) => {
+    const { transcript } = await readStoredTranscript(storeId);
+    // Only the task on screen may replace what is on screen. Two quick clicks on
+    // the sidebar start two reads, and the slower one belongs to the task the
+    // user has already left, so adopting it would put the wrong conversation
+    // beside the right task with nothing on screen to say so.
+    if (openStoreId.current !== storeId) return;
+    setRehydrated(transcript);
+  }, []);
+  const k5 = useK5Socket({ rehydrate });
+  const { state, adoptTranscript } = k5;
+  openStoreId.current = state.storeId;
+  // The Composer clears its textarea and its chips once the parent confirms the
+  // submission went out. On the lazy-open path that confirmation cannot happen
+  // inline — the seat is still opening when onSend returns — so the whole
+  // submission is held here, files included: the bytes cannot be uploaded before
+  // the spool exists. Bounded to one turn: a second queued prompt is refused
+  // visibly rather than silently lost.
+  const queuedPrompt = useRef<PromptSubmission | null>(null);
   const queueFullRef = useRef(false);
+  // A refused submission pushed back into the Composer. Needed for exactly one
+  // case — the seat was still opening when Send was pressed, so the answer came
+  // back after onSend had already resolved — and kept out of the return value for
+  // every other one.
+  const [restore, setRestore] = useState<RestoredSubmission | null>(null);
+  const restoreId = useRef(0);
   // A model/mode the user picked but the harness has not confirmed yet.
   const pendingChoice = useRef<{ model?: string; mode?: string }>({});
   // The last confirmed values, so a refused change can be rolled back to what
   // the seat is actually running.
   const confirmed = useRef<{ model?: string; mode?: string }>({});
 
+  // A stored transcript replaces the visible entries until the live socket takes
+  // over. Hydrated through the reducer so the shape the socket appends to is the
+  // one the store produced.
+  //
+  // `adoptTranscript` is destructured out and depended on directly. Depending on
+  // the whole `k5` object was an unbounded render loop: the hook returns a bare
+  // object literal, so it is a new identity every render, and `hydrateTranscript`
+  // always returns a fresh state, so the call is never a referential no-op. The
+  // effect re-fired, re-rendered, and spun the tab's CPU until React tore it down.
+  // `adoptTranscript` is a `useCallback` with no dependencies, so it is stable.
+  useEffect(() => {
+    if (rehydrated === null) return;
+    adoptTranscript(rehydrated);
+    // Cleared once adopted, because the value is a handover rather than a
+    // description of the transcript. Left in place it would be re-adopted by
+    // any future re-render that produces a new callback identity, overwriting
+    // live state with a history that has since grown.
+    setRehydrated(null);
+  }, [rehydrated, adoptTranscript]);
+
+  /**
+   * Puts a submission the parent could not deliver back into the Composer.
+   *
+   * The Composer owns the files, so returning them means a prop rather than
+   * clearing and re-adding them. `restore.id` makes a repeated return of the same
+   * files observable, so the Composer can ignore an id it has already applied.
+   */
+  const handBack = useCallback((submission: PromptSubmission) => {
+    restoreId.current += 1;
+    setRestore({
+      id: restoreId.current,
+      text: submission.text,
+      attachments: submission.attachments,
+    });
+  }, []);
+
+  /**
+   * Uploads a submission's files, then prompts. Shared by the direct send and the
+   * lazy-open flush so both paths read the spool the same way.
+   *
+   * `storeId` is k5's own id: the spool lives in the store, and the harness's
+   * opaque session id addresses nothing on this side of the wire.
+   */
+  const deliver = useCallback(
+    async (submission: PromptSubmission, storeId: string | null): Promise<boolean> => {
+      let refs: AttachmentRef[] = [];
+      if (submission.attachments.length > 0) {
+        if (storeId === null) {
+          setTranscriptNote("Attachments need an open task, so the prompt was not sent.");
+          return false;
+        }
+        try {
+          const uploaded = await uploadAttachments(storeId, submission.attachments);
+          refs = uploaded.map((entry) => ({ attachmentId: entry.attachmentId }));
+        } catch (cause) {
+          setTranscriptNote(
+            `The attachments were not uploaded: ${
+              cause instanceof Error ? cause.message : "the upload did not finish"
+            }`,
+          );
+          // The bytes are still in the Composer's hands, which is why this reports
+          // a refusal instead of prompting without them.
+          return false;
+        }
+      }
+      k5.prompt(submission.text, refs);
+      return true;
+    },
+    [k5],
+  );
+
   const messages = state.entries;
   const active = state.entries.length > 0;
   // The existing working dots are reused rather than a new busy prop.
   const pending = state.turnStatus === "running" || state.turnStatus === "cancelling";
+  // One turn's tool rail and nothing historical: the reducer clears it when the
+  // next turn begins, so a card here is always work from the turn on screen.
+  const liveTools = Object.values(state.tools);
+  // Thought deltas accumulate for the whole turn and are never cleared by
+  // `turn.completed`, so the tail is shown while the turn runs and dropped once
+  // the answer is in the transcript. A harness that narrates for minutes must
+  // not be able to push the whole conversation off the screen.
+  const thought = state.thinking.trim();
+  const thinking =
+    thought.length > THOUGHT_TAIL_CHARS ? `…${thought.slice(-THOUGHT_TAIL_CHARS)}` : thought;
+  // Only while a seat is live. With no seat there is no posture to report, and an
+  // empty hero must stay clean, so the unverified line belongs to a session, not
+  // to the screen.
+  const seatPosture = state.session === "open" ? describePosture(state.posture) : null;
 
   // Derived from real state only. k5 has no session history yet, so the sidebar
   // shows the live session and nothing else rather than plausible-looking rows
   // for work that never happened.
   const sidebarSessions = useMemo<Session[]>(() => {
-    if (state.sessionId === null || activeProject === undefined) return [];
-    const model = state.configOptions.find((o) => o.id === "model")?.current;
-    const title = activeProject.name;
-    return [
-      {
-        id: state.sessionId,
-        title,
-        meta: model ?? "connecting",
-        group: "This task",
-      },
-    ];
-  }, [activeProject, state.sessionId, state.configOptions]);
+    // Real stored tasks, newest first, grouped the way the sidebar already
+    // expects. Nothing here is invented: a task that was never recorded does not
+    // appear, because there is no record of it to show.
+    const stored: Session[] = storedSessions.map((entry) => ({
+      id: entry.storeId,
+      title: entry.title,
+      meta: entry.turnCount === 1 ? "1 turn" : `${String(entry.turnCount)} turns`,
+      group: entry.truncated ? "Incomplete" : "Tasks",
+    }));
+    // The live session is shown only when the store has not caught up with it yet,
+    // so opening a task does not make a duplicate row appear.
+    const live =
+      state.storeId !== null && stored.some((entry) => entry.id === state.storeId)
+        ? []
+        : state.storeId !== null && activeProject !== undefined
+          ? [
+              {
+                // The k5 store id, not the harness's session id: every handler in
+                // the sidebar addresses a stored task by store id, and the live
+                // row was the one row carrying something else. Selecting it asked
+                // the server to continue a session the browser is not allowed to
+                // name, and removing it sent a DELETE for a session the store has
+                // never heard of.
+                id: state.storeId,
+                title: activeProject.name,
+                meta: state.configOptions.find((o) => o.id === "model")?.current ?? "connecting",
+                group: "This task",
+              },
+            ]
+          : [];
+    return [...live, ...stored];
+  }, [activeProject, state.sessionId, state.storeId, state.configOptions, storedSessions]);
 
   const handleNewTask = useCallback(() => {
     queuedPrompt.current = null;
     queueFullRef.current = false;
+    // A remounted Composer would otherwise replay the last refused submission,
+    // resurrecting files into a task the user just walked away from.
+    setRestore(null);
     pendingChoice.current = {};
     confirmed.current = {};
     // A new task must clear any note; a stale error above an empty hero reads as
@@ -133,7 +321,15 @@ export default function App() {
   useEffect(() => {
     if (state.session !== "failed") return;
     setTranscriptNote(state.sessionMessage ?? `Session failed: ${state.sessionReason ?? "unknown"}`);
-  }, [state.session, state.sessionMessage, state.sessionReason]);
+    // A prompt queued against a seat that then refused to open is now a prompt
+    // that will never be sent, so its files go back to the Composer rather than
+    // staying in a ref nobody renders.
+    const stranded = queuedPrompt.current;
+    if (stranded === null) return;
+    queuedPrompt.current = null;
+    queueFullRef.current = false;
+    handBack(stranded);
+  }, [handBack, state.session, state.sessionMessage, state.sessionReason]);
 
   useEffect(() => {
     const element = mainRef.current;
@@ -142,62 +338,120 @@ export default function App() {
     element.scrollTo({ top: element.scrollHeight, behavior: smooth ? "smooth" : "auto" });
   }, [messages.length, pending]);
 
-  // A queued prompt is sent as soon as the session opens, so the submission
-  // always reaches the harness.
+  // A healthy session clears the previous failure note.
   useEffect(() => {
-    // A healthy session clears the previous failure note.
     if (state.session === "open") setTranscriptNote(null);
   }, [state.session]);
 
+  // The stored list is a snapshot taken when the tab mounted. A task recorded here
+  // is not in it, so its row is missing, and once it is in it the turn count is
+  // frozen at whatever it was when the snapshot was taken.
+  //
+  // Re-read on the two things that change what the store holds: a session being
+  // opened, and a turn reaching a terminal state. Nothing polls, because nothing
+  // else moves the list. The previous status is held in a ref because an effect
+  // cannot tell "just became" from "has been", and a turn that ends in an error is
+  // still a turn the store recorded.
+  const lastTurnStatus = useRef(state.turnStatus);
+  useEffect(() => {
+    if (state.storeId !== null) refreshStored();
+    const was = lastTurnStatus.current;
+    lastTurnStatus.current = state.turnStatus;
+    if (was === "running" || was === "cancelling") {
+      if (state.turnStatus === "idle" || state.turnStatus === "done" || state.turnStatus === "error") {
+        refreshStored();
+      }
+    }
+  }, [refreshStored, state.storeId, state.turnStatus]);
+
+  // A queued prompt is sent as soon as the session opens, so the submission
+  // always reaches the harness.
   useEffect(() => {
     const queued = queuedPrompt.current;
     if (state.sessionId === null || queued === null) return;
-    setTranscriptNote(null);
+    // Cleared before the await, not after: this effect re-runs on every render,
+    // and leaving the submission queued would send it twice.
     queuedPrompt.current = null;
     queueFullRef.current = false;
-    k5.prompt(queued);
-  }, [k5, state.sessionId]);
+    void (async () => {
+      const delivered = await deliver(queued, state.storeId);
+      if (delivered) setTranscriptNote(null);
+      else handBack(queued);
+    })();
+  }, [deliver, handBack, state.sessionId, state.storeId]);
 
   const handleSend = useCallback(
-    (submission: PromptSubmission) => {
+    async (submission: PromptSubmission): Promise<boolean> => {
       const text = submission.text.trim();
-      if (!text) return;
+      if (!text) return false;
       const busy = state.turnStatus === "running" || state.turnStatus === "cancelling";
       if (busy || queuedPrompt.current !== null) {
-        if (queueFullRef.current) return;
+        if (queueFullRef.current) return false;
         queueFullRef.current = true;
         setTranscriptNote("One prompt is already queued. Wait for it to finish.");
-        return;
+        return false;
       }
       if (state.sessionId === null) {
-        if (!activeProject) return;
+        if (!activeProject) return false;
         if (state.session === "failed") {
           setTranscriptNote(
             state.sessionMessage ?? "The previous session could not be opened.",
           );
-          return;
+          return false;
         }
         // The seat opens lazily on the first prompt, so an empty hero costs no
-        // harness process.
-        queuedPrompt.current = text;
+        // harness process. There is no store to spool into yet, so the files ride
+        // along and go up once the flush effect sees a session.
+        queuedPrompt.current = { ...submission, text };
         k5.openSession(activeProject.id);
-        return;
+        return true;
       }
-      k5.prompt(text);
+      return deliver(submission, state.storeId);
     },
-    [activeProject, k5, state.session, state.sessionId, state.sessionMessage, state.turnStatus],
+    [activeProject, deliver, k5, state.session, state.sessionId, state.sessionMessage, state.storeId, state.turnStatus],
+  );
+
+  const handleRemoveSession = useCallback(
+    (session: Session) => {
+      // A removed task is gone from the store, so the list refreshes on its own
+      // receipt rather than optimistically. Removing the task that is on screen
+      // leaves it there: the live seat is not the store record, and pretending
+      // otherwise would hide work the harness is still running.
+      if (session.id === state.storeId) return;
+      void removeStored(session.id).then((removed) => {
+        // A delete that did not happen is reported rather than left to look like
+        // a list that has not refreshed yet. The promise is handled here because
+        // a rejected fetch from a click handler is an unhandled rejection.
+        if (removed) return;
+        setTranscriptNote("That task could not be removed from the store.");
+      }, (cause: unknown) => {
+        setTranscriptNote(
+          `That task could not be removed: ${cause instanceof Error ? cause.message : "the request failed"}`,
+        );
+      });
+    },
+    [removeStored, state.storeId],
   );
 
   const handleSelectSession = useCallback(
     (session: Session) => {
-      // The sidebar still lists placeholder sessions from the original build.
-      // Selecting one used to fabricate a transcript; now that it would also
-      // close a live seat, it does nothing at all. Durable session history is
-      // Phase 4 work, and a placeholder that destroys real work is worse than
-      // an honest no-op.
-      void session;
+      // Continuing a stored task, rather than fabricating one. The server
+      // re-validates the recorded cwd and refuses if the project has moved, so
+      // this cannot quietly resume a conversation against the wrong directory.
+      //
+      // Compared against the store id, which is what a stored row carries.
+      // Against the harness session id the guard never matched, so clicking the
+      // task already on screen asked the server to continue a session this
+      // connection already holds and was answered with a refusal.
+      if (session.id === state.storeId) return;
+      setTranscriptNote(null);
+      // The transcript is not read here: the socket reads it when the server
+      // reports the continuation, so the history lands on the session the load
+      // actually opened rather than on whatever was on screen when the click
+      // happened.
+      k5.loadSession(session.id);
     },
-    [],
+    [k5, state.storeId],
   );
 
   const handleSelectProject = useCallback(
@@ -241,6 +495,8 @@ export default function App() {
           onOpenProject={handleOpenProject}
           onSelectProject={handleSelectProject}
           onSelectSession={handleSelectSession}
+          onRemoveSession={handleRemoveSession}
+          storedSessionsError={storedSessionsError}
           sessions={sidebarSessions}
           connection={state.connection}
         />
@@ -276,6 +532,18 @@ export default function App() {
                     </div>
                   ),
                 )}
+                {liveTools.length > 0 ? (
+                  <ul aria-label="Tool calls in this turn" className="flex flex-col gap-1.5">
+                    {liveTools.map((card) => (
+                      <ToolCard key={card.toolCallId} card={card} />
+                    ))}
+                  </ul>
+                ) : null}
+                {pending && thinking.length > 0 ? (
+                  <p className="break-words whitespace-pre-wrap text-[12px] leading-relaxed text-white/35">
+                    {thinking}
+                  </p>
+                ) : null}
                 {pending ? (
                   <div className="flex items-center gap-1.5 py-1" aria-label="The agent is working">
                     {[0, 1, 2].map((dot) => (
@@ -299,6 +567,39 @@ export default function App() {
               </div>
             ) : null}
 
+            {/* A native disclosure, so closing it needs no state and no new
+                component: the affordance the Composer's permissions pill always
+                implied now has a way to show its evidence and a way to put it
+                away. The summary is the claim, the body is the scope. */}
+            {seatPosture ? (
+              <div className="mx-auto w-full max-w-[800px] pb-2 text-[12px] text-white/55">
+                <details>
+                  <summary
+                    className={cn(
+                      "flex w-fit cursor-pointer list-none items-center gap-1.5",
+                      "transition-colors duration-200 hover:text-white/75",
+                    )}
+                  >
+                    <ShieldCheckIcon className="h-3.5 w-3.5 shrink-0 text-white/45" />
+                    <span className="truncate">{seatPosture.summary}</span>
+                  </summary>
+                  {seatPosture.grants.length > 0 ? (
+                    <ul className="mt-1.5 flex flex-col gap-0.5">
+                      {seatPosture.grants.map((grant) => (
+                        <li
+                          key={`${grant.permission} ${grant.pattern}`}
+                          className="break-words text-white/40"
+                        >
+                          <span className="text-white/60">{grant.permission}</span>
+                          <span> — {grant.pattern}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : null}
+                </details>
+              </div>
+            ) : null}
+
             <div
               ref={composerWrapRef}
               className={cn(
@@ -315,6 +616,7 @@ export default function App() {
                 settings={composerSettings}
                 configOptions={state.session === "open" ? state.configOptions : null}
                 compact={active}
+                restore={restore}
                 onRequestProject={handleOpenProject}
                 onSelectProject={handleSelectProject}
                 onSettingsChange={(next) => {

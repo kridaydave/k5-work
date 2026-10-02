@@ -10,6 +10,7 @@ import type { ToolLifecycle, ToolStatus } from "@k5-work/shared";
 export type UpdateVerdict =
   | { kind: "text"; stream: "text" | "thought"; text: string }
   | { kind: "tool"; toolCallId: string; title: string; status: ToolStatus }
+  | { kind: "session"; title: string | null; updatedAt: string | null }
   | { kind: "ignore"; reason: string }
   | { kind: "suppress"; reason: string };
 
@@ -22,7 +23,6 @@ const IGNORED = {
   usage_update: "usage meters are not rendered in the first slice",
   config_option_update: "config options are only read at session.opened",
   current_mode_update: "modes are not surfaced in the first slice",
-  session_info_update: "session metadata is not rendered in the first slice",
   available_commands_update: "command inventory is bounded, not forwarded",
   plan: "plan rendering is not implemented",
 } satisfies Record<string, string>;
@@ -42,7 +42,7 @@ const SUPPRESSED = {
 // the SDK without a decision here.
 type Unclassified = Exclude<VariantName, keyof typeof IGNORED | keyof typeof SUPPRESSED
   | "agent_message_chunk" | "user_message_chunk" | "agent_thought_chunk"
-  | "tool_call" | "tool_call_update">;
+  | "tool_call" | "tool_call_update" | "session_info_update">;
 const EXHAUSTIVE: Unclassified extends never ? true : never = true;
 void EXHAUSTIVE;
 
@@ -95,6 +95,21 @@ export function classifySessionUpdate(update: SessionUpdate): UpdateVerdict {
       title: typeof payload.title === "string" ? payload.title : "",
       status: toToolStatus(payload.status),
     };
+  }
+
+  if (variant === "session_info_update") {
+    // The harness auto-generates a title after the first meaningful exchange,
+    // and a stored session with no title is a blank row in the sidebar forever.
+    // Both fields are independently optional, so an update carrying only one is
+    // still forwarded with the other left null.
+    const payload = update as { title?: unknown; updatedAt?: unknown };
+    const title = typeof payload.title === "string" && payload.title.length > 0 ? payload.title : null;
+    const updatedAt =
+      typeof payload.updatedAt === "string" && payload.updatedAt.length > 0 ? payload.updatedAt : null;
+    if (title === null && updatedAt === null) {
+      return { kind: "ignore", reason: "session metadata update carried no title or timestamp" };
+    }
+    return { kind: "session", title, updatedAt };
   }
 
   const suppressed = (SUPPRESSED as Record<string, string>)[variant];

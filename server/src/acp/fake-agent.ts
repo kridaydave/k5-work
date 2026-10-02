@@ -21,10 +21,24 @@ export const SCENARIOS = [
   "protocol-mismatch",
   "session-new-auth-required",
   "echo",
+  // Repeats the received prompt back verbatim. The only way a test can see what
+  // the harness actually got, rather than what k5 believes it sent.
+  "echo-blocks",
+  "no-embedded-context",
   "slow",
   "unsupported-request",
   "long-title",
   "permission",
+  "session-title",
+  "meta-update",
+  "no-session-caps",
+  "weird-caps",
+  "slow-resume",
+  // Sends one last chunk *after* the prompt response. Legal ACP: the spec lets
+  // an agent answer the request and then flush trailing notifications, and the
+  // seat's own comments say a client cannot use the response alone as proof the
+  // stream is finished. A seat must survive this and stay usable.
+  "trailing-update",
 ] as const;
 export type Scenario = (typeof SCENARIOS)[number];
 
@@ -42,9 +56,49 @@ export function initializeResult(scenario: Scenario): Json {
   const base: Json = {
     protocolVersion: 1,
     agentInfo: { name: "FakeAgent", version: "0.0.0" },
-    agentCapabilities: { loadSession: false, sessionCapabilities: {} },
+    // Real OpenCode 1.18.32 advertises loadSession plus
+    // {close, fork, list, resume}, so the default fake matches it and the
+    // capability gates are exercised on the happy path.
+    agentCapabilities: {
+      loadSession: true,
+      sessionCapabilities: { list: {}, resume: {}, close: {} },
+      promptCapabilities: { image: true, embeddedContext: true },
+    },
     authMethods: [],
   };
+  if (scenario === "no-session-caps") {
+    // A harness that supports none of the session lifecycle extras. The gates
+    // must refuse rather than call a method it never advertised.
+    return {
+      ...base,
+      agentCapabilities: { loadSession: false, sessionCapabilities: {} },
+    };
+  }
+  if (scenario === "no-embedded-context") {
+    // Text prompts only. `promptCapabilities.embeddedContext` is the gate on ACP
+    // `resource` blocks, so this harness provably cannot take an attachment and
+    // k5 must refuse the turn rather than send a block it will drop.
+    return {
+      ...base,
+      agentCapabilities: {
+        loadSession: true,
+        sessionCapabilities: { list: {}, resume: {}, close: {} },
+        promptCapabilities: { image: true },
+      },
+    };
+  }
+  if (scenario === "weird-caps") {
+    // Capabilities advertised in a shape k5 does not read. The SDK's generated
+    // schema drops these silently, so k5 must treat them as unsupported and say
+    // so rather than failing the seat open.
+    return {
+      ...base,
+      agentCapabilities: {
+        loadSession: "true",
+        sessionCapabilities: { list: true, resume: "yes" },
+      },
+    };
+  }
   if (scenario === "terminal-auth") {
     return { ...base, authMethods: [TERMINAL_AUTH_METHOD] };
   }
@@ -85,11 +139,15 @@ function configOptionsFixture(): Json[] {
   ];
 }
 
-export function promptScript(scenario: Scenario, text: string): {
+export function promptScript(
+  scenario: Scenario,
+  text: string,
+  sessionId = "fake-session-1",
+  blocks: unknown = null,
+): {
   notifications: Json[];
   response: Json;
 } {
-  const sessionId = "fake-session-1";
   const notifications: Json[] = [
     {
       jsonrpc: "2.0",
@@ -129,8 +187,47 @@ export function promptScript(scenario: Scenario, text: string): {
       },
     });
   }
+  // Agents auto-generate a title after the first meaningful exchange, which is
+  // the only reason a stored session is not a blank row in the sidebar forever.
+  if (scenario === "session-title") {
+    notifications.push({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: "session_info_update",
+          title: "Refactor the session store",
+          updatedAt: "2026-09-27T10:00:00.000Z",
+        },
+      },
+    });
+  }
+  // A timestamp with no title. It must reach the service (so the ordering hint
+  // is applied) and must NOT blank a title the session already has.
+  if (scenario === "meta-update") {
+    notifications.push({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: "session_info_update",
+          updatedAt: "2026-09-27T12:00:00.000Z",
+        },
+      },
+    });
+  }
+  // An attachment arrives as a `resource` block, which carries no text, so a
+  // prompt that only joined the text blocks would look identical to one with no
+  // attachment at all. Serialising the whole received array is what makes the
+  // difference observable from the outside.
   const pieces =
-    scenario === "echo" ? [`echo: ${text}`] : ["first ", "second ", "third"];
+    scenario === "echo"
+      ? [`echo: ${text}`]
+      : scenario === "echo-blocks"
+        ? [`blocks:${JSON.stringify(blocks)}`]
+        : ["first ", "second ", "third"];
   for (const piece of pieces) {
     notifications.push({
       jsonrpc: "2.0",
@@ -151,6 +248,62 @@ export function promptScript(scenario: Scenario, text: string): {
   };
 }
 
+/**
+ * Sessions the fake knows about, in the shape `session/list` returns.
+ *
+ * `cwd` comes from the request rather than from `process.cwd()`, because Node
+ * resolves the child's own cwd to the real path: on macOS the client's temp
+ * directory is a symlink under `/var` while `process.cwd()` reports
+ * `/private/var`, so an exact-string filter dropped every fixture and the test
+ * passed on an empty list it never meant to assert on.
+ */
+function listSessionsFixture(requestedCwd: string | null): Json[] {
+  const cwd = requestedCwd ?? process.cwd();
+  return [
+    {
+      sessionId: "fake-session-1",
+      cwd,
+      title: "A previous task",
+      updatedAt: "2026-09-27T09:00:00.000Z",
+    },
+    {
+      sessionId: "fake-session-2",
+      cwd: "/somewhere/else",
+      updatedAt: "2026-09-26T09:00:00.000Z",
+    },
+    {
+      // No title: a session the harness has not named yet.
+      sessionId: "fake-session-3",
+      cwd,
+    },
+  ];
+}
+
+/** The history a `session/load` replays, as `session/update` notifications. */
+function replayScript(sessionId: string): Json[] {
+  return [
+    {
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId,
+        update: { sessionUpdate: "user_message_chunk", content: { type: "text", text: "earlier" } },
+      },
+    },
+    {
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "and the earlier answer" },
+        },
+      },
+    },
+  ];
+}
+
 export function handleMessage(
   scenario: Scenario,
   message: Json,
@@ -158,7 +311,8 @@ export function handleMessage(
 ):
   | { result: Json }
   | { error: { code: number; message: string } }
-  | { hold: true; permission?: boolean; sessionId?: string } {
+  | { hold: true; permission?: boolean; sessionId?: string; holdMs?: number }
+  | { trailing: true; sessionId: string } {
   const { id, method, params } = message as {
     id?: unknown;
     method: string;
@@ -214,16 +368,48 @@ export function handleMessage(
       configOptions = next;
       return { result: { configOptions: next } };
     }
+    case "session/list": {
+      const filterCwd = typeof params?.cwd === "string" ? params.cwd : null;
+      const known = listSessionsFixture(filterCwd);
+      const sessions = filterCwd === null ? known : known.filter((s) => s.cwd === filterCwd);
+      return { result: { sessions } };
+    }
+    case "session/load": {
+      // ACP requires the replay to be streamed and only then answered, and the
+      // client must have attached a queue before the request was issued.
+      const loadId = String(params?.sessionId ?? "");
+      const known = listSessionsFixture(typeof params?.cwd === "string" ? params.cwd : null);
+      if (!known.some((s) => s.sessionId === loadId)) {
+        return { error: { code: -32602, message: `no such session ${loadId}` } };
+      }
+      pending.push(...replayScript(loadId));
+      return { result: { configOptions: configOptionsFixture() } };
+    }
+    case "session/resume": {
+      const resumeId = String(params?.sessionId ?? "");
+      const known = listSessionsFixture(typeof params?.cwd === "string" ? params.cwd : null);
+      if (!known.some((s) => s.sessionId === resumeId)) {
+        return { error: { code: -32602, message: `no such session ${resumeId}` } };
+      }
+      // No replay: that is the whole difference between load and resume.
+      if (scenario === "slow-resume") {
+        // Held open, so a socket that closes mid-continuation lands inside the
+        // window where the seat is adopted but not yet the connection's.
+        return { hold: true, holdMs: 1_500 };
+      }
+      return { result: { configOptions: configOptionsFixture() } };
+    }
     case "session/prompt": {
       if (scenario === "unsupported-request") {
         return { error: { code: -32601, message: "session/prompt unsupported" } };
       }
       const promptSessionId = String(params?.sessionId ?? "fake-session-1");
-    const prompt = params?.prompt as { type?: string; text?: string }[] | undefined;
-      const text = Array.isArray(prompt)
-        ? prompt.filter((b) => b?.type === "text").map((b) => b?.text ?? "").join("")
-        : "";
-      const script = promptScript(scenario, text);
+      const prompt = Array.isArray(params?.prompt) ? (params?.prompt as Json[]) : [];
+      const text = prompt
+        .filter((b) => b?.["type"] === "text")
+        .map((b) => String(b?.["text"] ?? ""))
+        .join("");
+      const script = promptScript(scenario, text, promptSessionId, prompt);
       if (scenario === "permission") {
         pending.push(
           {
@@ -250,6 +436,12 @@ export function handleMessage(
         // race it. `stop` is resolved by run()'s drain loop.
         pending.push(...script.notifications);
         return { hold: true };
+      }
+      if (scenario === "trailing-update") {
+        // Answer the prompt first, then flush a final chunk. The turn is over
+        // from the client's point of view when the response lands, so this
+        // arrives with nothing live to attribute it to.
+        return { trailing: true, sessionId: promptSessionId };
       }
       pending.push(...script.notifications);
       return { result: { stopReason: "end_turn" } };
@@ -355,7 +547,24 @@ function run(scenario: Scenario): void {
         if (holdId === null) return;
         send({ jsonrpc: "2.0", id: holdId, result: { stopReason: "end_turn" } });
         holdId = null;
-      }, 8_000);
+      }, outcome.holdMs ?? 8_000);
+    } else if ("trailing" in outcome) {
+      // The response lands first, then the last chunk. Delayed by a tick so the
+      // ordering is real rather than a same-write race.
+      send({ jsonrpc: "2.0", id, result: { stopReason: "end_turn" } });
+      setTimeout(() => {
+        send({
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: {
+            sessionId: outcome.sessionId,
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: "one last trailing chunk" },
+            },
+          },
+        });
+      }, 10);
     } else if ("error" in outcome) {
       send({ jsonrpc: "2.0", id, error: outcome.error });
     } else {

@@ -17,6 +17,7 @@ import {
   PostureTooWeakError,
   PostureUnverifiableError,
   verifyPosture,
+  type ResolvedPosture,
 } from "./posture.js";
 import { describeFinding, findPluginSignals } from "./plugin-guard.js";
 import { AcpSeat, type AcpSeatInfo, type SeatStreamEvent } from "./acp-seat.js";
@@ -74,6 +75,8 @@ export interface OpenSeatResult {
   acp: AcpSeat;
   info: AcpSeatInfo;
   profile: AccessProfile;
+  /** What the resolver reported for this seat, so it can be published. */
+  posture: ResolvedPosture;
 }
 
 export interface SeatRunnerOptions {
@@ -90,6 +93,13 @@ export interface SeatRunnerOptions {
 const DEFAULT_AGENT = "build";
 
 /**
+ * How many harness processes may exist purely to answer a read at once. Small
+ * on purpose: a read is short, and the point of the cap is to stop a loop from
+ * spawning unbounded children, not to serve a burst.
+ */
+const MAX_INFLIGHT_HEADLESS = 2;
+
+/**
  * Owns the seat open path: policy, then a reserved key, then the harness.
  *
  * Every check that can refuse a seat happens before a child is spawned, except
@@ -98,12 +108,35 @@ const DEFAULT_AGENT = "build";
  * a cap slot is never leaked by a failed open.
  */
 export class SeatRunner {
+  /** See `openHeadless`: the read path takes no keyed reservation, so this is
+   * the only thing bounding how many harness processes a read can spawn. Counted
+   * over the child's whole life, not the length of the open. */
+  private headlessInFlight = 0;
+
   constructor(private readonly options: SeatRunnerOptions) {}
 
-  async open(
-    request: OpenSeatOptions,
-    onEvent: ((turnId: string, event: SeatStreamEvent) => void) | null = null,
-  ): Promise<OpenSeatResult> {
+  /**
+   * The policy gate, in order: enabled, servable profile, no plugins, a
+   * configured command, then a verified posture. Every check that can refuse
+   * happens before a child is spawned, and posture is verified before any
+   * reservation so a failure cannot consume a cap slot.
+   *
+   * Extracted because a read needs the same gate: `session/list` runs a command
+   * against the harness, and a harness whose permissions cannot be verified is
+   * not one to run one against.
+   */
+  private async gate(input: {
+    projectPath: string;
+    access: AccessProfile["label"];
+    /** Skips the posture resolver, for a read that runs no agent code. */
+    skipPosture?: boolean;
+  }): Promise<{
+    profile: AccessProfile;
+    argv: string[];
+    env: NodeJS.ProcessEnv;
+    /** What the resolver reported, or null only when it was skipped. */
+    posture: ResolvedPosture | null;
+  }> {
     if (this.options.disableLiveSeats) {
       throw new SeatOpenError(
         "live-seats-disabled",
@@ -113,16 +146,16 @@ export class SeatRunner {
 
     // Posture first: a profile k5 cannot keep must be refused before it is even
     // looked up, so a browser cannot select a posture by asking for it.
-    if (!isServableProfile(request.access)) {
+    if (!isServableProfile(input.access)) {
       throw new SeatOpenError(
         "profile-not-servable",
-        `the "${request.access}" access profile cannot be enforced by this harness; ` +
+        `the "${input.access}" access profile cannot be enforced by this harness; ` +
           `only ${"full"} is servable. See docs/posture-and-trust-decisions.md`,
       );
     }
-    const profile = resolveAccessProfile(request.access);
+    const profile = resolveAccessProfile(input.access);
 
-    const findings = findPluginSignals(request.projectPath);
+    const findings = findPluginSignals(input.projectPath);
     if (findings.length > 0) {
       throw new SeatOpenError(
         "project-has-plugins",
@@ -141,18 +174,17 @@ export class SeatRunner {
     }
 
     const env = this.options.env ?? process.env;
-    const key = {
-      harness: request.harness,
-      projectId: request.projectId,
-      profile,
-    };
-
-    // Verified before the reservation so a posture failure cannot consume a cap
-    // slot, and re-checked nowhere else: this is the single gate.
+    if (input.skipPosture === true) {
+      return { profile, argv, env, posture: null };
+    }
+    // Kept, not merely checked: the service has to report what was actually
+    // resolved, and re-resolving here would be a second subprocess answering a
+    // question the seat was already accepted on.
+    let posture: ResolvedPosture;
     try {
-      await verifyPosture({
+      posture = await verifyPosture({
         command: argv[0],
-        cwd: request.projectPath,
+        cwd: input.projectPath,
         env,
         agent: this.options.agent ?? DEFAULT_AGENT,
         profile,
@@ -169,6 +201,32 @@ export class SeatRunner {
       }
       throw err;
     }
+    return { profile, argv, env, posture };
+  }
+
+  async open(
+    request: OpenSeatOptions,
+    onEvent: ((turnId: string, event: SeatStreamEvent) => void) | null = null,
+  ): Promise<OpenSeatResult> {
+    const { profile, argv, env, posture } = await this.gate({
+      projectPath: request.projectPath,
+      access: request.access,
+    });
+    // Unreachable while `gate` is the only producer, and refused rather than
+    // tolerated if that ever stops being true: a seat with no resolved posture is
+    // a seat whose permissions nobody read, which is the one thing this whole
+    // path exists to prevent.
+    if (posture === null) {
+      throw new SeatOpenError(
+        "posture-unverifiable",
+        "the seat opened without a resolved permission posture",
+      );
+    }
+    const key = {
+      harness: request.harness,
+      projectId: request.projectId,
+      profile,
+    };
 
     let seat: Seat;
     try {
@@ -201,8 +259,13 @@ export class SeatRunner {
         seat,
         child,
         acp,
-        info: { sessionId: acp.sessionId, configOptions: acp.configOptions },
+        info: {
+          sessionId: acp.sessionId,
+          configOptions: acp.configOptions,
+          capabilities: acp.capabilities,
+        },
         profile,
+        posture,
       };
     } catch (err) {
       // Release the reservation *and* reap the child on every failure path, or
@@ -212,6 +275,152 @@ export class SeatRunner {
       if (child) await child.close();
       throw classifyOpenFailure(err);
     }
+  }
+
+  /**
+   * Opens a connection with no ACP session, for a read that must not create one.
+   *
+   * `session/list` needs a live agent, and the workspace's promise is that an
+   * empty hero costs no lasting harness process. So a list gets a seat of its own
+   * and is reaped as soon as the read is done.
+   *
+   * It deliberately takes no keyed reservation — that is what would let a read
+   * block a real session. But a keyed reservation is not the only bound, and
+   * without any bound this is an unbounded process spawn: measured at 320 MiB
+   * per headless opencode, one tab looping on a refresh reached twenty children
+   * in under ten seconds while the pool reported zero seats. So in-flight reads
+   * are counted against their own small cap.
+   *
+   * The count covers the child's whole life rather than the open. Decrementing
+   * when `openHeadless` returned measured nothing, because the caller then waits
+   * on `listSessions()` for as long as its timeout, and the cap read "two" while
+   * a third, fourth and fifth child were already resident.
+   */
+  async openHeadless(input: {
+    projectId: string;
+    projectPath: string;
+    access?: AccessProfile["label"];
+    /**
+     * True for a read that runs no agent code. A continuation must leave it
+     * false, because from that point the harness will run a prompt.
+     */
+    readOnly?: boolean;
+    /**
+     * Where a promoted seat's turn events go. A `session/list` read never runs a
+     * prompt and needs none; a continuation is about to run one, and a seat with
+     * no callback drops every delta the harness produces for it.
+     */
+    onEvent?: (turnId: string, event: SeatStreamEvent) => void;
+  }): Promise<{
+    child: AcpChild;
+    acp: AcpSeat;
+    profile: AccessProfile;
+    /** Null only for a read that skipped the resolver; a live seat has one. */
+    posture: ResolvedPosture | null;
+    /**
+     * Gives the read seat's cap slot back. Required: the slot is held for the
+     * lifetime of the child, not for the length of the open, because the
+     * process is what the cap exists to bound. Idempotent, so the caller may
+     * release in a `finally` and a promotion may release again.
+     */
+    release: () => void;
+  }> {
+    if (this.headlessInFlight >= MAX_INFLIGHT_HEADLESS) {
+      throw new SeatOpenError(
+        "seat-cap",
+        `already listing sessions in ${String(this.headlessInFlight)} places; try again shortly`,
+      );
+    }
+    this.headlessInFlight += 1;
+    // Released once. Every path out of this method releases the slot, either here
+    // before the throw or in the returned closure once the child is gone.
+    let released = false;
+    const release = (): void => {
+      if (released) return;
+      released = true;
+      this.headlessInFlight -= 1;
+    };
+    try {
+      const { profile, argv, env, posture } = await this.gate({
+        projectPath: input.projectPath,
+        access: input.access ?? "full",
+        // The posture resolver is a subprocess that measured 3.5 s on this
+        // machine, and it exists to bound what agent code may do. `session/list`
+        // runs no agent code: it spawns the harness, handshakes, and reads back
+        // metadata the harness already holds. Paying 3.5 s of that per sidebar
+        // refresh bought nothing. A continuation still pays it, because from that
+        // point the harness will run a prompt.
+        skipPosture: input.readOnly === true,
+      });
+      const child = await spawnAcpChild({ argv, cwd: input.projectPath, env });
+      try {
+        const acp = await AcpSeat.openHeadless(
+          child,
+          {
+            cwd: input.projectPath,
+            ...(this.options.openDeadlineMs === undefined
+              ? {}
+              : { openTimeoutMs: this.options.openDeadlineMs }),
+          },
+          input.onEvent ?? null,
+        );
+        return { child, acp, profile, posture, release };
+      } catch (err) {
+        // The child is the only thing that can leak; there is no reservation.
+        await child.close();
+        release();
+        throw classifyOpenFailure(err);
+      }
+    } catch (err) {
+      // A gate refusal or a spawn failure never produced a child, so nobody else
+      // can release this slot.
+      release();
+      throw err;
+    }
+  }
+
+  /**
+   * Turns a read seat into a live one, for a session that already exists.
+   *
+   * The reservation happens here, after the adopt succeeded, so a failed
+   * continuation never consumed a cap slot. The gate is not re-run: the
+   * headless open already did it, and a second posture verification would be a
+   * second thing that can fail after the harness is already attached to a
+   * session.
+   */
+  promoteAdopted(input: {
+    harness: Harness;
+    projectId: string;
+    projectPath: string;
+    child: AcpChild;
+    acp: AcpSeat;
+    sessionId: string;
+    /**
+     * The read seat's cap slot, handed over here rather than released by the
+     * caller. The child is now a pooled live seat, so counting it as an in-flight
+     * read as well would let a tab's refreshes refuse a real continuation.
+     */
+    release?: () => void;
+  }): Seat {
+    const profile = resolveAccessProfile("full");
+    let seat: Seat;
+    try {
+      seat = this.options.pool.reserve(
+        { harness: input.harness, projectId: input.projectId, profile },
+        input.projectPath,
+      );
+    } catch (err) {
+      // Classified the same way a fresh open classifies them, so "another tab
+      // already has this project" is not reported as a server fault.
+      if (err instanceof SeatCapError) throw new SeatOpenError("seat-cap", err.message);
+      if (err instanceof SeatBusyError) throw new SeatOpenError("seat-busy", err.message);
+      throw err;
+    }
+    this.options.pool.promote(seat, input.sessionId, input.child);
+    // Released only once the pool actually counts the seat, so a promotion that
+    // threw above leaves the read slot held and nothing leaks.
+    input.release?.();
+    return seat;
   }
 }
 

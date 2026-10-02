@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { FolderIcon, PlusIcon, SearchIcon } from "@/components/icons";
+import { CloseIcon, FolderIcon, PlusIcon, SearchIcon } from "@/components/icons";
 import { cn } from "@/utils/cn";
 import type { Project } from "@k5-work/shared";
 import type { ConnectionState } from "@k5-work/shared";
@@ -18,6 +18,19 @@ type SidebarProps = {
   onOpenProject: () => void;
   onSelectProject: (id: string) => void;
   onSelectSession: (session: Session) => void;
+  /**
+   * Removes a stored task. Optional because the live session, which has no store
+   * record yet, cannot be removed. Every task that can be opened can be removed:
+   * a store with no delete is a one-way door.
+   */
+  onRemoveSession?: (session: Session) => void;
+  /**
+   * Why the stored task list could not be read, or null. Shown instead of the list
+   * rather than as an empty one: "No tasks yet" and "the store is unreachable" are
+   * different facts, and a user who cannot see their history needs to be told which
+   * one they are looking at.
+   */
+  storedSessionsError?: string | null;
   /**
    * Real sessions only. k5 does not keep a session history yet, so this is at
    * most the live session; inventing entries here would present work that never
@@ -53,6 +66,8 @@ export function Sidebar({
   onOpenProject,
   onSelectProject,
   onSelectSession,
+  onRemoveSession,
+  storedSessionsError,
   sessions,
   connection = "connecting",
 }: SidebarProps) {
@@ -293,7 +308,7 @@ export function Sidebar({
                       <h3 className="px-2 pb-1.5 text-[11px] font-medium text-white/35">{group.label}</h3>
                       <ul className="space-y-0.5">
                         {group.sessions.map((session) => (
-                          <li key={session.id}>
+                          <li key={session.id} className="group/row relative">
                             <button
                               type="button"
                               onClick={() => runAndClose(() => onSelectSession(session))}
@@ -307,12 +322,30 @@ export function Sidebar({
                               </span>
                               <span className="mt-0.5 block pl-3.5 text-[11px] text-white/30">{session.meta}</span>
                             </button>
+                            {onRemoveSession !== undefined ? (
+                              <button
+                                type="button"
+                                aria-label={`Remove ${session.title}`}
+                                title="Remove this task"
+                                onClick={() => runAndClose(() => onRemoveSession(session))}
+                                // Visible on a coarse pointer, where there is no
+                                // hover to reveal it: a control that only exists
+                                // for a mouse is a one-way door on a tablet.
+                                className="absolute right-1.5 top-1.5 grid h-6 w-6 cursor-pointer place-items-center rounded-lg text-white/30 opacity-100 transition hover:bg-white/[0.07] hover:text-white/70 focus-visible:opacity-100 [@media(hover:hover)]:opacity-0 group-hover/row:[@media(hover:hover)]:opacity-100"
+                              >
+                                <CloseIcon className="h-3.5 w-3.5" />
+                              </button>
+                            ) : null}
                           </li>
                         ))}
                       </ul>
                     </section>
                   ))}
                 </div>
+              ) : storedSessionsError !== undefined && storedSessionsError !== null ? (
+                <p className="px-2 py-2 text-[12px] text-white/45">
+                  Tasks could not be read: {storedSessionsError}
+                </p>
               ) : (
                 <p className="px-2 py-2 text-[12px] text-white/35">
                   {sessions.length === 0 ? "No tasks yet." : "No matching tasks."}

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import type { ServerEvent } from "./contracts.js";
+import type { ResolvedPostureReport, ServerEvent } from "./contracts.js";
 import {
   INITIAL_VIEW_STATE,
   applyServerEvent,
@@ -18,6 +18,7 @@ const opened: ServerEvent = {
   type: "session.opened",
   commandId: "c-1",
   sessionId: "s-1",
+  storeId: "11111111-1111-4111-8111-111111111111",
   projectId: "p-1",
   cwd: "/tmp/p",
   configOptions: [{ id: "model", name: "model", type: "select", current: null, values: [] }],
@@ -128,7 +129,11 @@ describe("view reducer", () => {
 
   it("surfaces a failed open instead of leaving an optimistic pending state", () => {
     let state: K5ViewState = { ...INITIAL_VIEW_STATE, session: "opening" };
-    state = applyServerEvent(state, { type: "command.result", commandId: "c-1", ok: false, reason: "auth-required", message: "login first" });
+    state = applyServerEvent(
+      state,
+      { type: "command.result", commandId: "c-1", ok: false, reason: "auth-required", message: "login first" },
+      "session.open",
+    );
     assert.equal(state.session, "failed");
     assert.equal(state.sessionReason, "auth-required");
     assert.equal(state.sessionMessage, "login first");
@@ -237,6 +242,7 @@ describe("configure failures are not turn failures", () => {
         type: "session.opened",
         commandId: "c-open",
         sessionId: "s-1",
+        storeId: "11111111-1111-4111-8111-111111111111",
         projectId: "p-1",
         cwd: "/tmp/p",
         configOptions: [],
@@ -251,7 +257,7 @@ describe("configure failures are not turn failures", () => {
     ]);
 
   // Built the way the real flow builds it, so there is a live turn to protect.
-  const running: K5ViewState = beginTurn(opened, "t-1", "go");
+  const running: K5ViewState = beginTurn(opened, "t-1", "go", "c-1");
 
   it("keeps a streaming turn alive when a model change is refused", () => {
     // A harness refusing a model change mid-turn says nothing about the turn.
@@ -272,6 +278,7 @@ describe("configure failures are not turn failures", () => {
       { type: "command.result", commandId: "c-1", ok: false, reason: "seat-busy" },
       "session.prompt",
     );
+    // Built the way the real flow builds it, so the refusal belongs to the live turn.
     assert.equal(after.turnStatus, "error");
   });
 
@@ -291,5 +298,230 @@ describe("configure failures are not turn failures", () => {
       text: "still going",
     });
     assert.equal(after.entries.at(-1)?.text, "still going");
+  });
+});
+
+describe("a refusal and a straggler cannot take down a live view", () => {
+  it("does not start a second turn over one that is still running", () => {
+    const state = beginTurn(
+      { ...INITIAL_VIEW_STATE, session: "open", sessionId: "s-1" },
+      "t-A", "first question", "cmdA",
+    );
+    const after = beginTurn(state, "t-B", "second question", "cmdB");
+    assert.equal(after.activeTurnId, "t-A", "the live turn keeps the working view");
+    assert.equal(after.entries.length, 2, "and no optimistic bubble is invented for the second prompt");
+  });
+
+  it("a busy refusal for a different command does not drop the running turn's answer", () => {
+    // The seat reports the second prompt as busy. The turn the user is reading is
+    // the first one, and its command is not the one that was refused. Treating any
+    // failed command as ending that turn stranded the answer mid-stream.
+    let state = beginTurn(
+      { ...INITIAL_VIEW_STATE, session: "open", sessionId: "s-1" },
+      "t-A", "first question", "cmdA",
+    );
+    state = applyServerEvent(
+      state,
+      { type: "command.result", commandId: "cmdB", ok: false, reason: "busy", message: "wait" },
+      "session.prompt",
+    );
+    assert.equal(state.turnStatus, "running");
+    state = applyServerEvent(state, {
+      type: "turn.delta", sessionId: "s-1", turnId: "t-A", stream: "text", text: "THE ANSWER",
+    });
+    assert.equal(state.entries.at(-1)?.text, "THE ANSWER");
+    state = applyServerEvent(state, {
+      type: "turn.completed", sessionId: "s-1", turnId: "t-A", stopReason: "end_turn",
+    });
+    assert.equal(state.turnStatus, "done");
+  });
+
+  it("a refusal does not un-cancel a tool card that the turn already finished", () => {
+    let state = running();
+    state = applyServerEvent(state, {
+      type: "tool.updated", sessionId: "s-1", turnId: "t-1",
+      toolCallId: "tool-1", title: "read", status: "in_progress", lifecycle: "active",
+    });
+    state = applyServerEvent(state, {
+      type: "turn.completed", sessionId: "s-1", turnId: "t-1", stopReason: "end_turn",
+    });
+    assert.equal(state.tools["tool-1"].lifecycle, "cancelled");
+    state = applyServerEvent(state, {
+      type: "tool.updated", sessionId: "s-1", turnId: "t-1",
+      toolCallId: "tool-1", title: "read", status: "in_progress", lifecycle: "active",
+    });
+    assert.equal(state.tools["tool-1"].lifecycle, "cancelled", "the straggler is not let back in");
+    // But a late terminal status is the one thing that may still arrive.
+    state = applyServerEvent(state, {
+      type: "tool.updated", sessionId: "s-1", turnId: "t-1",
+      toolCallId: "tool-1", title: "read", status: "completed", lifecycle: "active",
+    });
+    assert.equal(state.tools["tool-1"].status, "completed", "a late completion honored");
+  });
+
+  it("a closed session from a different id does not clear the view", () => {
+    // Every sibling session event is already scoped to its own session. Close and
+    // reap were not, so a late close for a session that was never the live one
+    // wiped the working view, including the active turn's id.
+    let state = applyServerEvent(
+      { ...INITIAL_VIEW_STATE, session: "open", sessionId: "s-2" },
+      { type: "session.closed", sessionId: "s-1", reason: "client-request" },
+    );
+    assert.equal(state.sessionId, "s-2");
+    assert.equal(state.session, "open");
+    state = applyServerEvent(state, { type: "seat.reaped", sessionId: "s-1", reason: "child-failure" });
+    assert.equal(state.sessionId, "s-2");
+    assert.equal(state.session, "open");
+  });
+});
+
+it("a failed discovery or continuation is not a turn failure", () => {
+  // A sidebar refresh that fails while the model is working used to kill the turn:
+  // the dots stopped and every later delta was dropped, so a finished answer stayed
+  // truncated with an error badge on it.
+  for (const scope of ["session.list", "session.load", "session.configure"] as const) {
+    let state: K5ViewState = beginTurn(INITIAL_VIEW_STATE, "t-1", "do the thing");
+    state = applyServerEvent(state, {
+      type: "turn.started",
+      sessionId: "s-1",
+      turnId: "t-1",
+      userText: "do the thing",
+      attachments: [],
+    });
+    state = applyServerEvent(state, {
+      type: "turn.delta",
+      sessionId: "s-1",
+      turnId: "t-1",
+      stream: "text",
+      text: "working on it",
+    });
+
+    state = applyServerEvent(
+      state,
+      { type: "command.result", commandId: "c-1", ok: false, reason: "posture-unverifiable", message: "no" },
+      scope,
+    );
+    assert.equal(state.turnStatus, "running", `a failed ${scope} must not stop the turn`);
+    assert.equal(state.sessionMessage, "no", `a failed ${scope} is reported`);
+
+    // And the stream continues to land.
+    state = applyServerEvent(state, {
+      type: "turn.delta",
+      sessionId: "s-1",
+      turnId: "t-1",
+      stream: "text",
+      text: " and finished",
+    });
+    state = applyServerEvent(state, {
+      type: "turn.completed",
+      sessionId: "s-1",
+      turnId: "t-1",
+      stopReason: "end_turn",
+    });
+    assert.equal(state.turnStatus, "done");
+    const assistant = state.entries.find((e) => e.id === "assistant:t-1");
+    assert.equal(assistant?.text, "working on it and finished", "the answer is not truncated");
+  }
+});
+
+it("a title does not leak from one session into the next", () => {
+  let state: K5ViewState = applyServerEvent(INITIAL_VIEW_STATE, {
+    type: "session.opened",
+    commandId: "c-1",
+    sessionId: "s-1",
+    storeId: "11111111-1111-4111-8111-111111111111",
+    projectId: "p-1",
+    cwd: "/tmp/p",
+    configOptions: [],
+  });
+  state = applyServerEvent(state, {
+    type: "session.updated",
+    sessionId: "s-1",
+    title: "Named task",
+    updatedAt: null,
+  });
+  assert.equal(state.sessionTitle, "Named task");
+
+  // A new session starts untitled, not carrying the previous one forward.
+  state = applyServerEvent(state, {
+    type: "session.opened",
+    commandId: "c-2",
+    sessionId: "s-2",
+    storeId: "11111111-1111-4111-8111-111111111111",
+    projectId: "p-1",
+    cwd: "/tmp/p",
+    configOptions: [],
+  });
+  assert.equal(state.sessionTitle, null, "a new session must not inherit a title");
+
+  // And a closed session drops it too.
+  state = applyServerEvent(state, {
+    type: "session.updated",
+    sessionId: "s-2",
+    title: "Second",
+    updatedAt: null,
+  });
+  state = applyServerEvent(state, { type: "session.closed", sessionId: "s-2", reason: "client-request" });
+  assert.equal(state.sessionTitle, null, "a closed session drops its title");
+});
+
+describe("the resolved posture follows the session it belongs to", () => {
+  const reported: ResolvedPostureReport = {
+    verified: true,
+    allowedTools: ["read"],
+    wildcardAllow: false,
+    ruleCount: 4,
+    grants: [{ permission: "read", pattern: "*" }],
+  };
+  const postureEvent: ServerEvent = { type: "session.posture", sessionId: "s-1", posture: reported };
+
+  it("lands in view state when the report is for the live session", () => {
+    const state = applyServerEvent(applyServerEvent(INITIAL_VIEW_STATE, opened), postureEvent);
+    assert.deepEqual(state.posture, reported);
+  });
+
+  it("rejects a report for a different session instead of overwriting", () => {
+    // The dangerous half: a report for a reaped seat landing after a new one
+    // opened would otherwise be shown as the new session's permissions, which is
+    // the same unevidenced claim this feature exists to remove.
+    let state = applyServerEvent(INITIAL_VIEW_STATE, opened);
+    state = applyServerEvent(state, postureEvent);
+    const stale = applyServerEvent(state, {
+      type: "session.posture",
+      sessionId: "s-0",
+      posture: { ...reported, verified: false, wildcardAllow: true, grants: [], allowedTools: [] },
+    });
+    assert.deepEqual(stale.posture, reported, "a stale posture must not overwrite a newer one");
+    assert.equal(stale, state, "and it must not even produce a new state object");
+  });
+
+  it("drops it when the session closes and when the seat is reaped", () => {
+    let state = applyServerEvent(INITIAL_VIEW_STATE, opened);
+    state = applyServerEvent(state, postureEvent);
+    assert.deepEqual(applyServerEvent(state, { type: "session.closed", sessionId: "s-1", reason: "client-request" }).posture, null);
+    state = applyServerEvent(applyServerEvent(INITIAL_VIEW_STATE, opened), postureEvent);
+    assert.deepEqual(applyServerEvent(state, { type: "seat.reaped", sessionId: "s-1", reason: "child-failure" }).posture, null);
+  });
+
+  it("does not survive into the next session", () => {
+    let state = applyServerEvent(INITIAL_VIEW_STATE, opened);
+    state = applyServerEvent(state, postureEvent);
+    state = applyServerEvent(state, {
+      type: "session.opened",
+      commandId: "c-2",
+      sessionId: "s-2",
+      storeId: "11111111-1111-4111-8111-111111111111",
+      projectId: "p-1",
+      cwd: "/tmp/p",
+      configOptions: [],
+    });
+    assert.equal(state.posture, null, "a new session must not inherit a posture");
+    // And a new task clears it too, which is where a user watches for it.
+    assert.equal(resetSession(state).posture, null);
+  });
+
+  it("has nothing to show for a session that never reported one", () => {
+    assert.equal(INITIAL_VIEW_STATE.posture, null);
+    assert.equal(applyServerEvent(INITIAL_VIEW_STATE, opened).posture, null);
   });
 });

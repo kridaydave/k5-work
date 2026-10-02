@@ -1,7 +1,9 @@
 import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { ServerEvent } from "@k5-work/shared";
+import { MAX_ATTACHMENTS } from "@k5-work/shared";
+import type { ResolvedPostureReport, ServerEvent } from "@k5-work/shared";
 import type { Scheduler } from "@k5-work/shared";
+import { wsScheme } from "./useK5Socket";
 import { useK5Socket } from "./useK5Socket";
 
 // A controllable WebSocket stand-in. The hook's correctness depends on exact
@@ -121,11 +123,18 @@ describe("useK5Socket", () => {
   });
 
   it("switches to wss on an https origin", () => {
-    // Same code path, different scheme: proven by construction rather than by
-    // a second jsdom environment.
-    const { protocol } = window.location;
-    const scheme = protocol === "https:" ? "wss:" : "ws:";
-    expect(`${scheme}//x/ws`.startsWith("wss:") || scheme === "ws:").toBe(true);
+    // Both branches, by moving the origin rather than asserting that a value
+    // satisfies one side of a disjunction it was derived from. The old version
+    // computed the scheme from the live location and then asserted that scheme
+    // matched itself, so it could not fail.
+    const schemeFor = wsScheme;
+    expect(schemeFor("https:")).toBe("wss:");
+    expect(schemeFor("http:")).toBe("ws:");
+    // The live origin must not get an insecure socket, which is the property that
+    // matters and the one the old assertion could not check: it derived the
+    // scheme from this same location and then asserted the derivation agreed
+    // with itself, so no change to either could ever fail it.
+    expect(wsScheme(window.location.protocol)).toBe("ws:");
   });
 
   it("opens a session on demand and reports the negotiated options", async () => {
@@ -143,6 +152,7 @@ describe("useK5Socket", () => {
         type: "session.opened",
         commandId: "c-1",
         sessionId: "s-1",
+        storeId: '11111111-1111-4111-8111-111111111111',
         projectId: "p-1",
         cwd: "/tmp/p",
         configOptions: [
@@ -171,6 +181,7 @@ describe("useK5Socket", () => {
         type: "session.opened",
         commandId: "c-1",
         sessionId: "s-1",
+        storeId: '11111111-1111-4111-8111-111111111111',
         projectId: "p-1",
         cwd: "/tmp/p",
         configOptions: [],
@@ -223,6 +234,7 @@ describe("useK5Socket", () => {
         type: "session.opened",
         commandId: "c-1",
         sessionId: "s-1",
+        storeId: '11111111-1111-4111-8111-111111111111',
         projectId: "p-1",
         cwd: "/tmp/p",
         configOptions: [],
@@ -247,6 +259,7 @@ describe("useK5Socket", () => {
         type: "session.opened",
         commandId: "c-1",
         sessionId: "s-1",
+        storeId: '11111111-1111-4111-8111-111111111111',
         projectId: "p-1",
         cwd: "/tmp/p",
         configOptions: [],
@@ -264,6 +277,7 @@ describe("useK5Socket", () => {
         type: "session.opened",
         commandId: "c-1",
         sessionId: "s-1",
+        storeId: '11111111-1111-4111-8111-111111111111',
         projectId: "p-1",
         cwd: "/tmp/p",
         configOptions: [],
@@ -313,6 +327,7 @@ describe("useK5Socket", () => {
         type: "session.opened",
         commandId: "c-1",
         sessionId: "s-1",
+        storeId: '11111111-1111-4111-8111-111111111111',
         projectId: "p-1",
         cwd: "/tmp/p",
         configOptions: [],
@@ -347,6 +362,7 @@ describe("useK5Socket", () => {
         type: "session.opened",
         commandId: "c-1",
         sessionId: "s-1",
+        storeId: '11111111-1111-4111-8111-111111111111',
         projectId: "p-1",
         cwd: "/tmp/p",
         configOptions: [],
@@ -372,6 +388,7 @@ describe("useK5Socket", () => {
         type: "session.opened",
         commandId: "c-1",
         sessionId: "s-1",
+        storeId: '11111111-1111-4111-8111-111111111111',
         projectId: "p-1",
         cwd: "/tmp/p",
         configOptions: [
@@ -386,5 +403,395 @@ describe("useK5Socket", () => {
       });
     });
     expect(result.current.state.configOptions[0].current).toBe("opencode/space-bunny-free");
+  });
+});
+
+describe("the resolved posture on the socket", () => {
+  const posture: ResolvedPostureReport = {
+    verified: true,
+    allowedTools: ["read"],
+    wildcardAllow: false,
+    ruleCount: 4,
+    grants: [{ permission: "read", pattern: "/tmp/*" }],
+  };
+
+  async function openSeat() {
+    const view = await mount();
+    const socket = view.sockets.at(-1)!;
+    act(() => {
+      socket.receive({
+        type: "session.opened",
+        commandId: "c-1",
+        sessionId: "s-1",
+        storeId: "11111111-1111-4111-8111-111111111111",
+        projectId: "p-1",
+        cwd: "/tmp/p",
+        configOptions: [],
+      });
+    });
+    return { ...view, socket };
+  }
+
+  it("lands in view state with the scope intact", async () => {
+    const { result, socket } = await openSeat();
+    act(() => socket.receive({ type: "session.posture", sessionId: "s-1", posture }));
+    // The pattern has to survive the wire: `read` allowed only under /tmp is a
+    // different fact from `read` allowed everywhere, and the browser cannot
+    // recover it from a bare permission list.
+    expect(result.current.state.posture).toEqual(posture);
+  });
+
+  it("clears it when the session closes", async () => {
+    const { result, socket } = await openSeat();
+    act(() => socket.receive({ type: "session.posture", sessionId: "s-1", posture }));
+    act(() => socket.receive({ type: "session.closed", sessionId: "s-1", reason: "client-request" }));
+    expect(result.current.state.posture).toBeNull();
+  });
+
+  it("does not let a new session inherit the previous one", async () => {
+    const { result, socket } = await openSeat();
+    act(() => socket.receive({ type: "session.posture", sessionId: "s-1", posture }));
+    act(() => {
+      socket.receive({
+        type: "session.opened",
+        commandId: "c-2",
+        sessionId: "s-2",
+        storeId: "11111111-1111-4111-8111-111111111111",
+        projectId: "p-1",
+        cwd: "/tmp/p",
+        configOptions: [],
+      });
+    });
+    // The second seat has reported nothing yet, and the honest answer to that is
+    // "unknown" — not the previous harness's grant list.
+    expect(result.current.state.posture).toBeNull();
+  });
+
+  it("ignores a report that arrives for a seat the browser is not on", async () => {
+    const { result, socket } = await openSeat();
+    act(() => socket.receive({ type: "session.posture", sessionId: "s-1", posture }));
+    act(() => {
+      socket.receive({ type: "seat.reaped", sessionId: "s-1", reason: "child-failure" });
+      socket.receive({
+        type: "session.posture",
+        sessionId: "s-1",
+        posture: { ...posture, verified: false, wildcardAllow: true },
+      });
+    });
+    expect(result.current.state.posture).toBeNull();
+  });
+});
+
+describe("prompt attachments", () => {
+  async function mountOpen() {
+    const view = await mount();
+    const socket = view.sockets.at(-1)!;
+    act(() => {
+      socket.receive({
+        type: "session.opened",
+        commandId: "c-1",
+        sessionId: "s-1",
+        storeId: "11111111-1111-4111-8111-111111111111",
+        projectId: "p-1",
+        cwd: "/tmp/p",
+        configOptions: [],
+      });
+    });
+    return { ...view, socket };
+  }
+
+  it("puts the spooled attachment ids in the sent frame", async () => {
+    // The command carries identity only: the name, mime and size are the server's
+    // to read back off the bytes.
+    const { result, socket } = await mountOpen();
+
+    act(() => result.current.prompt("what is wrong here?", [{ attachmentId: "att-1" }]));
+
+    const prompt = socket.commands().find((command) => command.type === "session.prompt");
+    expect(prompt?.attachments).toEqual([{ attachmentId: "att-1" }]);
+  });
+
+  it("sends an empty list when a prompt carries no attachments", async () => {
+    // Asserted rather than assumed: the schema defaults the field, and the frame
+    // the server parses is the schema's output, not the caller's object.
+    const { result, socket } = await mountOpen();
+
+    act(() => result.current.prompt("just text"));
+
+    const prompt = socket.commands().find((command) => command.type === "session.prompt");
+    expect(prompt?.attachments).toEqual([]);
+  });
+
+  it("refuses an over-budget prompt instead of putting it on the wire", async () => {
+    const { result, socket } = await mountOpen();
+
+    act(() =>
+      result.current.prompt(
+        "too many",
+        Array.from({ length: MAX_ATTACHMENTS + 1 }, (_, index) => ({
+          attachmentId: `att-${String(index)}`,
+        })),
+      ),
+    );
+
+    expect(socket.commands().map((command) => command.type)).not.toContain("session.prompt");
+    expect(result.current.state.turnStatus).toBe("error");
+    expect(result.current.state.sessionMessage).toMatch(/wire contract/);
+  });
+});
+
+describe("reconnection", () => {
+  /** Collects scheduled retries so a test runs them deliberately, not on a timer. */
+  function mountReconnecting(
+    rehydrate?: (storeId: string) => Promise<void>,
+    rehydrateBudgetMs = 20,
+  ): {
+    view: ReturnType<typeof renderHook<ReturnType<typeof useK5Socket>, unknown>>;
+    runRetry: () => void;
+    delays: number[];
+  } {
+    const delays: number[] = [];
+    let pending: (() => void)[] = [];
+    // Both collaborators are hoisted. An inline arrow would give them a new
+    // identity every render, and the socket effect depends on the coalescer, which
+    // is memoised on the scheduler — the exact trap the module documents.
+    const scheduler: Scheduler = (run) => run();
+    const schedule = (run: () => void, delay: number): (() => void) => {
+      delays.push(delay);
+      pending.push(run);
+      return () => {
+        pending = pending.filter((entry) => entry !== run);
+      };
+    };
+    const view = renderHook(() =>
+      useK5Socket({
+        scheduler,
+        schedule,
+        rehydrateBudgetMs,
+        ...(rehydrate === undefined ? {} : { rehydrate }),
+      }),
+    );
+    return {
+      view,
+      delays,
+      runRetry: () => {
+        const queued = pending;
+        pending = [];
+        act(() => {
+          queued.forEach((run) => run());
+        });
+      },
+    };
+  }
+
+  it("reconnects after a close instead of leaving a dead tab", () => {
+    // The server restarts during development and a dropped network is not a reason
+    // the workspace stops working.
+    const { view, runRetry, delays } = mountReconnecting();
+    act(() => FakeSocket.instances[0]!.open());
+    expect(view.result.current.state.connection).toBe("open");
+    expect(FakeSocket.instances).toHaveLength(1);
+
+    act(() => {
+      FakeSocket.instances[0]!.drop();
+      FakeSocket.instances[0]!.settleClose();
+    });
+    expect(view.result.current.state.connection).toBe("closed");
+
+    runRetry();
+    expect(FakeSocket.instances).toHaveLength(2);
+    act(() => FakeSocket.instances[1]!.open());
+    expect(view.result.current.state.connection).toBe("open");
+    expect(delays[0]).toBeGreaterThan(0);
+  });
+
+  it("backs off further with each failed attempt", () => {
+    const { view, runRetry, delays } = mountReconnecting();
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const current = FakeSocket.instances.at(-1)!;
+      act(() => {
+        current.drop();
+        current.settleClose();
+      });
+      runRetry();
+    }
+    // Strictly increasing until the cap, and never unbounded.
+    expect(delays[0]).toBeLessThan(delays[1]!);
+    expect(delays[1]).toBeLessThan(delays[2]!);
+    expect(delays.at(-1)).toBeLessThanOrEqual(15_000);
+    void view;
+  });
+
+  it("re-reads the stored transcript before reconnecting, so a finished turn is not lost", async () => {
+    const seen: string[] = [];
+    const { view, runRetry } = mountReconnecting(async (storeId) => {
+      seen.push(storeId);
+    });
+    act(() => FakeSocket.instances[0]!.open());
+    // Give the connection a durable record to rehydrate from.
+    act(() =>
+      FakeSocket.instances[0]!.receive({
+        type: "session.opened",
+        commandId: "c-1",
+        sessionId: "ses-1",
+        storeId: "11111111-1111-4111-8111-111111111111",
+        projectId: "p-1",
+        cwd: "/tmp/p",
+        configOptions: [],
+      } as ServerEvent),
+    );
+    expect(view.result.current.state.storeId).toBe("11111111-1111-4111-8111-111111111111");
+
+    act(() => {
+      FakeSocket.instances[0]!.drop();
+      FakeSocket.instances[0]!.settleClose();
+    });
+    // The new socket is not opened until the transcript has been re-read.
+    expect(FakeSocket.instances).toHaveLength(1);
+    await act(async () => {
+      runRetry();
+      await Promise.resolve();
+    });
+    expect(seen).toEqual(["11111111-1111-4111-8111-111111111111"]);
+    expect(FakeSocket.instances).toHaveLength(2);
+  });
+
+  it("still reconnects when there is nothing recorded to re-read", () => {
+    const { runRetry } = mountReconnecting(async () => {
+      throw new Error("should not be called");
+    });
+    act(() => FakeSocket.instances[0]!.open());
+    act(() => {
+      FakeSocket.instances[0]!.drop();
+      FakeSocket.instances[0]!.settleClose();
+    });
+    act(() => runRetry());
+    expect(FakeSocket.instances).toHaveLength(2);
+  });
+
+  it("reconnects even when rehydrating never settles", async () => {
+    // An unbounded rehydrate left the workspace closed for ever: there was no next
+    // attempt scheduled, so the backoff cap was irrelevant.
+    const { view, runRetry } = mountReconnecting(() => new Promise<void>(() => {}));
+    act(() => FakeSocket.instances[0]!.open());
+    act(() =>
+      FakeSocket.instances[0]!.receive({
+        type: "session.opened",
+        commandId: "c-1",
+        sessionId: "ses-1",
+        storeId: "11111111-1111-4111-8111-111111111111",
+        projectId: "p-1",
+        cwd: "/tmp/p",
+        configOptions: [],
+      } as ServerEvent),
+    );
+    act(() => {
+      FakeSocket.instances[0]!.drop();
+      FakeSocket.instances[0]!.settleClose();
+    });
+    // The budget is real time, so the reconnect is asserted with a bounded wait
+    // rather than a fixed sleep.
+    await act(async () => {
+      runRetry();
+      await vi.waitFor(() => expect(FakeSocket.instances.length).toBeGreaterThan(1), {
+        timeout: 10_000,
+        interval: 20,
+      });
+    });
+    act(() => FakeSocket.instances[1]!.open());
+    expect(view.result.current.state.connection).toBe("open");
+  });
+
+  it("reconnects when rehydrating throws synchronously", async () => {
+    // A throw before the promise existed escaped the timer callback and wedged the
+    // tab: neither .catch nor .finally ever attached.
+    const { view, runRetry } = mountReconnecting((): Promise<void> => {
+      throw new Error("sync boom");
+    });
+    act(() => FakeSocket.instances[0]!.open());
+    act(() =>
+      FakeSocket.instances[0]!.receive({
+        type: "session.opened",
+        commandId: "c-1",
+        sessionId: "ses-1",
+        storeId: "11111111-1111-4111-8111-111111111111",
+        projectId: "p-1",
+        cwd: "/tmp/p",
+        configOptions: [],
+      } as ServerEvent),
+    );
+    act(() => {
+      FakeSocket.instances[0]!.drop();
+      FakeSocket.instances[0]!.settleClose();
+    });
+    await act(async () => {
+      runRetry();
+      await vi.waitFor(() => expect(FakeSocket.instances.length).toBeGreaterThan(1), {
+        timeout: 10_000,
+        interval: 20,
+      });
+    });
+    act(() => FakeSocket.instances[1]!.open());
+    expect(view.result.current.state.connection).toBe("open");
+  });
+
+  it("a rehydration failure does not strand the socket closed", async () => {
+    // The transcript is a convenience; losing it must not also lose the ability
+    // to work.
+    const { view, runRetry } = mountReconnecting(async () => {
+      throw new Error("the store is unavailable");
+    });
+    act(() => FakeSocket.instances[0]!.open());
+    act(() =>
+      FakeSocket.instances[0]!.receive({
+        type: "session.opened",
+        commandId: "c-1",
+        sessionId: "ses-1",
+        storeId: "11111111-1111-4111-8111-111111111111",
+        projectId: "p-1",
+        cwd: "/tmp/p",
+        configOptions: [],
+      } as ServerEvent),
+    );
+    act(() => {
+      FakeSocket.instances[0]!.drop();
+      FakeSocket.instances[0]!.settleClose();
+    });
+    await act(async () => {
+      runRetry();
+      await Promise.resolve();
+    });
+    expect(FakeSocket.instances).toHaveLength(2);
+    act(() => FakeSocket.instances[1]!.open());
+    expect(view.result.current.state.connection).toBe("open");
+  });
+
+  it("re-reads the stored transcript when the server reports a continuation", async () => {
+    // `session.loaded` announces a task and changes no view state, so without
+    // this read the entries on screen stayed the previous task's: the sidebar
+    // showed the right task selected and the conversation beside it was the
+    // wrong one.
+    const seen: string[] = [];
+    const { view } = mountReconnecting(async (storeId) => {
+      seen.push(storeId);
+    });
+    act(() => FakeSocket.instances[0]!.open());
+    act(() =>
+      FakeSocket.instances[0]!.receive({
+        type: "session.loaded",
+        commandId: "c-9",
+        storeId: "22222222-2222-4222-8222-222222222222",
+        sessionId: "ses-9",
+        projectId: "p-1",
+        cwd: "/tmp/p",
+        configOptions: [],
+      } as ServerEvent),
+    );
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(seen).toEqual(["22222222-2222-4222-8222-222222222222"]);
+    // And it does not disturb anything else about the connection.
+    expect(view.result.current.state.connection).toBe("open");
   });
 });

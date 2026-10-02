@@ -11,19 +11,43 @@ import {
   requestCancel,
   resetSession,
   scopeFor,
+  type AttachmentRef,
   type BrowserCommand,
   type K5ViewState,
   type ServerEvent,
+  type ProjectedTranscript,
   type Scheduler,
+  hydrateTranscript,
 } from "@k5-work/shared";
 
 // One socket per tab. The URL is same-origin and relative on purpose: a
 // hardcoded host breaks immediately under a tunnel or a remote origin, which is
 // the mistake AGENTS.md calls out for frontend origins.
-function socketUrl(): string {
-  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-  return `${protocol}//${window.location.host}/ws`;
+export function wsScheme(originProtocol: string): "wss:" | "ws:" {
+  return originProtocol === "https:" ? "wss:" : "ws:";
 }
+
+export function socketUrl(): string {
+  return `${wsScheme(window.location.protocol)}//${window.location.host}/ws`;
+}
+
+/** How long a socket must stay open before it counts as a working connection. */
+export const STABLE_SOCKET_MS = 5_000;
+
+/** Ceiling on re-reading the transcript before reconnecting anyway. */
+export const REHYDRATE_BUDGET_MS = 5_000;
+
+/** Exponential backoff, capped, so a dead server is not hammered. */
+export const MAX_RECONNECT_DELAY_MS = 15_000;
+export function backoffMs(attempt: number): number {
+  const delay = 250 * 2 ** Math.max(0, attempt - 1);
+  return Math.min(delay, MAX_RECONNECT_DELAY_MS);
+}
+
+const defaultSchedule = (run: () => void, delayMs: number): (() => void) => {
+  const timer = setTimeout(run, delayMs);
+  return () => clearTimeout(timer);
+};
 
 let commandCounter = 0;
 function nextCommandId(): string {
@@ -34,18 +58,43 @@ function nextCommandId(): string {
 export interface K5Socket {
   state: K5ViewState;
   openSession(projectId: string): void;
-  prompt(text: string): void;
+  /**
+   * Sends a prompt. `attachments` are ids the spool already holds: the bytes were
+   * uploaded before this call, and the command carries identity only.
+   */
+  prompt(text: string, attachments?: readonly AttachmentRef[]): void;
   cancel(): void;
   closeSession(): void;
   newTask(): void;
   /** Applies a harness-advertised config option to the live seat. */
   configure(sessionId: string, configOptionId: string, value: string): void;
+  /**
+   * Replaces the visible transcript with a stored one, read after a reconnect.
+   * Kept here rather than in the caller so the socket's own view state and the
+   * caller's can never disagree about what is on screen.
+   */
+  adoptTranscript(transcript: ProjectedTranscript): void;
+  /** Continues a stored task on the harness, by k5 store id. */
+  loadSession(storeId: string): boolean;
   connected: boolean;
 }
 
 export interface UseK5SocketOptions {
   /** Injected so tests can drive frame coalescing without a browser. */
   scheduler?: Scheduler;
+  /**
+   * Injected so a test can drive reconnection without waiting on real backoff.
+   * The default is a real timer.
+   */
+  schedule?: (run: () => void, delayMs: number) => () => void;
+  /**
+   * Re-reads the durable transcript after a reconnect. Injected because it does
+   * I/O, and because a test must be able to assert it was called with the right
+   * store id rather than that a fetch happened to resolve.
+   */
+  rehydrate?: (storeId: string) => Promise<void>;
+  /** Ceiling on rehydrating before reconnecting anyway. Injectable for tests. */
+  rehydrateBudgetMs?: number;
 }
 
 /**
@@ -147,74 +196,165 @@ export function useK5Socket(options: UseK5SocketOptions = {}): K5Socket {
     return true;
   }, [rejectLocal]);
 
+  // The injected collaborators are read through a ref, not listed as effect
+  // dependencies. A caller that passes an inline arrow would otherwise give it a
+  // new identity on every render, and the socket effect would tear down and
+  // reconnect each time — which is exactly the failure the module-scope scheduler
+  // below exists to prevent, reintroduced through a different door.
+  const scheduleRetry = useRef(options.schedule ?? defaultSchedule);
+  scheduleRetry.current = options.schedule ?? defaultSchedule;
+  const rehydrate = useRef(options.rehydrate);
+  rehydrate.current = options.rehydrate;
+  const rehydrateBudget = useRef(options.rehydrateBudgetMs ?? REHYDRATE_BUDGET_MS);
+  rehydrateBudget.current = options.rehydrateBudgetMs ?? REHYDRATE_BUDGET_MS;
+
   useEffect(() => {
     // A stable token so React StrictMode's development double mount opens one
     // logical connection rather than two.
     let disposed = false;
-    const socket = new WebSocket(socketUrl());
-    socketRef.current = socket;
+    let cancelRetry: (() => void) | null = null;
+    let attempt = 0;
 
-    socket.onopen = () => {
-      if (disposed) return;
-      setState((current) => ({ ...current, connection: "open" }));
+    /**
+     * One bounded rehydrate, shared by both callers: a socket reconnecting under
+     * a live task, and a task just continued from the store. The returned promise
+     * always settles: the read is raced against a budget, and a rejection is
+     * logged rather than propagated, because a rehydrator that throws
+     * synchronously or never settles must not strand the caller.
+     */
+    const rehydrateNow = (storeId: string): Promise<void> => {
+      const load = rehydrate.current;
+      if (disposed || load === undefined) return Promise.resolve();
+      return new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, rehydrateBudget.current);
+        void Promise.resolve()
+          .then(() => load(storeId))
+          .then(
+            () => {
+              clearTimeout(timer);
+              resolve();
+            },
+            (cause: unknown) => {
+              clearTimeout(timer);
+              console.warn("k5: the stored transcript could not be re-read", cause);
+              resolve();
+            },
+          );
+      });
     };
-    socket.onmessage = (message) => {
+
+    // Reconnecting, rather than treating a close as terminal: the server restarts
+    // during development and a dropped wifi connection is not a reason for the
+    // workspace to become a dead tab. Backoff is capped, and the attempt counter
+    // resets on a successful open so a later drop does not inherit an old delay.
+    const connect = (): void => {
       if (disposed) return;
-      let raw: unknown;
-      try {
-        raw = JSON.parse(String(message.data));
-      } catch {
-        return;
-      }
-      const parsed = ServerEventSchema.safeParse(raw);
-      // An unparseable frame is dropped rather than partially applied; logging
-      // keeps schema drift visible instead of silent.
-      if (!parsed.success) {
-        console.warn("k5: dropping an unrecognised server event", parsed.error.message);
-        return;
-      }
-      const event = parsed.data;
-      // Large streams are batched; state changes are applied immediately so a
-      // terminal event is never stuck behind a frame.
-      if (event.type === "turn.delta" || event.type === "tool.updated") {
-        coalescer.push(event);
-        return;
-      }
-      coalescer.flush();
-      if (event.type === "command.result") {
-        apply(event, scopeFor(commandScopes.current, event.commandId));
-        return;
-      }
-      apply(event);
+      const socket = new WebSocket(socketUrl());
+      socketRef.current = socket;
+
+      let openedAt = 0;
+      socket.onopen = () => {
+        if (disposed) return;
+        openedAt = Date.now();
+        setState((current) => ({ ...current, connection: "open" }));
+      };
+      socket.onerror = () => {
+        if (disposed) return;
+        setState((current) => ({ ...current, connection: "closed" }));
+      };
+
+      socket.onclose = () => {
+        // Only the socket that currently owns the ref may release it. A
+        // superseded socket closes asynchronously, after its replacement has
+        // already been assigned, so an unconditional clear here would leave the
+        // live socket untracked while the UI still claims to be connected.
+        if (socketRef.current === socket) socketRef.current = null;
+        if (disposed) return;
+        coalescer.flush();
+        setState((current) => ({
+          ...applyServerEvent(current, {
+            type: "connection.closed",
+            reason: "socket closed",
+          }),
+        }));
+        // Reset only after the socket has stayed up long enough to count as a
+        // working connection. Resetting on every open disabled the backoff against
+        // the most common real failure: a server that accepts the upgrade and then
+        // closes, which is exactly a dev-server restart. Measured eight
+        // accept-then-drop cycles all retrying at 250 ms, four connects a second
+        // for ever.
+        if (openedAt > 0 && Date.now() - openedAt >= STABLE_SOCKET_MS) {
+          attempt = 0;
+        }
+        attempt += 1;
+        const delay = backoffMs(attempt);
+        const runRetry = (): void => {
+          if (disposed) return;
+          // Re-read the transcript before the new socket can deliver anything, so
+          // a turn that finished while we were away is not silently lost. The
+          // store is the record; the socket is only a viewer.
+          const storeId = stateRef.current.storeId;
+          if (rehydrate.current !== undefined && storeId !== null) {
+            // The reconnect waits for the read, so a live delta can never land
+            // before the history it belongs to.
+            void rehydrateNow(storeId).finally(() => {
+              if (!disposed) connect();
+            });
+            return;
+          }
+          connect();
+        };
+        cancelRetry = scheduleRetry.current(runRetry, delay);
+      };
+
+      socket.onmessage = (message) => {
+        if (disposed) return;
+        let raw: unknown;
+        try {
+          raw = JSON.parse(String(message.data));
+        } catch {
+          return;
+        }
+        const parsed = ServerEventSchema.safeParse(raw);
+        if (!parsed.success) {
+          console.warn("k5: dropping an unrecognised server event", parsed.error.message);
+          return;
+        }
+        const event = parsed.data;
+        if (event.type === "turn.delta" || event.type === "tool.updated") {
+          coalescer.push(event);
+          return;
+        }
+        coalescer.flush();
+        if (event.type === "command.result") {
+          apply(event, scopeFor(commandScopes.current, event.commandId));
+          return;
+        }
+        apply(event);
+        // A continuation announces itself without touching view state, so the
+        // entries on screen are still the previous task's. The store is the
+        // record of the task just opened, and it is read here rather than on a
+        // timer: by now `session.opened` has established this session's ids, so
+        // the transcript lands on the session it belongs to.
+        if (event.type === "session.loaded") void rehydrateNow(event.storeId);
+      };
     };
-    socket.onerror = () => {
-      if (disposed) return;
-      setState((current) => ({ ...current, connection: "closed" }));
-    };
-    socket.onclose = () => {
-      // Only the socket that currently owns the ref may release it. A
-      // superseded socket closes asynchronously, after its replacement has
-      // already been assigned, so an unconditional clear here would leave the
-      // live socket untracked while the UI still claims to be connected.
-      if (socketRef.current === socket) socketRef.current = null;
-      if (disposed) return;
-      coalescer.flush();
-      setState((current) => ({
-        ...applyServerEvent(current, {
-          type: "connection.closed",
-          reason: "socket closed",
-        }),
-      }));
-      return;
-    };
+
+    connect();
 
     return () => {
       disposed = true;
+      cancelRetry?.();
       coalescer.cancel();
+      // Whatever is live is closed here; connect() may have replaced the socket
+      // this effect originally created, so the ref is the authority, not a
+      // captured local.
+      const live = socketRef.current;
       socketRef.current = null;
+      if (live === null) return;
       // Closing is the browser's authoritative signal, not a second event.
-      if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
-        socket.close(1000, "unmount");
+      if (live.readyState === WebSocket.OPEN || live.readyState === WebSocket.CONNECTING) {
+        live.close(1000, "unmount");
       }
     };
   }, [apply, coalescer]);
@@ -228,7 +368,7 @@ export function useK5Socket(options: UseK5SocketOptions = {}): K5Socket {
   );
 
   const prompt = useCallback(
-    (text: string) => {
+    (text: string, attachments: readonly AttachmentRef[] = []) => {
       const { sessionId, connection } = stateRef.current;
       if (connection !== "open") {
         // Never begin a turn with no way to send it: the optimistic entry would
@@ -257,8 +397,17 @@ export function useK5Socket(options: UseK5SocketOptions = {}): K5Socket {
         return;
       }
       const commandId = nextCommandId();
-      setState((current) => beginTurn(current, turnId, text));
-      send({ commandId, type: "session.prompt", sessionId, turnId, text });
+      setState((current) => beginTurn(current, turnId, text, commandId));
+      // Copied, because the contract's own type is a mutable array and a caller
+      // holding the list could otherwise mutate the frame after it was validated.
+      send({
+        commandId,
+        type: "session.prompt",
+        sessionId,
+        turnId,
+        text,
+        attachments: [...attachments],
+      });
     },
     [rejectLocal, send],
   );
@@ -275,6 +424,10 @@ export function useK5Socket(options: UseK5SocketOptions = {}): K5Socket {
     if (!sessionId) return;
     send({ commandId: nextCommandId(), type: "session.close", sessionId });
   }, [send]);
+
+  const adoptTranscript = useCallback((transcript: ProjectedTranscript) => {
+    setState((current) => hydrateTranscript(current, transcript));
+  }, []);
 
   const newTask = useCallback(() => {
     // A new task ends the live turn server-side before the transcript resets,
@@ -294,7 +447,6 @@ export function useK5Socket(options: UseK5SocketOptions = {}): K5Socket {
     [send],
   );
 
-
   return {
     state,
     openSession,
@@ -303,6 +455,22 @@ export function useK5Socket(options: UseK5SocketOptions = {}): K5Socket {
     closeSession,
     newTask,
     configure,
+    adoptTranscript,
+    /**
+     * Sends the continuation command, so the caller never builds a wire shape.
+     *
+     * There is deliberately no `listSessions` here. The server implements
+     * `session.list` against the harness, but nothing in the browser asks for it:
+     * the sidebar is populated from the store over HTTP, because that is the list
+     * of transcripts that actually exist. A button that listed the harness's own
+     * sessions would show work k5 has no record of and cannot reopen. The command
+     * stays on the wire and stays tested until there is a screen that can be honest
+     * about what such a row would mean.
+     */
+    loadSession: useCallback(
+      (storeId: string) => send({ commandId: nextCommandId(), type: "session.load", storeId }),
+      [send],
+    ),
     connected: state.connection === "open",
   };
 }

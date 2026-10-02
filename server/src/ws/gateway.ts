@@ -134,6 +134,12 @@ export interface AcceptedConnection {
 }
 
 export interface ConnectionHandlers {
+  /**
+   * Resolves when any in-flight work this connection owns has finished, such as
+   * a seat teardown or a session read that is holding a harness process. Optional
+   * because a handler with nothing to wait for need not implement it.
+   */
+  waitForIdle?(): Promise<void>;
   command(command: BrowserCommand): void;
   /**
    * The outbound bound was hit. The socket is being closed, so this is the last
@@ -164,6 +170,14 @@ export interface GatewayOptions {
 export interface Gateway {
   readonly connections: Set<AcceptedConnection>;
   close(): Promise<void>;
+  /**
+   * Waits for every live connection to finish its in-flight work.
+   *
+   * A handler may be mid-request when the socket closes — a session read owns a
+   * harness process that nothing else knows about. Without this, a shutdown that
+   * lands during one exits clean with the process still running.
+   */
+  settle(): Promise<void>;
 }
 
 export const WS_PATH = "/ws";
@@ -356,6 +370,20 @@ export function createGateway(options: GatewayOptions): Gateway {
       clearTimeout(grace);
       connections.clear();
       handlersBySocket.clear();
+    },
+    async settle() {
+      // Snapshot first: a handler may add to this set as its own teardown runs.
+      const handlers = [...new Set(handlersBySocket.values())];
+      await Promise.all(
+        handlers.map(async (handler) => {
+          try {
+            await handler.waitForIdle?.();
+          } catch {
+            // A handler that throws while reporting idle must not hold shutdown
+            // open; its own cleanup has already been attempted.
+          }
+        }),
+      );
     },
   };
 }
