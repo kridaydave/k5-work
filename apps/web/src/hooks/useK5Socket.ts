@@ -397,7 +397,7 @@ export function useK5Socket(options: UseK5SocketOptions = {}): K5Socket {
         return;
       }
       const commandId = nextCommandId();
-      setState((current) => beginTurn(current, turnId, text));
+      setState((current) => beginTurn(current, turnId, text, commandId));
       // Copied, because the contract's own type is a mutable array and a caller
       // holding the list could otherwise mutate the frame after it was validated.
       send({

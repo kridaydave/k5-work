@@ -223,7 +223,10 @@ describe("tool calls in the transcript", () => {
   });
 
   it("drops the rail when the next turn begins, so no stale card looks live", () => {
-    const first = withEvents(beginTestTurn(), toolUpdate());
+    // The first turn ends, and the new turn carries no tool rail with it.
+    // beginTurn refuses to start over a still-running turn, and this asserts the
+    // normal path, where the old turn completed.
+    const first = withEvents(beginTestTurn(), toolUpdate(), endTurn());
     renderApp(beginTurn(first, "t-2", "and now the docs"));
     expect(within(transcript()).queryAllByRole("listitem")).toHaveLength(0);
   });

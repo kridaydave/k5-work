@@ -72,6 +72,15 @@ export interface K5ViewState {
   sessionReason: CommandFailureReason | null;
   sessionMessage: string | null;
   activeTurnId: string | null;
+  /**
+   * The commandId of the prompt that the active turn was opened for. A refusal is
+   * tied to the turn that sent it, because a turn is optimistic and a
+   * `command.result` carries no turnId of its own. Without this, a refusal for a
+   * second prompt — the seat was busy, and the one already running is not the one
+   * that was refused — took down the running turn and the user's answer streamed
+   * into a bubble that had been told it would never come.
+   */
+  pendingPromptId: string | null;
   turnStatus: TurnStatus;
   /** Why the turn ended, when it ended badly. */
   turnReason: string | null;
@@ -91,6 +100,7 @@ export const INITIAL_VIEW_STATE: K5ViewState = {
   sessionReason: null,
   sessionMessage: null,
   activeTurnId: null,
+  pendingPromptId: null,
   turnStatus: "idle",
   turnReason: null,
   entries: [],
@@ -186,10 +196,18 @@ export function beginTurn(
   state: K5ViewState,
   turnId: string,
   userText: string,
+  commandId?: string,
 ): K5ViewState {
+  // A turn that is still running or cancelling owns the working view. Starting a
+  // second one stole `activeTurnId` from it, so every later event for the real
+  // turn landed in nothing and the user watched an answer stream into a bubble
+  // that was not the live one. The second prompt is either queued or refused;
+  // either way this state must not invent an optimistic turn for it.
+  if (state.turnStatus === "running" || state.turnStatus === "cancelling") return state;
   return {
     ...state,
     activeTurnId: turnId,
+    pendingPromptId: commandId ?? null,
     turnStatus: "running",
     turnReason: null,
     thinking: "",
@@ -270,11 +288,33 @@ export function applyServerEvent(
       };
 
     case "session.opened":
+      // A different session means everything about the previous turn is a
+      // stranger here, and none of it belongs on screen in the new one. Orphaned
+      // tool cards and a half-streamed answer had a way to survive a reap plus a
+      // new open, because nothing cleared the turn-scoped fields. When the id is
+      // the same one, nothing is reset: the snapshot is updated in place.
+      if (state.sessionId === event.sessionId) {
+        return {
+          ...state,
+          session: "open",
+          storeId: event.storeId,
+          configOptions: event.configOptions,
+          sessionTitle: null,
+          posture: null,
+        };
+      }
       return {
         ...state,
         session: "open",
         sessionId: event.sessionId,
         storeId: event.storeId,
+        pendingPromptId: null,
+        activeTurnId: null,
+        turnStatus: "idle",
+        turnReason: null,
+        thinking: "",
+        tools: {},
+        entries: [],
         // Cleared, not carried: a title belongs to one session, and the harness
         // only sends its own once it has generated one. Without this a new
         // session showed the previous one's name until that update arrived, and
@@ -301,8 +341,15 @@ export function applyServerEvent(
       return { ...state, configOptions: event.configOptions };
 
     case "session.closed":
+      // Scoped to the session that closed, like every sibling. A close or a reap
+      // that arrives after a different session opened — the old seat's notification
+      // lands late, or the harness answers a close out of order — used to wipe the
+      // whole current view, including the active turn's id, which then disarmed
+      // every later event meant for the running task.
+      if (state.sessionId !== event.sessionId) return state;
       return {
         ...state,
+        pendingPromptId: null,
         session: "none",
         sessionId: null,
         sessionTitle: null,
@@ -341,8 +388,10 @@ export function applyServerEvent(
       return { ...state, sessionTitle: event.title };
 
     case "seat.reaped":
+      if (state.sessionId !== event.sessionId) return state;
       return {
         ...state,
+        pendingPromptId: null,
         session: "none",
         sessionId: null,
         sessionTitle: null,
@@ -379,17 +428,47 @@ export function applyServerEvent(
         };
       }
       // A failed open leaves an optimistic "opening" state that must not persist.
-      if (state.session === "opening" || state.turnStatus === "running") {
+      if (commandScope === "session.open") {
+        if (state.session !== "opening") {
+          return {
+            ...state,
+            sessionReason: event.reason,
+            sessionMessage: event.message ?? null,
+          };
+        }
         return {
           ...state,
-          session: state.session === "opening" ? "failed" : state.session,
+          session: "failed",
           sessionReason: event.reason,
           sessionMessage: event.message ?? null,
           turnStatus: isTurnTerminal(state.turnStatus) ? state.turnStatus : "error",
           turnReason: isTurnTerminal(state.turnStatus) ? state.turnReason : event.reason,
         };
       }
-      // A newer failure must not be masked by a stale reason from an earlier one.
+      // Only the prompt that this state optimistically started may fail its turn.
+      // A refusal for a different prompt — the seat was busy, or a configure the
+      // harness refused after the turn began — belongs in the message bar. Keying
+      // off `turnStatus === "running"` instead meant any failed command killed the
+      // turn and then every later event for it was dropped: a configure refusal
+      // and a busy refusal each turned into a lost answer.
+      if (commandScope === "session.prompt") {
+        const live = state.turnStatus === "running" || state.turnStatus === "cancelling";
+        if (state.pendingPromptId !== event.commandId || !live) {
+          return {
+            ...state,
+            sessionMessage: event.message ?? null,
+          };
+        }
+        return {
+          ...state,
+          turnStatus: "error",
+          turnReason: event.reason,
+          sessionMessage: event.message ?? null,
+        };
+      }
+      // The remaining command results (cancel, close, and the configure/list/load
+      // family already handled above) are never a turn failure: they report into
+      // the message bar and leave the running view alone.
       return {
         ...state,
         sessionReason: event.reason,
@@ -399,7 +478,7 @@ export function applyServerEvent(
 
     case "turn.started":
       if (state.activeTurnId !== event.turnId) return state;
-      return { ...state, turnStatus: "running" };
+      return { ...state, turnStatus: "running", pendingPromptId: null };
 
     case "turn.delta": {
       if (state.activeTurnId !== event.turnId) return state;
@@ -418,8 +497,26 @@ export function applyServerEvent(
       // arrives after a new task or during teardown leaks a stale card into the
       // fresh session.
       if (state.activeTurnId !== event.turnId) return state;
-      if (isTurnTerminal(state.turnStatus) && state.tools[event.toolCallId] === undefined) {
-        return state;
+      if (isTurnTerminal(state.turnStatus)) {
+        // A card is finished once the turn is; a straggler update cannot reopen it.
+        // The old guard admitted any update for a card it already knew about, so a
+        // `tool.updated` sitting behind the completion rewrote lifecycle to "active"
+        // and the card spun forever on a turn that had already ended, with nothing
+        // left to correct it. An update after a terminal event is one the harness
+        // sent late, and the only honest use of it is a late completion.
+        const existing = state.tools[event.toolCallId];
+        if (existing === undefined) return state;
+        // A late completion is allowed because it ends the card truthfully.
+        const reachingTerminal = event.status === "completed" || event.status === "failed";
+        if (!reachingTerminal) return state;
+        if (existing.status === "completed" || existing.status === "failed") return state;
+        return {
+          ...state,
+          tools: {
+            ...state.tools,
+            [event.toolCallId]: { ...existing, status: event.status, lifecycle: event.lifecycle },
+          },
+        };
       }
       return {
         ...state,
@@ -449,6 +546,7 @@ export function applyServerEvent(
         ...state,
         turnStatus: failed ? "error" : "done",
         turnReason: failed ? event.stopReason : null,
+        pendingPromptId: null,
         // A turn that has ended cannot have a tool still running. This covers
         // `in_progress` as well as `pending`: a card the harness left mid-flight
         // used to keep lifecycle "active" and spin forever, because only
