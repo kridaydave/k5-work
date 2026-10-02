@@ -92,7 +92,12 @@ export default function App() {
   // The durable task list, read over HTTP with no harness process involved. The
   // sidebar is populated from disk, not from the live session alone, so a reload
   // shows the history that is actually there.
-  const { sessions: storedSessions, remove: removeStored } = useStoredSessions();
+  const {
+    sessions: storedSessions,
+    error: storedSessionsError,
+    remove: removeStored,
+    refresh: refreshStored,
+  } = useStoredSessions();
   // Re-read the transcript after a reconnect, before the new socket can deliver
   // anything: a turn that finished while the socket was down would otherwise be
   // silently lost, because the socket never replays and the store is the record.
@@ -338,6 +343,27 @@ export default function App() {
     if (state.session === "open") setTranscriptNote(null);
   }, [state.session]);
 
+  // The stored list is a snapshot taken when the tab mounted. A task recorded here
+  // is not in it, so its row is missing, and once it is in it the turn count is
+  // frozen at whatever it was when the snapshot was taken.
+  //
+  // Re-read on the two things that change what the store holds: a session being
+  // opened, and a turn reaching a terminal state. Nothing polls, because nothing
+  // else moves the list. The previous status is held in a ref because an effect
+  // cannot tell "just became" from "has been", and a turn that ends in an error is
+  // still a turn the store recorded.
+  const lastTurnStatus = useRef(state.turnStatus);
+  useEffect(() => {
+    if (state.storeId !== null) refreshStored();
+    const was = lastTurnStatus.current;
+    lastTurnStatus.current = state.turnStatus;
+    if (was === "running" || was === "cancelling") {
+      if (state.turnStatus === "idle" || state.turnStatus === "done" || state.turnStatus === "error") {
+        refreshStored();
+      }
+    }
+  }, [refreshStored, state.storeId, state.turnStatus]);
+
   // A queued prompt is sent as soon as the session opens, so the submission
   // always reaches the harness.
   useEffect(() => {
@@ -470,6 +496,7 @@ export default function App() {
           onSelectProject={handleSelectProject}
           onSelectSession={handleSelectSession}
           onRemoveSession={handleRemoveSession}
+          storedSessionsError={storedSessionsError}
           sessions={sidebarSessions}
           connection={state.connection}
         />

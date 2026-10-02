@@ -173,7 +173,6 @@ function renderApp(state: K5ViewState) {
     newTask: () => {},
     configure: () => {},
     adoptTranscript: () => {},
-    listSessions: () => false,
     loadSession: () => false,
   };
   return render(<App />);

@@ -67,15 +67,32 @@ Locked decisions: `docs/posture-and-trust-decisions.md`.
 - [x] Configure failures are scoped to the command that caused them, so a
       refused model change can no longer kill a working turn.
 
+- [x] Phase 4 — durable transcripts
+  - The session store (`<root>/k5.db`, SQLite). k5 owns the transcript: every event
+    it forwards is written to an append-only `events` table and read back from
+    there, so a reload shows the conversation that actually happened. A pre-SQLite
+    store is imported once at first open and then left alone.
+  - Sidebar lists stored tasks from the store over HTTP, with a remove action, and
+    rehydrates a transcript after a reconnect and on continuation.
+  - `storeId` is the only addressable identity for history. The harness's own
+    session id is opaque and harness-controlled, so it never appears on the wire.
+  - `session.resume` continues a stored task behind a capability gate and a
+    stored-cwd check; the harness's `session/load` replay is deliberately not
+    drained, because ACP has no replay terminator.
+  - Out-of-band attachments: bytes and the manifest that describes them are one
+    row, so they cannot disagree.
+  - Component-level coverage for the composer, tool cards, attachments and the
+    stored-session read path.
+
 ## Not done
 
-- [ ] Phase 4 — policy and persistence
-  - Real session history. The sidebar renders the live session only, because
-    there is no store to read a list from yet; `session/list` is what unblocks it.
-  - `session/load`, `session/list`, `session/resume` behind their capability
-    gates with stored-cwd validation.
-  - Out-of-band attachments, then durable transcripts and bounded replay.
-  - Component-level coverage for the transcript and tool cards.
+- [ ] Phase 5 — discovery and policy
+  - The harness's own sessions are not listed. `session.list` is implemented and
+    tested against a real seat, but nothing in the browser asks for it, because a
+    row for a session k5 has no transcript of could not be reopened honestly. It
+    needs a decision about what such a row means before it gets a screen.
+  - Search across stored transcripts. The list is recency-ordered and capped; a
+    query over the `events` table is what would back it.
   - A permission screen, if a harness ever asks. It needs the wire contract, the
     reducer state and the browser decision path back; today the refusal is
     unconditional.

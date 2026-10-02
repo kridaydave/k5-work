@@ -25,6 +25,13 @@ type SidebarProps = {
    */
   onRemoveSession?: (session: Session) => void;
   /**
+   * Why the stored task list could not be read, or null. Shown instead of the list
+   * rather than as an empty one: "No tasks yet" and "the store is unreachable" are
+   * different facts, and a user who cannot see their history needs to be told which
+   * one they are looking at.
+   */
+  storedSessionsError?: string | null;
+  /**
    * Real sessions only. k5 does not keep a session history yet, so this is at
    * most the live session; inventing entries here would present work that never
    * happened as if it had.
@@ -60,6 +67,7 @@ export function Sidebar({
   onSelectProject,
   onSelectSession,
   onRemoveSession,
+  storedSessionsError,
   sessions,
   connection = "connecting",
 }: SidebarProps) {
@@ -334,6 +342,10 @@ export function Sidebar({
                     </section>
                   ))}
                 </div>
+              ) : storedSessionsError !== undefined && storedSessionsError !== null ? (
+                <p className="px-2 py-2 text-[12px] text-white/45">
+                  Tasks could not be read: {storedSessionsError}
+                </p>
               ) : (
                 <p className="px-2 py-2 text-[12px] text-white/35">
                   {sessions.length === 0 ? "No tasks yet." : "No matching tasks."}

@@ -31,6 +31,12 @@ export interface StoredSessionState {
   sessions: SessionSummary[];
   loading: boolean;
   error: string | null;
+  /**
+   * Re-reads the list. Needed because the list is a snapshot of what was recorded
+   * when this tab mounted, and a task recorded here changes while the tab is open:
+   * its turn count climbs, and a task that did not exist at mount is not in the
+   * snapshot at all, so the row is not merely stale but missing until a reload.
+   */
   refresh: () => void;
   remove: (storeId: string) => Promise<boolean>;
 }
@@ -43,6 +49,9 @@ export function useStoredSessions(): StoredSessionState {
   // Guards against a slow response overwriting a newer one.
   const latest = useRef(0);
 
+  // Re-read on mount, and again whenever the caller says the list moved. Not
+  // polled: nothing here changes without the tab doing something, so a timer
+  // would be a request nobody asked for.
   useEffect(() => {
     const request = ++latest.current;
     setLoading(true);

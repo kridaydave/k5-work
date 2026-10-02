@@ -74,8 +74,6 @@ export interface K5Socket {
    * caller's can never disagree about what is on screen.
    */
   adoptTranscript(transcript: ProjectedTranscript): void;
-  /** Asks the harness what sessions it knows about for a project. */
-  listSessions(projectId: string): boolean;
   /** Continues a stored task on the harness, by k5 store id. */
   loadSession(storeId: string): boolean;
   connected: boolean;
@@ -458,11 +456,17 @@ export function useK5Socket(options: UseK5SocketOptions = {}): K5Socket {
     newTask,
     configure,
     adoptTranscript,
-    /** Sends the three new commands, so the caller never builds wire shapes. */
-    listSessions: useCallback(
-      (projectId: string) => send({ commandId: nextCommandId(), type: "session.list", projectId }),
-      [send],
-    ),
+    /**
+     * Sends the continuation command, so the caller never builds a wire shape.
+     *
+     * There is deliberately no `listSessions` here. The server implements
+     * `session.list` against the harness, but nothing in the browser asks for it:
+     * the sidebar is populated from the store over HTTP, because that is the list
+     * of transcripts that actually exist. A button that listed the harness's own
+     * sessions would show work k5 has no record of and cannot reopen. The command
+     * stays on the wire and stays tested until there is a screen that can be honest
+     * about what such a row would mean.
+     */
     loadSession: useCallback(
       (storeId: string) => send({ commandId: nextCommandId(), type: "session.load", storeId }),
       [send],
