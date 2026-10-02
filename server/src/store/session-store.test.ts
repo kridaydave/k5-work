@@ -13,6 +13,7 @@ import {
   MAX_LINE_BYTES,
   SessionStore,
   sanitizeTitle,
+  TITLE_MAX_UNITS,
 } from "./session-store.js";
 import { SessionStoreError } from "./errors.js";
 import { unsafeNameReason, isSafeNameSegment } from "./safe-name.js";
@@ -1363,6 +1364,56 @@ test("a harness-supplied title is stripped, collapsed and cut on a grapheme", ()
   assert.ok(!cut.includes("\ufffd"), "no replacement characters from a split surrogate pair");
   assert.ok([...cut].length <= 11, `expected at most 11 graphemes, got ${String([...cut].length)}`);
   assert.ok(cut.endsWith("…"));
+});
+
+test("a title of emoji does not produce a row the store cannot read back", async () => {
+  // The bound on a title is in UTF-16 code units, because that is what a JavaScript
+  // string's length is and that is what every schema downstream checks. Capping by
+  // grapheme instead admitted 480 units of a 120-emoji title, and the result was a
+  // row this store could write and then not read: setTitle stored it without
+  // complaint, summary() returned null, and because append() looks the session up
+  // first, every later event of a live turn was dropped with no error at all.
+  await withStore(async (store) => {
+    const session = await newSession(store, { title: "\u{1F44D}\u{1F3FD}".repeat(120) });
+    const summary = store.summary(session.storeId);
+    assert.notEqual(summary, null, "the session must still be readable");
+    assert.ok(
+      (summary?.title.length ?? 0) <= TITLE_MAX_UNITS,
+      `a stored title must fit the bound, got ${String(summary?.title.length)}`,
+    );
+    // And it survives the harness re-titling the session mid-turn, which is when
+    // the real one arrived.
+    store.append(session.storeId, delta(1, "before"));
+    store.setTitle(session.storeId, "\u{1F44D}\u{1F3FD}".repeat(120));
+    assert.notEqual(store.summary(session.storeId), null, "still readable after a harness title");
+    assert.equal(store.summary(session.storeId)?.lastSeq, 1, "and still recording");
+    assert.equal((await store.read(session.storeId, 0)).events.length, 1);
+  });
+});
+
+test("a title the schema would refuse is shortened rather than written", async () => {
+  // A row that cannot be parsed cannot be listed, selected, removed, or appended
+  // to, and nothing reports it. create() validated after the INSERT, so the row was
+  // already durable when the summary threw a raw ZodError, and the caller never
+  // learned the store id at all. Every write path is checked first now.
+  await withStore(async (store) => {
+    const session = await newSession(store, { title: "x".repeat(20_000) });
+    const summary = store.summary(session.storeId);
+    assert.notEqual(summary, null, "a refused title must not become an unreadable row");
+    assert.ok((summary?.title.length ?? 0) <= TITLE_MAX_UNITS);
+  });
+});
+
+test("sanitizeTitle falls back rather than splitting a surrogate pair", async () => {
+  // A ZWJ emoji sequence is one grapheme and many code units. Cutting it in the
+  // middle is mojibake in a sidebar row, which is the thing this function exists
+  // to prevent, so an unbudgetable grapheme yields the placeholder instead.
+  const cut = sanitizeTitle("\u{1F680}".repeat(200), 10);
+  assert.ok(!cut.includes("\ufffd"), "no replacement characters from a split surrogate pair");
+  assert.ok(cut.endsWith("\u2026"), "and it is marked as cut");
+  const joined = sanitizeTitle("\u{1F469}\u200D\u{1F4BB}".repeat(300));
+  assert.ok(joined.length <= TITLE_MAX_UNITS, `bounded, got ${String(joined.length)}`);
+  assert.ok(!joined.includes("\ufffd"), "a ZWJ sequence is never cut in half");
 });
 
 test("a session title is bounded in the list response", async () => {

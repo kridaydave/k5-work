@@ -72,7 +72,6 @@ export const MAX_PAGE_BYTES = 4 * 1024 * 1024;
 
 const DB_FILE = "k5.db";
 const META_VERSION = 1;
-const TITLE_MAX_GRAPHEMES = 120;
 const SESSION_IDLE_EVICT_MS = 30 * 24 * 60 * 60 * 1000;
 
 /**
@@ -263,9 +262,54 @@ function nowIso(ms: number): IsoTimestamp {
 }
 
 /**
- * Strips control characters and bidi overrides, collapses whitespace, then cuts
- * on a grapheme boundary. String.slice would split a surrogate pair and produce
- * mojibake, and a title is harness-influenced text rendered in a sidebar row.
+ * The longest a title may be, in UTF-16 code units.
+ *
+ * This is the number the schemas enforce. `z.string().max(200)` counts code units,
+ * because that is what a JavaScript string's length is, and every bound a title
+ * has to satisfy downstream is written that way. It is deliberately not a count of
+ * characters or of graphemes, because those are three different numbers and
+ * picking the wrong one here produced a row the store could not read back.
+ */
+export const TITLE_MAX_UNITS = 200;
+
+/** Kept in step with the bound above, with room for the ellipsis. */
+const TITLE_MAX_GRAPHEMES = 120;
+
+/**
+ * The last line of defence for a title, and the reason `sanitizeTitle` is not
+ * trusted on its own.
+ *
+ * A row that fails `MetaFileSchema` cannot be read back by this store at all, and
+ * that is unrecoverable rather than merely ugly: `meta` returns null, so `append`
+ * silently drops every later event of a live turn, and `read` refuses the session
+ * outright while its events sit on disk unreachable. Validating here means a title
+ * that would do that is shortened instead of stored.
+ */
+function titleWithinSchema(raw: string): string {
+  const candidate = sanitizeTitle(raw);
+  if (candidate.length <= TITLE_MAX_UNITS) return candidate;
+  // Reached only if the segmenter took a grapheme the budget could not hold, which
+  // `sanitizeTitle` already guards. Cut on a grapheme boundary rather than
+  // mid-surrogate, and give up the placeholder if even one grapheme will not fit.
+  const segmenter = new Intl.Segmenter("en", { granularity: "grapheme" });
+  let out = "";
+  for (const { segment } of segmenter.segment(candidate)) {
+    if (out.length + segment.length > TITLE_MAX_UNITS) break;
+    out += segment;
+  }
+  return out.length === 0 ? "Untitled task" : out;
+}
+
+/**
+ * Strips control characters and bidi overrides, collapses whitespace, then cuts on
+ * a grapheme boundary so a surrogate pair is never split into mojibake.
+ *
+ * The budget is in code units, not graphemes. Cutting at 120 graphemes admits 480
+ * code units of emoji, which is past the 200 every title is validated against, and
+ * the result was a row the store wrote and then could not read: `setTitle` stored
+ * it without complaint, `summary` returned null, and every later append was
+ * dropped because the session had become unreadable. One emoji in a prompt was
+ * enough to lose a whole recorded transcript.
  */
 export function sanitizeTitle(raw: string, maxGraphemes = TITLE_MAX_GRAPHEMES): string {
   const stripped = raw
@@ -275,14 +319,26 @@ export function sanitizeTitle(raw: string, maxGraphemes = TITLE_MAX_GRAPHEMES): 
     .trim();
   if (stripped.length === 0) return "Untitled task";
   if (stripped.length <= maxGraphemes) return stripped;
+  // The shorter of the two budgets wins, so the result satisfies the schema
+  // whichever one binds first. The grapheme count keeps a run of emoji from being
+  // cut down to a handful of characters, and the unit count is what keeps the
+  // result inside the contract. `out.length` is what is capped, not a count of
+  // graphemes: a title is validated in code units everywhere downstream, so this
+  // function must stay inside that budget or the row it lands in cannot be read
+  // back.
+  const budget = Math.min(maxGraphemes, TITLE_MAX_UNITS - 1);
   const segmenter = new Intl.Segmenter("en", { granularity: "grapheme" });
   let out = "";
-  let count = 0;
   for (const { segment } of segmenter.segment(stripped)) {
-    if (count >= maxGraphemes) break;
+    // Both budgets are checked before appending, so a segment is never half-taken.
+    if (out.length + segment.length > budget) break;
     out += segment;
-    count += 1;
   }
+  // A single grapheme can be longer than the whole budget in theory, so the loop
+  // above can take nothing at all. Falling back to a hard cut here would be the
+  // surrogate-splitting bug this function exists to prevent, so the placeholder
+  // is used instead: short, valid, and honest about having nothing to show.
+  if (out.length === 0) return "Untitled task";
   return `${out.replace(/[\s.]+$/u, "")}…`;
 }
 
@@ -784,7 +840,7 @@ export class SessionStore {
       projectId: input.projectId,
       projectName: input.projectName,
       cwd: input.cwd,
-      title: sanitizeTitle(input.title ?? ""),
+      title: titleWithinSchema(input.title ?? ""),
       createdAt: nowIso(nowMs),
       updatedAt: nowIso(nowMs),
       turnCount: 0,
@@ -795,6 +851,18 @@ export class SessionStore {
       titleSource: input.title === undefined ? "none" : "prompt",
       endedMidTurn: false,
     };
+    // Validated before the write, not after. Building the row by assertion and
+    // letting the INSERT land meant a value the schema refused was already durable
+    // by the time `toSummary` threw: the caller got a raw ZodError instead of a
+    // typed one, and never learned the store id, so the row was an orphan nothing
+    // could list, select or remove.
+    const row = MetaFileSchema.safeParse(meta);
+    if (!row.success) {
+      throw new SessionStoreError(
+        "E_STORE_WRITABLE",
+        `refusing a session row that could not be read back: ${row.error.issues[0]?.message ?? "unknown"}`,
+      );
+    }
     const db = this.handle();
     try {
       db.prepare(
@@ -981,7 +1049,7 @@ export class SessionStore {
   setTitle(storeId: string, title: string, updatedAt?: string | null): void {
     const meta = this.meta(storeId);
     if (meta === null || meta === undefined) return;
-    const sanitized = sanitizeTitle(title);
+    const sanitized = titleWithinSchema(title);
     // The harness knows better than we do when it was last active, and the
     // sidebar orders by this. Only accepted when parseable, so a malformed value
     // cannot make the row un-evictable by age.
@@ -1012,7 +1080,7 @@ export class SessionStore {
     // placeholder meant a prompt of literally "Untitled task" re-armed this, and
     // turn two silently renamed the session.
     if (meta.titleSource !== "none") return;
-    const sanitized = sanitizeTitle(prompt);
+    const sanitized = titleWithinSchema(prompt);
     if (sanitized === meta.title) return;
     try {
       this.handle()
