@@ -6,7 +6,11 @@ import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { ServerEvent } from "@k5-work/shared";
-import { MAX_ATTACHMENT_BYTES, SessionEventsResponseSchema } from "@k5-work/shared";
+import {
+  MAX_ATTACHMENT_BYTES,
+  projectTranscript,
+  SessionEventsResponseSchema,
+} from "@k5-work/shared";
 import {
   MAX_SESSION_BYTES,
   MAX_STORE_BYTES,
@@ -822,7 +826,11 @@ test("a record stored below the page's start is reported, not served", async () 
 
 // --- bounds ---
 
-test("a record over the line cap is dropped and reported, not truncated", async () => {
+test("a record over the line cap is dropped, reported, and counted as lost", async () => {
+  // The drop leaves no sequence gap, so a reader comparing numbers sees a
+  // contiguous log and concludes nothing is missing. That is what made a lost
+  // assistant message look like a complete transcript. `dropped` is the only
+  // thing standing between the two.
   await withStore(
     async (store) => {
       const session = await newSession(store);
@@ -833,10 +841,122 @@ test("a record over the line cap is dropped and reported, not truncated", async 
       const page = await store.read(session.storeId, null);
       const texts = page.events.map((e) => (e.event.type === "turn.delta" ? e.event.text : ""));
       assert.deepEqual(texts, ["before", "after"]);
+      // Not truncated: the session kept accepting appends, so the log is a
+      // transcript with a hole in it rather than a prefix that stopped growing.
       assert.equal(store.summary(session.storeId)?.truncated, false);
+      assert.equal(store.summary(session.storeId)?.droppedRecords, 1);
+      assert.equal(page.dropped, 1);
+      // And the loss is visible to the browser through the projection, which is
+      // where a user would actually see it.
+      const projected = projectTranscript(
+        page.events.map((e) => ({ v: 1 as const, seq: e.seq, ts: e.ts, event: e.event })),
+        { dropped: page.dropped },
+      );
+      assert.equal(projected.dropped, 1);
     },
     { onError: () => {} },
   );
+});
+
+test("a dropped record stays counted after a restart", async () => {
+  // The row outlives the process that lost the record, so the count has to be
+  // stored rather than kept in memory. Reading only the in-memory map meant a
+  // restart quietly reset it and the transcript went back to reporting itself
+  // whole while still missing the same turn.
+  const root = tempRoot();
+  const options = { root, onError: () => {} } as const;
+  const first = new SessionStore(options);
+  await first.open();
+  try {
+    const session = await newSession(first);
+    first.append(session.storeId, delta(1, "before"));
+    first.append(session.storeId, delta(2, "y".repeat(MAX_LINE_BYTES)));
+    first.append(session.storeId, delta(3, "after"));
+    await first.flushMeta(session.storeId);
+  } finally {
+    await first.close();
+  }
+
+  const second = new SessionStore(options);
+  await second.open();
+  try {
+    const ids = second.list().map((entry) => entry.storeId);
+    assert.equal(ids.length, 1);
+    const page = await second.read(ids[0] ?? "", null);
+    assert.equal(page.events.length, 2, "the lost record stays lost");
+    assert.equal(page.dropped, 1, "and it is still admitted after the restart");
+    assert.equal(second.summary(ids[0] ?? "")?.droppedRecords, 1);
+  } finally {
+    await second.close();
+    await fsp.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a harness timestamp is normalised to ISO so the sidebar can order by it", async () => {
+  // `updated_at` is TEXT and every comparator on it is a byte comparison: the
+  // sidebar sorts, the recency index is built on it, and age eviction parses it.
+  // `Date.parse` accepting a string does not make that string sortable, so a
+  // harness answering "Feb 1 2026" parked its session above every ISO row and a
+  // live task could be reaped for looking like the oldest thing in the store.
+  await withStore(async (store) => {
+    const session = await newSession(store, { title: "harness dated" });
+    store.setTitle(session.storeId, "harness dated", "Feb 1 2026");
+    const updatedAt = store.summary(session.storeId)?.updatedAt;
+    // Expected value computed the same way, not hardcoded: a bare date string has
+    // no zone, so V8 reads it as local time and the UTC instant differs on every
+    // box that is not on GMT. Hardcoding "2026-02-01T00:00:00.000Z" made this test
+    // fail on a machine in Asia/Calcutta.
+    assert.equal(updatedAt, new Date(Date.parse("Feb 1 2026")).toISOString());
+    // And it sorts where the date says it should: between 2025 and 2027, not
+    // above every row in the table.
+    const later = await newSession(store, { title: "iso newer" });
+    store.setTitle(later.storeId, "iso newer", "2026-06-01T00:00:00.000Z");
+    const titles = store.list().map((entry) => entry.title);
+    assert.deepEqual(titles, ["iso newer", "harness dated"]);
+  });
+});
+
+test("an unparseable harness timestamp leaves the stored one alone", async () => {
+  await withStore(async (store) => {
+    const session = await newSession(store, { title: "kept" });
+    const before = store.summary(session.storeId)?.updatedAt;
+    store.setTitle(session.storeId, "kept", "not a date at all");
+    assert.equal(store.summary(session.storeId)?.updatedAt, before);
+  });
+});
+
+test("a boot rewrites a timestamp that was stored before the normalisation", async () => {
+  // The write path normalises now, but rows written by an older build are still
+  // on disk and age eviction deletes on that column. A data repair, not cosmetics.
+  const root = tempRoot();
+  const options = { root, onError: () => {} } as const;
+  const first = new SessionStore(options);
+  await first.open();
+  let storeId = "";
+  try {
+    const session = await newSession(first, { title: "legacy date" });
+    storeId = session.storeId;
+    await first.flushMeta(session.storeId);
+    // What the old build wrote: the harness string, verbatim.
+    poke(root, (db) => {
+      db.prepare("UPDATE sessions SET updated_at = ? WHERE store_id = ?").run("1 Jan 2020", storeId);
+    });
+  } finally {
+    await first.close();
+  }
+
+  const second = new SessionStore(options);
+  await second.open();
+  try {
+    assert.equal(
+      second.summary(storeId)?.updatedAt,
+      new Date(Date.parse("1 Jan 2020")).toISOString(),
+      "a row stored as '1 Jan 2020' would otherwise sort below every ISO row and read as the oldest session",
+    );
+  } finally {
+    await second.close();
+    await fsp.rm(root, { recursive: true, force: true });
+  }
 });
 
 test("only session-scoped events are persisted", async () => {

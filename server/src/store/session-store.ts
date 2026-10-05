@@ -130,8 +130,17 @@ CREATE TABLE IF NOT EXISTS sessions (
   bytes               INTEGER NOT NULL,
   truncated           INTEGER NOT NULL,
   title_source        TEXT    NOT NULL,
-  ended_mid_turn      INTEGER NOT NULL
+  ended_mid_turn      INTEGER NOT NULL,
+  dropped_records     INTEGER NOT NULL DEFAULT 0
 ) STRICT;
+
+-- `updated_at` is compared as TEXT, never parsed by SQLite, so a row is only
+-- correctly ordered if every stamp in the column has the same fixed width.
+-- `create` and `setTitle` both normalise through `isoStamp`, so a harness that
+-- answers `session_info_update` with "Feb 1 2026" cannot park a live task at the
+-- top of the sidebar forever. The remaining risk is a stamp written before that
+-- normalisation existed, so boot rewrites any row that is not already ISO rather
+-- than leaving a session ordered wrongly for the life of the file.
 
 -- The sidebar reads every session newest-first on every load, so the sort key is
 -- an index rather than a full scan and a sort.
@@ -209,6 +218,13 @@ const MetaFileSchema = z
     lastSeq: z.number().int().nonnegative(),
     bytes: z.number().int().nonnegative(),
     truncated: z.boolean(),
+    /**
+     * Records this store refused to keep in a way that left no gap behind.
+     * Persisted, because the loss is permanent. A row that quietly lost a turn
+     * has to keep admitting it across restarts instead of reporting itself whole
+     * again once the process that dropped the record is gone.
+     */
+    droppedRecords: z.number().int().nonnegative(),
     // A flag, not a sentinel value. Comparing against the placeholder string
     // meant a first prompt of literally "Untitled task", or any harness title
     // that sanitised to the placeholder, re-armed the fallback and let turn two
@@ -259,6 +275,21 @@ export interface SessionStoreOptions {
 
 function nowIso(ms: number): IsoTimestamp {
   return new Date(ms).toISOString();
+}
+
+/**
+ * A harness-supplied timestamp as the one shape every comparator on it assumes,
+ * or null when it is not a real time.
+ *
+ * This exists because `Date.parse` accepting a string does not make that string
+ * sortable. `updated_at` is TEXT, the sidebar sorts on it, the recency index is
+ * built on it, and age eviction parses it, so the value has to be a fixed-width
+ * ISO stamp or the three of them disagree about which session is newest.
+ */
+function isoStamp(raw: string | null | undefined): IsoTimestamp | null {
+  if (typeof raw !== "string" || raw.length === 0) return null;
+  const ms = Date.parse(raw);
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
 }
 
 /**
@@ -376,7 +407,8 @@ function asFlag(row: MetaRow, column: string): boolean {
 
 const SESSION_COLUMNS =
   "store_id, harness, harness_session_id, project_id, project_name, cwd, title, " +
-  "created_at, updated_at, turn_count, first_seq, last_seq, bytes, truncated, title_source, ended_mid_turn";
+  "created_at, updated_at, turn_count, first_seq, last_seq, bytes, truncated, title_source, " +
+  "ended_mid_turn, dropped_records";
 
 /**
  * One row to the shape the rest of the server uses, or null when the row is not
@@ -404,6 +436,7 @@ function rowToMeta(row: MetaRow): MetaFile | null {
     truncated: asFlag(row, "truncated"),
     titleSource: asText(row, "title_source") ?? "none",
     endedMidTurn: asFlag(row, "ended_mid_turn"),
+    droppedRecords: asInt(row, "dropped_records"),
   });
   return result.success ? result.data : null;
 }
@@ -537,6 +570,7 @@ export class SessionStore {
       }
       db.exec(SCHEMA);
       db.exec(`PRAGMA user_version = ${String(SCHEMA_VERSION)}`);
+      this.addMissingColumns();
     } catch (cause) {
       this.db = null;
       db.close();
@@ -551,6 +585,10 @@ export class SessionStore {
       // the rest of the process. The same drift in the other direction is a store
       // that refuses every write while sitting nearly empty.
       this.reconcile();
+      // After the import, not before: a legacy row carries whatever timestamp the old
+      // file held, and it lands in the table unsorted. Repairing first would leave
+      // every imported session mis-ordered until the next boot.
+      this.normaliseStamps();
       this.chargeStoreBytes();
     } catch (cause) {
       this.db = null;
@@ -586,6 +624,92 @@ export class SessionStore {
       )
       .get() as MetaRow;
     this.storeBytes = asInt(events, "total") + asInt(spooled, "total");
+  }
+
+  /**
+   * Adds any column this build needs to a table that an older one created without
+   * it.
+   *
+   * `SCHEMA` is all `CREATE TABLE IF NOT EXISTS`, which creates a missing table but
+   * never adds a column to one that already exists. So a `k5.db` written by the
+   * previous build keeps its old shape, and every query naming the new column
+   * throws `no such column` inside `list()`, `append()` and `evict()`. The throw
+   * matters most in `append`, which is documented as never throwing and runs on a
+   * synchronous emit path: it becomes an unhandled rejection that takes the
+   * harness children down with it. That is a worse outcome than an old file being
+   * slightly behind.
+   *
+   * Idempotent, because a column that is already there is skipped, which is what
+   * lets `SCHEMA_VERSION` stay put: the version guards what a row *means*, and an
+   * additive defaulted column does not change that. The rule at its declaration
+   * assumed a migration path existed, and this is it.
+   */
+  private addMissingColumns(): void {
+    const db = this.handle();
+    const present = new Set(
+      (db.prepare("PRAGMA table_info(sessions)").all() as MetaRow[]).flatMap((row) => {
+        const name = asText(row, "name");
+        return name === null ? [] : [name];
+      }),
+    );
+    if (present.size === 0) return;
+    if (!present.has("dropped_records")) {
+      db.exec("ALTER TABLE sessions ADD COLUMN dropped_records INTEGER NOT NULL DEFAULT 0");
+    }
+  }
+
+  /**
+   * Rewrites any `updated_at` that is not already a fixed-width ISO stamp.
+   *
+   * `create` and `setTitle` both normalise, so new rows are fine. This is for the
+   * rows written before that was true: the harness's date string was stored as it
+   * arrived, and the sidebar orders on it as TEXT, so one session carrying
+   * "Feb 1 2026" sat above every ISO row forever and one carrying "1 Jan 2020"
+   * read as the oldest task in the store. Age eviction deletes on that order, so
+   * this is a data repair and not cosmetics.
+   *
+   * Never fatal to boot: the read and each row are guarded separately, and a row
+   * that cannot be rewritten is reported and skipped, exactly as a session that
+   * cannot be reconciled is.
+   */
+  private normaliseStamps(): void {
+    let rows: MetaRow[];
+    try {
+      rows = this.handle()
+        .prepare("SELECT store_id AS store_id, updated_at AS updated_at FROM sessions")
+        .all() as MetaRow[];
+    } catch (cause) {
+      // Never fatal to boot, as the comment above promises. A store whose rows
+      // cannot be listed is a store whose timestamps cannot be repaired, which is
+      // strictly less bad than refusing to start at all.
+      this.report("E_STORE_ROOT", `could not read timestamps to normalise: ${String(cause)}`);
+      return;
+    }
+    for (const row of rows) {
+      const storeId = asText(row, "store_id");
+      if (storeId === null) continue;
+      const current = asText(row, "updated_at");
+      if (current === null) continue;
+      const stamp = isoStamp(current);
+      // Already fixed-width ISO, so there is nothing to gain from rewriting the
+      // row on every boot. Skipping it also keeps an unparseable stamp out of the
+      // log: it is not this repair's job to decide what it meant.
+      if (stamp === null || stamp === current) continue;
+      try {
+        this.handle()
+          .prepare("UPDATE sessions SET updated_at = ? WHERE store_id = ?")
+          .run(stamp, storeId);
+        this.report(
+          "E_STORE_WRITABLE",
+          `normalised the timestamp of ${storeId} from ${JSON.stringify(current)} to ${stamp}`,
+        );
+      } catch (cause) {
+        this.report(
+          "E_STORE_WRITABLE",
+          `could not normalise the timestamp of ${storeId}: ${String(cause)}`,
+        );
+      }
+    }
   }
 
   /**
@@ -850,6 +974,7 @@ export class SessionStore {
       truncated: false,
       titleSource: input.title === undefined ? "none" : "prompt",
       endedMidTurn: false,
+      droppedRecords: 0,
     };
     // Validated before the write, not after. Building the row by assertion and
     // letting the INSERT land meant a value the schema refused was already durable
@@ -866,7 +991,7 @@ export class SessionStore {
     const db = this.handle();
     try {
       db.prepare(
-        `INSERT INTO sessions (${SESSION_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO sessions (${SESSION_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
         meta.storeId,
         meta.harness,
@@ -883,6 +1008,7 @@ export class SessionStore {
         meta.bytes,
         0,
         meta.titleSource,
+        0,
         0,
       );
     } catch (cause) {
@@ -930,15 +1056,18 @@ export class SessionStore {
       line = JSON.stringify(validated);
       payload = JSON.stringify(validated.event);
     } catch (cause) {
-      this.report("E_STORE_LINE_TOO_LONG", `refusing an unrecordable event: ${String(cause)}`);
+      this.noteDropped(
+        storeId,
+        `refused an unrecordable event for ${storeId}: ${String(cause)}`,
+      );
       return;
     }
 
     const bytes = Buffer.byteLength(line, "utf8");
     if (bytes > MAX_LINE_BYTES) {
-      this.report(
-        "E_STORE_LINE_TOO_LONG",
-        `dropped a ${String(bytes)}-byte record over the ${String(MAX_LINE_BYTES)}-byte cap`,
+      this.noteDropped(
+        storeId,
+        `dropped a ${String(bytes)}-byte record of ${storeId} over the ${String(MAX_LINE_BYTES)}-byte cap`,
       );
       return;
     }
@@ -1001,10 +1130,13 @@ export class SessionStore {
         // whole while quietly missing events. The summary is left untruncated
         // because the log is not a prefix: a later turn appends normally and the
         // only consequence is this one event, which is what `dropped` reports.
-        this.storeDrifted.set(storeId, (this.storeDrifted.get(storeId) ?? 0) + 1);
-        this.report(
-          "E_STORE_WRITABLE",
+        // The same loss `noteDropped` records, reached for a different reason: the
+        // transaction rolled back rather than the record being refused. Persisted
+        // for the same reason too, since a restart must not quietly forget it.
+        this.noteDropped(
+          storeId,
           `the session store was busy, so one record of ${storeId} was not kept: ${String(cause)}`,
+          "E_STORE_WRITABLE",
         );
         return;
       }
@@ -1027,6 +1159,41 @@ export class SessionStore {
     this.stopped.add(storeId);
     this.setTruncated(storeId);
     this.report("E_STORE_QUOTA", message);
+  }
+
+  /**
+   * Records that one event could not be kept, and says so where a reader can see
+   * it.
+   *
+   * The two callers above drop a record without writing one, and without taking
+   * the sequence number, so the log stays contiguous and a reader comparing
+   * sequences concludes nothing is missing. That is what made a lost assistant
+   * message look like a complete transcript. Counting it is the only way to be
+   * honest about it, and the count is persisted because the hole outlives the
+   * process that made it.
+   *
+   * Deliberately does not set `truncated`. That flag means the log is a prefix and
+   * stops accepting appends, which is a different failure with a different repair.
+   * A session that drops one oversized event keeps going, so it belongs under
+   * "Incomplete" with an explicit count rather than claiming to be a prefix.
+   */
+  private noteDropped(
+    storeId: string,
+    message: string,
+    code: SessionStoreErrorCode = "E_STORE_LINE_TOO_LONG",
+  ): void {
+    this.storeDrifted.set(storeId, (this.storeDrifted.get(storeId) ?? 0) + 1);
+    try {
+      this.handle()
+        .prepare("UPDATE sessions SET dropped_records = dropped_records + 1 WHERE store_id = ?")
+        .run(storeId);
+    } catch (cause) {
+      this.report(
+        "E_STORE_WRITABLE",
+        `could not record the dropped event of ${storeId}: ${String(cause)}`,
+      );
+    }
+    this.report(code, message);
   }
 
   private setTruncated(storeId: string): void {
@@ -1053,10 +1220,15 @@ export class SessionStore {
     // The harness knows better than we do when it was last active, and the
     // sidebar orders by this. Only accepted when parseable, so a malformed value
     // cannot make the row un-evictable by age.
-    const stamp =
-      typeof updatedAt === "string" && Number.isFinite(Date.parse(updatedAt))
-        ? updatedAt
-        : meta.updatedAt;
+    //
+    // Normalised to ISO, because parseable is not the same as sortable. This
+    // column is TEXT and every comparator on it is a byte comparison: SQLite
+    // never parses it, and neither does the recency index. "Feb 1 2026" parses
+    // fine and sorts above every ISO stamp, so the row pinned itself to the top
+    // of the sidebar and could never be age-evicted. "1 Jan 2020" sorts below
+    // everything and read as the oldest session k5 owns, which is how a live
+    // task got reaped for being idle. One shape in, one shape stored.
+    const stamp = isoStamp(updatedAt) ?? meta.updatedAt;
     try {
       this.handle()
         .prepare(
@@ -1191,6 +1363,7 @@ export class SessionStore {
       firstSeq: meta.firstSeq,
       lastSeq: meta.lastSeq,
       truncated: meta.truncated,
+      droppedRecords: meta.droppedRecords,
     });
   }
 
@@ -1217,7 +1390,12 @@ export class SessionStore {
     // Records the store itself failed to keep. Reported on every page rather than
     // folded into the gap count, because these are not holes in the sequence and a
     // reader comparing numbers would never find them.
-    const drift = this.storeDrifted.get(storeId) ?? 0;
+    //
+    // The persisted column is the floor, not the whole answer: it carries the
+    // losses made by earlier processes, while `storeDrifted` carries this one's.
+    // Reading only the map meant a restart quietly reset the count to zero and the
+    // transcript went back to reporting itself whole.
+    const drift = Math.max(this.storeDrifted.get(storeId) ?? 0, meta.droppedRecords);
     // 0 is the "start over" cursor: it means everything after seq 0, which is the
     // whole log for any firstSeq. Every path that cannot serve the request returns
     // it, so a client following nextSince rehydrates from the start rather than
@@ -1710,7 +1888,7 @@ export class SessionStore {
     try {
       db.exec("BEGIN IMMEDIATE");
       db.prepare(
-        `INSERT INTO sessions (${SESSION_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO sessions (${SESSION_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
         meta.data.storeId,
         meta.data.harness,
@@ -1728,6 +1906,11 @@ export class SessionStore {
         meta.data.truncated ? 1 : 0,
         meta.data.titleSource,
         meta.data.endedMidTurn ? 1 : 0,
+        // The unreadable records this import skipped are loss the same shape as a
+        // record a live append refused to keep: gone, with no gap left behind.
+        // Counting them here is what stops an imported transcript claiming to be
+        // whole while missing the turns that did not parse.
+        legacy.skipped,
       );
       const insert = db.prepare(
         "INSERT OR REPLACE INTO events (store_id, seq, ts, payload, bytes) VALUES (?, ?, ?, ?, ?)",
