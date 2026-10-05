@@ -368,6 +368,7 @@ test("the list response is bounded and rejects a malformed summary", () => {
     firstSeq: 1,
     lastSeq: 9,
     truncated: false,
+    droppedRecords: 0,
   };
   assert.equal(SessionSummarySchema.safeParse(summary).success, true);
   assert.equal(SessionListResponseSchema.safeParse({ sessions: [summary] }).success, true);
@@ -377,6 +378,11 @@ test("the list response is bounded and rejects a malformed summary", () => {
     SessionSummarySchema.safeParse({ ...summary, sneaky: true }).success,
     false,
   );
+  // A missing one is refused too, which is the half that caught the schema change:
+  // the field went in, this literal did not, and the failure looked like a boolean
+  // flipping rather than a contract drifting.
+  const { droppedRecords: _dropped, ...withoutLoss } = summary;
+  assert.equal(SessionSummarySchema.safeParse(withoutLoss).success, false);
   // The list really is bounded, not just annotated.
   const tooMany = {
     sessions: Array.from({ length: 501 }, () => summary),

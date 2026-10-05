@@ -102,6 +102,11 @@ export default function App() {
   // anything: a turn that finished while the socket was down would otherwise be
   // silently lost, because the socket never replays and the store is the record.
   const [rehydrated, setRehydrated] = useState<ProjectedTranscript | null>(null);
+  // What the store refused to keep for the open task. Separate from
+  // `transcriptNote` because that one is a transient status a user dismisses by
+  // acting, and this is a permanent fact about the transcript that has to keep
+  // being true for as long as the task is open.
+  const [readDropped, setReadDropped] = useState(0);
   // The task on screen, mirrored in a ref because the read is asynchronous and
   // its callback cannot see the render that started it.
   const openStoreId = useRef<string | null>(null);
@@ -113,9 +118,14 @@ export default function App() {
     // beside the right task with nothing on screen to say so.
     if (openStoreId.current !== storeId) return;
     setRehydrated(transcript);
+    setReadDropped(transcript.dropped);
   }, []);
   const k5 = useK5Socket({ rehydrate });
   const { state, adoptTranscript } = k5;
+  // Cleared here rather than in the switch handler, because `max` would otherwise
+  // carry the previous task's count onto the next one until its own read landed:
+  // a task that lost records making the viewer think the next one did too.
+  if (openStoreId.current !== state.storeId) setReadDropped(0);
   openStoreId.current = state.storeId;
   // The Composer clears its textarea and its chips once the parent confirms the
   // submission went out. On the lazy-open path that confirmation cannot happen
@@ -238,7 +248,7 @@ export default function App() {
       id: entry.storeId,
       title: entry.title,
       meta: entry.turnCount === 1 ? "1 turn" : `${String(entry.turnCount)} turns`,
-      group: entry.truncated ? "Incomplete" : "Tasks",
+      group: entry.truncated || entry.droppedRecords > 0 ? "Incomplete" : "Tasks",
     }));
     // The live session is shown only when the store has not caught up with it yet,
     // so opening a task does not make a duplicate row appear.
@@ -264,6 +274,17 @@ export default function App() {
     return [...live, ...stored];
   }, [activeProject, state.sessionId, state.storeId, state.configOptions, storedSessions]);
 
+  // The higher of what the transcript read back and what the stored-session list
+  // reports. Two views of one counter: the list refreshes when a task opens and
+  // when a turn reaches a terminal state, the read only on rehydrate. Taking only
+  // the read left the note absent for the whole rest of a task even after the
+  // sidebar had already grouped the row as Incomplete. A drop mid-turn still
+  // waits for the turn to end, which is the list's refresh point.
+  const lostRecords = Math.max(
+    readDropped,
+    storedSessions.find((entry) => entry.storeId === state.storeId)?.droppedRecords ?? 0,
+  );
+
   const handleNewTask = useCallback(() => {
     queuedPrompt.current = null;
     queueFullRef.current = false;
@@ -273,8 +294,9 @@ export default function App() {
     pendingChoice.current = {};
     confirmed.current = {};
     // A new task must clear any note; a stale error above an empty hero reads as
-    // a current failure.
+    // a current failure. The lost-record count goes with it, for the same reason.
     setTranscriptNote(null);
+    setReadDropped(0);
     k5.newTask();
     setSessionKey((current) => current + 1);
     requestAnimationFrame(() => {
@@ -564,6 +586,21 @@ export default function App() {
                 className="mx-auto w-full max-w-[800px] pb-2 text-[12px] text-white/55"
               >
                 {transcriptNote}
+              </div>
+            ) : null}
+
+            {/* What the store could not keep, in the only place a user reads the
+                transcript back. The record left no gap in the sequence, so nothing
+                on screen would otherwise show that a reply is missing: the
+                conversation simply has a hole in it and reports itself whole. */}
+            {lostRecords > 0 ? (
+              <div
+                role="status"
+                className="mx-auto w-full max-w-[800px] pb-2 text-[12px] text-amber-300/80"
+              >
+                {lostRecords === 1
+                  ? "One record of this task could not be stored, so something in the conversation above is missing."
+                  : `${String(lostRecords)} records of this task could not be stored, so parts of the conversation above are missing.`}
               </div>
             ) : null}
 

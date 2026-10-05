@@ -91,6 +91,13 @@ export const SessionSummarySchema = z
     // The reverse of a stored transcript: the log hit its byte cap, so what is
     // on disk is a prefix. The UI has to say so rather than imply completeness.
     truncated: z.boolean(),
+    /**
+     * Records the store refused to keep in a way that left no gap behind, so a
+     * reader cannot notice the loss by comparing sequences. Separate from
+     * `truncated` because the session kept accepting appends: this is a
+     * transcript with a hole in it, not a prefix that stopped growing.
+     */
+    droppedRecords: z.number().int().nonnegative(),
   })
   .strict();
 export type SessionSummary = z.infer<typeof SessionSummarySchema>;
