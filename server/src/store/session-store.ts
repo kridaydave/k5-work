@@ -1274,8 +1274,11 @@ export class SessionStore {
    * In WAL mode with synchronous=NORMAL a committed transaction is already
    * visible to every reader in the process; this makes it survive a power loss
    * too, which is the only thing a caller asking for a flush actually wants.
+   *
+   * The checkpoint covers the whole database, so the store id a caller holds is
+   * accepted for the recorder interface but never read.
    */
-  async flushMeta(storeId: string): Promise<void> {
+  async flushMeta(_storeId: string): Promise<void> {
     if (this.db === null) return;
     try {
       this.handle().exec("PRAGMA wal_checkpoint(PASSIVE)");

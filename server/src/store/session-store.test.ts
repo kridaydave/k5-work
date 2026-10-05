@@ -654,7 +654,7 @@ test("a numeric column refuses a value of the wrong type, and a wrong-shaped val
 // --- read path ---
 
 test("a read never changes what is stored", async () => {
-  await withStore(async (store, root) => {
+  await withStore(async (store, _root) => {
     const session = await newSession(store);
     store.append(session.storeId, delta(1, "one"));
     store.append(session.storeId, delta(2, "two"));

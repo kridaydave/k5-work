@@ -656,7 +656,6 @@ describe("a harness that asks for permission", () => {
 describe("durable session recording", () => {
   async function recordedTranscript(
     harness: Harness,
-    opts: { scenario?: string } = {},
   ): Promise<{ turns: ReturnType<typeof projectTranscript>["turns"]; titles: string[] }> {
     const ws = await harness.connect("http://127.0.0.1:5173");
     try {
