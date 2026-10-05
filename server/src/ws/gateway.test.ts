@@ -269,6 +269,31 @@ describe("gateway upgrade", () => {
     ws.terminate();
   });
 
+  it("drops an oversized commandId rather than throwing inside the message handler", async () => {
+    const g = await startGateway();
+    const { ws } = await connect(g.origin, { Origin: "http://127.0.0.1:5173" });
+    const received: unknown[] = [];
+    ws.on("message", (d) => received.push(JSON.parse(d.toString())));
+    ws.send(JSON.stringify({ commandId: "x".repeat(129), type: "session.hack" }));
+    // A well-formed command afterwards proves the handler survived: before the
+    // fix the oversized id threw out of connection.send, which escaped the
+    // message handler as an uncaught exception and ended the process.
+    await new Promise((r) => setTimeout(r, 80));
+    ws.send(JSON.stringify({ commandId: "c-after", type: "session.close", sessionId: "s-1" }));
+    await new Promise((r) => setTimeout(r, 80));
+    assert.deepEqual(
+      g.commands.map((c) => c.commandId),
+      ["c-after"],
+      "the oversized id must never reach a handler",
+    );
+    assert.deepEqual(
+      received,
+      [],
+      "an id that does not fit CommandIdSchema cannot be correlated back",
+    );
+    ws.terminate();
+  });
+
   it("closes a connection that exceeds the command rate limit", async () => {
     const g = await startGateway({
       bounds: { commandRateLimit: 3, commandRateWindowMs: 60_000 },

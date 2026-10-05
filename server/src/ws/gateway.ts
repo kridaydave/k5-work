@@ -3,6 +3,7 @@ import type { Duplex } from "node:stream";
 import { WebSocketServer, type WebSocket } from "ws";
 import {
   BrowserCommandSchema,
+  CommandIdSchema,
   ServerEventSchema,
   type BrowserCommand,
   type ServerEvent,
@@ -398,10 +399,13 @@ function parseJson(raw: string): unknown {
 
 function recoverCommandId(raw: string): string | null {
   try {
-    const parsed = JSON.parse(raw) as { commandId?: unknown };
-    return typeof parsed.commandId === "string" && parsed.commandId.length > 0
-      ? parsed.commandId
-      : null;
+    // Parsed with the schema the reply is validated against. The id is
+    // attacker-controlled, so an oversized one reaching connection.send throws
+    // inside the message handler and ends the process.
+    const parsed = CommandIdSchema.safeParse(
+      (JSON.parse(raw) as { commandId?: unknown }).commandId,
+    );
+    return parsed.success ? parsed.data : null;
   } catch {
     return null;
   }
