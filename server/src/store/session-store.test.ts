@@ -898,22 +898,35 @@ test("a harness timestamp is normalised to ISO so the sidebar can order by it", 
   // `Date.parse` accepting a string does not make that string sortable, so a
   // harness answering "Feb 1 2026" parked its session above every ISO row and a
   // live task could be reaped for looking like the oldest thing in the store.
-  await withStore(async (store) => {
-    const session = await newSession(store, { title: "harness dated" });
-    store.setTitle(session.storeId, "harness dated", "Feb 1 2026");
-    const updatedAt = store.summary(session.storeId)?.updatedAt;
-    // Expected value computed the same way, not hardcoded: a bare date string has
-    // no zone, so V8 reads it as local time and the UTC instant differs on every
-    // box that is not on GMT. Hardcoding "2026-02-01T00:00:00.000Z" made this test
-    // fail on a machine in Asia/Calcutta.
-    assert.equal(updatedAt, new Date(Date.parse("Feb 1 2026")).toISOString());
-    // And it sorts where the date says it should: between 2025 and 2027, not
-    // above every row in the table.
-    const later = await newSession(store, { title: "iso newer" });
-    store.setTitle(later.storeId, "iso newer", "2026-06-01T00:00:00.000Z");
-    const titles = store.list().map((entry) => entry.title);
-    assert.deepEqual(titles, ["iso newer", "harness dated"]);
-  });
+  //
+  // The clock is pinned, and both stamps sit inside the idle window, because a
+  // real clock made this test lie. A month-old row is idle by definition and
+  // create() evicts idle sessions before it inserts, so the first session was
+  // deleted the moment the second one was created and the assertion failed on
+  // the list rather than on the ordering it was written to check. Pinning it also
+  // stops the test going quietly stale.
+  const clock = Date.parse("2026-06-20T00:00:00.000Z");
+  await withStore(
+    async (store) => {
+      const session = await newSession(store, { title: "harness dated" });
+      store.setTitle(session.storeId, "harness dated", "Jun 5 2026");
+      const updatedAt = store.summary(session.storeId)?.updatedAt;
+      // Expected value computed the same way, not hardcoded: a bare date string has
+      // no zone, so V8 reads it as local time and the UTC instant differs on every
+      // box that is not on GMT. Hardcoding a UTC literal made this test fail on a
+      // machine in Asia/Calcutta.
+      assert.equal(updatedAt, new Date(Date.parse("Jun 5 2026")).toISOString());
+      // And it sorts where the date says it should: below the June 10 row, not above
+      // it. "J" is a higher byte than "2", so a lexicographic compare on the raw
+      // harness string put it first. That inversion is the bug this test exists
+      // for, and it still inverts with both dates in the same month.
+      const later = await newSession(store, { title: "iso newer" });
+      store.setTitle(later.storeId, "iso newer", "2026-06-10T00:00:00.000Z");
+      const titles = store.list().map((entry) => entry.title);
+      assert.deepEqual(titles, ["iso newer", "harness dated"]);
+    },
+    { now: () => clock },
+  );
 });
 
 test("an unparseable harness timestamp leaves the stored one alone", async () => {
