@@ -134,16 +134,19 @@ CREATE TABLE IF NOT EXISTS sessions (
   dropped_records     INTEGER NOT NULL DEFAULT 0
 ) STRICT;
 
--- `updated_at` is compared as TEXT, never parsed by SQLite, so a row is only
--- correctly ordered if every stamp in the column has the same fixed width.
--- `create` and `setTitle` both normalise through `isoStamp`, so a harness that
--- answers `session_info_update` with "Feb 1 2026" cannot park a live task at the
--- top of the sidebar forever. The remaining risk is a stamp written before that
--- normalisation existed, so boot rewrites any row that is not already ISO rather
--- than leaving a session ordered wrongly for the life of the file.
-
 -- The sidebar reads every session newest-first on every load, so the sort key is
 -- an index rather than a full scan and a sort.
+--
+-- updated_at is compared as TEXT and never parsed by SQLite, so a row is only
+-- correctly ordered if every stamp in the column has the same fixed width. Both
+-- writers normalise through isoStamp, so a harness answering session_info_update
+-- with "Feb 1 2026" cannot park a live task at the top of the sidebar forever. A
+-- stamp written before that normalisation existed is still possible, which is what
+-- normaliseStamps repairs at boot rather than leaving a session ordered wrongly
+-- for the life of the file.
+--
+-- No backticks in this block. The whole schema is one template literal, so a
+-- backtick in a SQL comment closes the string early and the file stops parsing.
 --
 -- store_id is the only tiebreak, and deliberately not the record count. Two tasks
 -- written in the same millisecond are not ordered by anything we know; breaking
