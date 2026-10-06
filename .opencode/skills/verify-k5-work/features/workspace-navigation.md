@@ -17,7 +17,7 @@ Before any agent runs, the user chooses which folder the work happens in and get
 - Load the web app. Projects appear in the sidebar under the `Projects` heading.
 - Click a project row to select it.
 - Click the `+` beside the `Projects` heading, or `Open another folder…` in the composer's project menu, to type a path.
-- Click the sidebar's `K5` logo or press `Ctrl+B` to collapse and expand.
+- Click `Collapse sidebar` (the `<` glyph) or press `Ctrl+B` to collapse, and `Expand sidebar` or `Ctrl+B` again to bring it back. The `K5` logo only expands: its handler is `if (!open) onToggle()`, so clicking it on an open sidebar does nothing. The flow drives the shortcut and waits for those two buttons.
 - Type in the `Search tasks` box above the project list.
 
 ## Driving it with ui-verify
