@@ -1,14 +1,43 @@
 name: CI
 
 on:
-  push:
   pull_request:
+  push:
+    branches:
+      - main
+
+# A push to a PR branch fires both `push` and `pull_request`, so without this
+# one commit ran the whole pipeline twice. PR runs cancel their predecessor;
+# main never cancels, so a merge to main always gets a full run.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
 
 jobs:
-  verify:
+  # Build and typecheck are platform-independent, so they share one job instead
+  # of repeating in each lane below. `typecheck` resolves @k5-work/shared from
+  # dist, so the build has to come first or it checks a stale contract.
+  static:
+    name: Build and typecheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Build
+        run: npm run build
+      - name: Typecheck
+        run: npm run typecheck
+
+  test:
+    name: Tests
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
@@ -19,26 +48,50 @@ jobs:
         with:
           node-version: 22
           cache: npm
-      - name: Install LibreOffice
+
+      # Only the docx round-trip test uses LibreOffice, and it soft-skips when
+      # the binary is missing, so installing it is what makes that gate real
+      # rather than a green check over a skipped test. It runs in the background
+      # while npm ci works; the step after the install waits for it.
+      - name: Start installing LibreOffice
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libreoffice-writer
-          libreoffice --version
+          (
+            set +e
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends libreoffice-writer
+            echo "$?" > "$RUNNER_TEMP/apt-status"
+          ) > "$RUNNER_TEMP/apt.log" 2>&1 < /dev/null &
+
+      - run: npm ci
+
+      - name: Finish installing LibreOffice
+        timeout-minutes: 5
+        run: |
+          until test -s "$RUNNER_TEMP/apt-status"; do sleep 1; done
+          cat "$RUNNER_TEMP/apt.log"
+          exit "$(cat "$RUNNER_TEMP/apt-status")"
+      - run: libreoffice --version
+
+      # Each workspace test script builds its own output first, so this needs no
+      # build step of its own. The old workflow re-ran the security and office
+      # files through separate steps, but both were subsets of this run, so 11
+      # files executed twice per run.
+      - name: Unit and contract tests
+        run: npm test
+
+  smoke:
+    name: Runtime smoke tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
       - run: npm ci
       - name: Build
         run: npm run build
-      - name: Unit and contract tests
-        run: npm test
-      - name: Browser layer tests
-        # Shared must be built first: the web suite resolves @k5-work/shared
-        # from dist, and a stale contract would silently test the wrong schema.
-        run: npm run build -w shared && npm run test -w apps/web
-      - name: Adversarial security tests
-        run: npm run test:security -w server
-      - name: Office repair gate
-        run: npm run test:office -w server
-      - name: Typecheck
-        run: npm run typecheck
       - name: Dev command smoke test
         env:
           K5_SERVER_ORIGIN: http://127.0.0.1:8787
@@ -119,3 +172,20 @@ jobs:
           test "$code" -eq 1
           # Exit code alone could come from any unrelated failure.
           grep -q "remote HOST requires ALLOW_REMOTE=true" /tmp/k5-work-remote-bind.log
+
+  # One required check, so adding or renaming a job never needs a branch
+  # protection edit. `always()` keeps it reporting when a job below failed or
+  # was cancelled instead of vanishing, which would block forever.
+  check:
+    name: Check
+    if: ${{ always() }}
+    needs: [static, test, smoke]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every job to pass
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          echo "$RESULTS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          echo "$RESULTS" | jq -e 'all(to_entries[]; .value.result == "success")' > /dev/null
