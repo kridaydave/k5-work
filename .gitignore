@@ -20,6 +20,11 @@ npm-debug.log*
 # use-it scratch workspace
 .useit/
 
+# verification run artifacts. Screenshots, recordings and logs belong to a run,
+# not to the branch; the ui-verify skill commits its own .verify/ on purpose,
+# this one does not.
+.verify-k5/
+
 # env
 .env
 .env.local
