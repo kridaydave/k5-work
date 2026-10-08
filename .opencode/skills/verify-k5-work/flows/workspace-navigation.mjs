@@ -10,7 +10,7 @@
 // report.json; see the baseline list in SKILL.md.
 
 export default async ({ page, shot, log, assert }) => {
-  // 1. Projects are discovered from disk and offered without a click.
+  // 1. Projects come from disk, not from the network.
   //
   // Addressed through the "Projects" heading, not through an aria-label on the
   // section. The expanded sidebar labels its sections with headings and only
@@ -45,7 +45,6 @@ export default async ({ page, shot, log, assert }) => {
     await other.click();
     const renamed = page.getByRole('heading', { name: `What should we build in ${otherName}?` });
     await renamed.waitFor({ timeout: 10000 });
-    assert(true, `selecting ${otherName} renames the empty hero`);
     await shot('02-project-switched');
   } else {
     log(`only one project discovered, skipping the switch (${activeName})`);
@@ -123,9 +122,21 @@ export default async ({ page, shot, log, assert }) => {
   await shot('08-search-no-match');
 
   await search.fill('');
-  await page.waitForTimeout(200);
+  // A cleared search restores the rows that were there before it. Wait on the
+  // count coming back rather than a fixed sleep, because the list re-renders on
+  // its own schedule. The predicate mirrors taskRows below.
+  await page.waitForFunction((want) => {
+    const sec = [...document.querySelectorAll('section')].find(
+      (s) => s.querySelector('h2')?.textContent.trim() === 'Tasks',
+    );
+    if (!sec) return true;
+    const rows = [...sec.querySelectorAll('ul button')].filter(
+      (b) => /\d+ turns?$/.test(b.textContent.trim()),
+    );
+    return rows.length === want;
+  }, rowsBefore);
   const rowsAfter = await taskRows(page).count();
-  assert(rowsAfter >= rowsBefore, `clearing the search restores the list (${rowsBefore} then ${rowsAfter})`);
+  assert(rowsAfter === rowsBefore, `clearing the search restores the list (${rowsBefore} then ${rowsAfter})`);
 };
 
 /**

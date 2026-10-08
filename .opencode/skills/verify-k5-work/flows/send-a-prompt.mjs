@@ -48,10 +48,11 @@ export default async ({ page, shot, log, assert }) => {
   await page.getByText(PROMPT, { exact: false }).first().waitFor({ timeout: 30000 });
   await shot('02-prompt-sent');
 
-  // 4. The harness answer, chunked and reassembled.
+  // 4. The harness answer lands in the transcript. The presence of this text is
+  //    the pass, so this is where a missing answer surfaces. waitFor throws on
+  //    timeout; a timeout here is a missing answer, not a missing assertion.
   await page.getByText(EXPECTED_ANSWER, { exact: false }).first()
     .waitFor({ timeout: 45000 });
-  assert(true, `agent answer "${EXPECTED_ANSWER}" reached the transcript`);
 
   // 5. The tool call settled, not left spinning.
   const card = page.locator(`ul[aria-label="Tool calls in this turn"] li[aria-label="${escapeRe(EXPECTED_TOOL)}"]`);
@@ -82,19 +83,19 @@ export default async ({ page, shot, log, assert }) => {
   await page.keyboard.press('Escape');
   await shot('04-answer-landed');
 
-  // 8. The durable side. Reload and the task must still be there, which means the
-  //    store wrote it and /api/sessions read it back.
+  // 8. Reload, then look for the task row again. A row that survives a full
+  //    reload was the store that held it, not the live page.
   await page.reload();
   const row = page.getByRole('button', { name: new RegExp(escapeRe(PROMPT)) });
   await row.first().waitFor({ timeout: 20000 });
   assert(await row.count() >= 1, 'the task is listed in the sidebar after a reload');
   await shot('05-task-in-sidebar');
 
-  // 9. Reopening it puts the recorded conversation back on screen.
+  // 9. Reopening it puts the recorded conversation back on screen. The
+  //    presence of the answer is the pass, same as the streamed turn.
   await row.first().click();
   await page.getByText(EXPECTED_ANSWER, { exact: false }).first()
     .waitFor({ timeout: 30000 });
-  assert(true, 'reopening the task shows its recorded answer');
   await shot('06-task-reopened');
 
   // 10. Read-only second view of the stored state, so the proof does not rest on

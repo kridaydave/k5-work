@@ -48,10 +48,16 @@ Other fake-agent scenarios worth knowing: `echo-blocks` returns the exact ACP bl
 ## Proof and skip reporting
 
 - UI proof is a screenshot set plus `report.json`. Read the report every time. A run with zero issues prints a clean summary; anything else prints what it found.
-- Two console entries are baseline on this repo and are named in the flow that expects them: the WebSocket-close warning from `page.reload()`, and a 404 for `/favicon.ico`. Anything else is a finding. Do not extend the baseline list to make a run green.
 - A mutation proof includes a read-only second view. `send-a-prompt.mjs` finishes by reading `GET /api/sessions` from inside the page, so the stored claim does not rest on the sidebar alone.
 - Record the feature ID, the entry point, and the run id with every artifact.
 - Report an unreachable path with the attempted command and the unmet precondition. A skipped entry point is not a verified one.
+
+## Baseline counts
+
+- `flows/send-a-prompt.mjs` produces two expected baseline entries: the WebSocket warning on `page.reload()` and the `/favicon.ico` 404.
+- `flows/workspace-navigation.mjs` additionally produces the deliberate 404 from `POST /api/projects/open`.
+
+Across both flows there are exactly three expected entries. A report is clean when every entry matches one of these three and nothing else appears. Do not extend the baseline list to make a run green.
 
 ## Where artifacts land
 
