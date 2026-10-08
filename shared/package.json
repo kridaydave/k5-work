@@ -7,7 +7,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "test": "npm run build && node --test dist/access.test.js dist/contracts.test.js dist/index.test.js dist/reducer.test.js dist/sessions.test.js"
+    "test": "npm run build && node --test \"dist/**/*.test.js\""
   },
   "devDependencies": {
     "@types/node": "^22.19.17",

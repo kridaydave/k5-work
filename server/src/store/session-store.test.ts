@@ -613,6 +613,78 @@ test("a session with an unusable timestamp is refused rather than pinning a slot
   }
 });
 
+test("an unreadable row is evicted rather than pinning a slot for the life of the process", async () => {
+  // The comment at the branch says a row this build cannot read is still
+  // occupying a slot, and the loop answers that by counting it as absent, which
+  // is the opposite. At the cap, decrementing `remaining` for a row it then
+  // refuses to delete leaves `remaining` under the cap, so the loop breaks and
+  // nothing is pruned: the store is full of rows it will neither evict nor let
+  // the user delete, because list() skips them and read() refuses them.
+  await withStore(
+    async (store, root) => {
+      const keep = await newSession(store, { title: "keep" });
+      const bad = await newSession(store, { title: "bad stamp" });
+      // Sorts first in `ORDER BY updated_at ASC`, so eviction meets it before
+      // the readable row and is then told to stop.
+      poke(root, (db) => {
+        db.prepare("UPDATE sessions SET updated_at = ? WHERE store_id = ?").run(
+          "!corrupt",
+          bad.storeId,
+        );
+      });
+
+      await newSession(store, { title: "third" });
+
+      // Counted on disk, not through summary(): an unreadable row reads as
+      // absent through the store's own API whether or not it was ever deleted,
+      // so an assertion there would pass with or without the fix.
+      poke(root, (db) => {
+        const rows = db.prepare("SELECT store_id FROM sessions").all() as {
+          store_id: string;
+        }[];
+        const ids = rows.map((row) => row.store_id);
+        assert.ok(!ids.includes(bad.storeId), "the unreadable row was pruned");
+        assert.ok(ids.includes(keep.storeId), "a readable row is kept");
+        assert.equal(ids.length, 2, "and the new session took the slot");
+      });
+      assert.equal(store.list().length, 2, "both surviving sessions list");
+    },
+    { maxSessions: 2 },
+  );
+});
+
+test("an unreadable row under the cap costs the user nothing", async () => {
+  // The other side of that decision. Evicting every unreadable row on sight
+  // would delete a user's transcript to tidy a store that had room, so the row
+  // is only reclaimed when the cap is the reason a create failed.
+  await withStore(
+    async (store, root) => {
+      const bad = await newSession(store, { title: "bad stamp" });
+      poke(root, (db) => {
+        db.prepare("UPDATE sessions SET updated_at = ? WHERE store_id = ?").run(
+          "!corrupt",
+          bad.storeId,
+        );
+      });
+
+      await newSession(store, { title: "room to spare" });
+
+      poke(root, (db) => {
+        const rows = db.prepare("SELECT store_id FROM sessions").all() as {
+          store_id: string;
+        }[];
+        assert.ok(
+          rows.some((row) => row.store_id === bad.storeId),
+          "the unreadable row stays while the store has room",
+        );
+        assert.equal(rows.length, 2, "and the new session was added beside it");
+      });
+      assert.equal(store.list().length, 1, "the readable one still lists");
+    },
+    { maxSessions: 4 },
+  );
+});
+
 test("a numeric column refuses a value of the wrong type, and a wrong-shaped value is refused on read", async () => {
   // Two layers, and both are load-bearing. STRICT tables refuse the write at all,
   // so the bad value cannot exist. A future migration, or a database written by

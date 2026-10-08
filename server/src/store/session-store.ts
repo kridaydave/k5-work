@@ -872,15 +872,21 @@ export class SessionStore {
       const storeId = asText(row, "store_id");
       if (storeId === null) continue;
       const meta = this.meta(storeId);
-      if (meta === null) {
-        // A row this build cannot read is still occupying a slot. Counting it as
-        // absent here would let the cap be exceeded by exactly the rows nobody
-        // can list.
-        remaining -= 1;
-        continue;
-      }
-      const idle = nowMs - Date.parse(meta.updatedAt);
+      // A row this build cannot read is still occupying a slot, so it is never
+      // counted as absent. It is also the only row nothing else can reclaim:
+      // list() skips it, read() refuses it, and append() drops every event for
+      // it, so no user path deletes it either.
+      //
+      // Decrementing `remaining` and skipping it was the opposite of what it
+      // claimed. The loop believed it had made room, stopped, and pruned
+      // nothing, so the store sat at its cap refusing every create for the rest
+      // of the process with a full row no user action could free.
+      const unreadable = meta === null;
+      const idle = unreadable ? Number.POSITIVE_INFINITY : nowMs - Date.parse(meta.updatedAt);
       const needRoom = remaining >= this.maxSessions;
+      // Under the cap it is kept, so an unreadable row never costs the user a
+      // readable session. At the cap it is the first thing that goes.
+      if (unreadable && !needRoom) continue;
       if (!needRoom && idle <= this.idleEvictMs) break;
       // A live seat is never evicted out from under itself: the appends it is
       // still making would land in a session that no longer exists.
