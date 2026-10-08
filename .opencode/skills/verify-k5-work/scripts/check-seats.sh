@@ -23,12 +23,10 @@ if [ ! -d "/proc/$server_pid" ]; then
   exit 0
 fi
 
-# shellcheck source=/dev/null
 source "$RUN_DIR/env.sh"
 
-# The child pids come from the server's own registry via its audit log, not from
-# a process scan. A scan would match this agent, the operator's dev server, and
-# every other node process on the box.
+# Direct children of our server pid only. This cannot match the operator's dev
+# server or this agent, because pgrep -P filters on the parent, not a name.
 children="$(pgrep -P "$server_pid" 2>/dev/null | tr '\n' ' ')"
 count="$(echo "$children" | wc -w | tr -d ' ')"
 

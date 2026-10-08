@@ -88,13 +88,13 @@ ui/workspace-navigation/  the same, for the navigation flow
 
 `report.json` is the gate, not the screenshots. It lists every console error, page exception, failed request, 4xx and 5xx the run produced. Read it every time, once per flow directory.
 
-Three entries are baseline on this repo and are named in the flows that expect them:
+Three entries are baseline across the two flows, and each flow names the ones it produces:
 
 - The WebSocket-close warning fires on `page.reload()`, when the browser tears the old socket down mid-handshake.
 - `GET /favicon.ico` is 404. There is no favicon.
 - `POST /api/projects/open` returns 404 in the folder-refusal assertion. That is the assertion.
 
-Anything else is a finding. Do not extend the baseline list to make a run green.
+The turn flow produces the first two. The navigation flow produces all three. Anything else is a finding. Do not extend the baseline list to make a run green.
 
 Proof standards:
 
@@ -128,7 +128,7 @@ When a flow fails, decide which of three things broke before editing anything.
 
 The app broke. Leave the flow alone. It caught something.
 
-The flow is wrong. Fix the locator or the expectation, and say why in a comment. The two bugs already found this way are recorded in `features/README.md` under driving conventions.
+The flow is wrong. Fix the locator or the expectation. Three bugs have been found and fixed this way so far, and the first two are written up in `features/README.md` under driving conventions with the lesson that caused them.
 
 The baseline moved. Only then does the baseline list in this file change, with the flow headers and `features/README.md` mirroring it, and the reason goes in the comment above it.
 

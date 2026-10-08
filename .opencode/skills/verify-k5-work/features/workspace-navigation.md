@@ -38,8 +38,9 @@ K5_VERIFY_REPO_ROOT="$PWD" ~/fleet/dev-workflow/ui-verify/scripts/ui-verify shoo
 - **Switch** clicks a different project row and asserts the hero heading renames. Skipped with a log line when only one project was discovered.
 - **Open path** fills `/definitely/not/a/real/folder/xyz` and asserts `#path-dialog-error` reads "Folder not found or is not a directory". The server answers 404 here by design, so a `[httperror] 404 /api/projects/open` in the report is this assertion, not a defect.
 - **Accepted path** fills `K5_VERIFY_REPO_ROOT` and asserts the dialog closes with a project selected. The repo root is always a valid project, so this needs no seeding.
-- **Collapse** presses `Ctrl+B` twice and asserts the `aside` width drops from about 276px to 68px and comes back. Both ends of the door in one run.
-- **Search** fills the box with a string no task contains and asserts the empty state matches the row count it started from: "No tasks yet." at zero rows, "No matching tasks." otherwise. It then clears the box and asserts the row count did not shrink.
+- **Collapse** presses `Ctrl+B` twice and asserts the `aside` width shrinks from its expanded reading to the icon rail, then grows back. Both ends of the door in one run.
+- **Search** fills the box with a string no task contains and asserts the empty state matches the row count it started from: "No tasks yet." at zero rows, "No matching tasks." otherwise. It then clears the box and asserts the row count returns to what it was.
+- **No-match row count** asserts the no-match search left zero task rows visible.
 
 ## Gotchas
 

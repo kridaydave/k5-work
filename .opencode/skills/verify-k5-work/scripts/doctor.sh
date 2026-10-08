@@ -21,7 +21,6 @@ if [ ! -f "$RUN_DIR/server.pid" ] || [ ! -f "$RUN_DIR/web.pid" ]; then
   exit 1
 fi
 
-# shellcheck source=/dev/null
 source "$RUN_DIR/env.sh"
 PORT="${K5_VERIFY_SERVER_URL##*:}"
 WEB_PORT="${K5_VERIFY_WEB_URL##*:}"
