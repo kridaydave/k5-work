@@ -82,3 +82,6 @@ Keep implementation details out of the map. Name user paths, stable handles, req
 
 - [Send a prompt and get a turn](./send-a-prompt.md) covers the empty hero, the lazy seat, streamed answer, tool card, harness-advertised models, and the store round trip.
 - [Workspace navigation](./workspace-navigation.md) covers project discovery and switching, opening a folder by path including the refusal, sidebar collapse, and task search.
+- [Composer controls](./composer-controls.md) covers the mode and permission pills, the resolved-posture disclosure, attachments by picker and drop including a refusal, and removing a stored task.
+
+The office generator is deliberately absent. `server/src/ooxml-core` is complete and tested, but nothing in the app reaches it: no route in `server/src/app.ts` and no call from `apps/web`. A feature file for it would describe a screen that no user can reach, so it waits for the route that exposes it.

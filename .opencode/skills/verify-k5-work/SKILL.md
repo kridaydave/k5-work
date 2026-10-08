@@ -130,6 +130,6 @@ The app broke. Leave the flow alone. It caught something.
 
 The flow is wrong. Fix the locator or the expectation, and say why in a comment. The two bugs already found this way are recorded in `features/README.md` under driving conventions.
 
-The baseline moved. Only then does `knownBaselineIssues` in the flow change, and the reason goes in the comment above it.
+The baseline moved. Only then does the baseline list in this file change, with the flow headers and `features/README.md` mirroring it, and the reason goes in the comment above it.
 
 Keep `features/README.md` and its feature files honest as the app changes. `/maintain-verification-skill` runs that pass.

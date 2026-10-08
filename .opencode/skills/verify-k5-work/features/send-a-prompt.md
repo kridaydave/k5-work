@@ -47,10 +47,10 @@ After the run, `$SKILL/scripts/check-seats.sh <run-id>` must report at most one 
 
 ## Gotchas
 
-- The prompt string doubles as the stored task title, because k5 derives the title from the first prompt. A fixed string means a duplicate row and a confusing search result. The flow generates a timestamped one.
+- The prompt string doubles as the stored task title, because k5 derives the title from the first prompt. A fixed string means a duplicate row and a confusing search result. The flow generates a timestamped one. A prompt longer than 120 graphemes is truncated with an ellipsis by `sanitizeTitle` (`session-store.ts:348`), so the flow's exact title match only holds for a short prompt.
 - The trigger label says `Model. Current: not discovered yet` against the fake agent. That is correct: the harness advertised options with no `currentValue`, and the app refuses to name one rather than guessing the first entry. Asserting on that label asserts a lie.
 - Menu items are `menuitemradio`, not `menuitem`. A select is a radio group.
 - Reloading with the page mid-turn loses the live socket but not the store. Assert the store round trip after the turn has ended, or the row will exist with `turnCount` still unsettled.
 - The fake agent returns its three text chunks instantly, so the streaming UI states (working dots, thought tail) can pass through between two polls. Drive those against the `slow` scenario, not this one.
 - `XDG_DATA_HOME` controls where the store lands. Forgetting it points a verification run at the operator's real history in `~/.local/share/k5-work`.
-- A drive interrupted mid-turn leaves the seat holding its session. The next browser on that instance is refused with `seat-busy` and its prompt never runs, so this flow times out on the answer. `$SKILL/scripts/doctor.sh` fails the instance for this; relaunch with a fresh run id.
+- A drive interrupted mid-turn used to leave the seat holding its session, and the next browser on that instance was refused with `seat-busy` so its prompt never ran. That no longer happens: `session-service.ts:353` releases the seat when the socket closes and terminates the stored turn with `stopReason: "k5-cancelled"`, so a reload sees a finished turn rather than a spinning card. The one `seat-busy` that survives is per-connection (`session-service.ts:1037`, "this connection already holds a session"), which a reload cannot trigger. Keep reusing a run id only after `$SKILL/scripts/check-seats.sh` passes.
