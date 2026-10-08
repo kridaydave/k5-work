@@ -103,10 +103,51 @@ export const SessionSummarySchema = z
 export type SessionSummary = z.infer<typeof SessionSummarySchema>;
 
 export const MAX_LISTED_SESSIONS = 500;
-export const SessionListResponseSchema = z
-  .object({ sessions: z.array(SessionSummarySchema).max(MAX_LISTED_SESSIONS) })
+
+/** The longest a snippet runs before it is cut with an ellipsis at either end. */
+export const SNIPPET_CHARS = 200;
+
+/** Snippets per matching session. Enough to tell two threads apart, no more. */
+export const MAX_SNIPPETS_PER_SESSION = 3;
+
+/**
+ * One matched line out of a stored transcript.
+ *
+ * Carries the record's sequence and timestamp so a client can name the turn the
+ * hit came from, and the trimmed text itself. `role` is which side of the
+ * conversation it came from, which is what tells two threads that share a phrase
+ * apart: one asked for it, the other said it.
+ *
+ * Messages only. Tool calls are not searched, because "which task read this
+ * file" is a different question from "which task was about this", and the second
+ * is the one a transcript search is for.
+ */
+export const SessionSnippetSchema = z
+  .object({
+    seq: z.number().int().positive(),
+    ts: IsoTimestampSchema,
+    role: z.enum(["prompt", "reply"]),
+    text: z.string().min(1).max(SNIPPET_CHARS),
+  })
   .strict();
-export type SessionListResponse = z.infer<typeof SessionListResponseSchema>;
+export type SessionSnippet = z.infer<typeof SessionSnippetSchema>;
+
+/**
+ * The list response, whatever produced it.
+ *
+ * Rows are `SessionSearchRow`, not `SessionSummary`, because a search and a
+ * list share this shape and the search is the one that fills `snippets`. A row
+ * from a plain list simply omits it, which reads as "not searched" rather than
+ * as "searched and found nothing".
+ */
+export const SessionSearchRowSchema = SessionSummarySchema.extend({
+  snippets: z.array(SessionSnippetSchema).max(MAX_SNIPPETS_PER_SESSION).optional(),
+});
+export type SessionSearchRow = z.infer<typeof SessionSearchRowSchema>;
+
+export const SessionListResponseSchema = z
+  .object({ sessions: z.array(SessionSearchRowSchema).max(MAX_LISTED_SESSIONS) })
+  .strict();
 
 /**
  * Four states, because "no new events" and "your cursor cannot be honoured" are

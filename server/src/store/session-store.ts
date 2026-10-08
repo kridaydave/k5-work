@@ -13,13 +13,19 @@ import {
   isPersistedEventType,
   MAX_EVENTS_PER_PAGE,
   MAX_LISTED_SESSIONS,
+  MAX_SNIPPETS_PER_SESSION,
+  SNIPPET_CHARS,
+  SessionSnippetSchema,
   type AttachmentKind,
   type AttachmentManifestEntry,
   type IsoTimestamp,
   type ReplayStatus,
   type ServerEvent,
   type SessionEventsResponse,
+  type SessionSearchRow,
+  type SessionSnippet,
   type SessionSummary,
+  type StoredEventRecord,
 } from "@k5-work/shared";
 import { SessionStoreError, type SessionStoreErrorCode } from "./errors.js";
 import { unsafeNameReason } from "./safe-name.js";
@@ -396,6 +402,43 @@ function classifyAttachment(bytes: Buffer, mimeType: string): AttachmentKind {
 function asText(row: MetaRow, column: string): string | null {
   const value = row[column];
   return typeof value === "string" ? value : null;
+}
+
+/**
+ * Escapes `%` and `_` so a `LIKE` pattern matches them literally.
+ *
+ * Without this, a query containing either character is a pattern rather than a
+ * search, and "50%" matches every row in the store.
+ */
+function escapeLike(needle: string): string {
+  return needle.replace(/[\\%_]/g, (char) => `\\${char}`);
+}
+
+/**
+ * Cuts a matched line to at most `max` characters, centred on the match.
+ *
+ * An ellipsis at either cut, so a snippet never looks like the whole message.
+ * A line short enough that the match is already inside the window is returned
+ * unchanged, including when it is shorter than `max`.
+ */
+function trimAround(text: string, wanted: string, max: number): string {
+  const at = text.toLowerCase().indexOf(wanted);
+  if (at < 0) return text.slice(0, max);
+  if (text.length <= max) return text;
+  const half = Math.floor((max - 3) / 2);
+  let start = at - half;
+  let end = at + wanted.length + half;
+  if (start <= 0) {
+    start = 0;
+    end = max - 3;
+  }
+  if (end >= text.length) {
+    end = text.length;
+    start = Math.max(0, end - max + 3);
+  }
+  const head = start > 0 ? "..." : "";
+  const tail = end < text.length ? "..." : "";
+  return `${head}${text.slice(start, end)}${tail}`;
 }
 
 function asInt(row: MetaRow, column: string): number {
@@ -1304,13 +1347,13 @@ export class SessionStore {
     }
   }
 
-  list(): SessionSummary[] {
+  list(): SessionSearchRow[] {
     const rows = this.handle()
       .prepare(
         `SELECT ${SESSION_COLUMNS} FROM sessions ORDER BY updated_at DESC, store_id DESC`,
       )
       .all() as MetaRow[];
-    const summaries: SessionSummary[] = [];
+    const summaries: SessionSearchRow[] = [];
     for (const row of rows) {
       const meta = rowToMeta(row);
       if (meta === null) {
@@ -1324,6 +1367,108 @@ export class SessionStore {
       if (summaries.length >= MAX_LISTED_SESSIONS) break;
     }
     return summaries;
+  }
+
+  /**
+   * Sessions whose title or transcript mentions the query, newest first.
+   *
+   * Two steps, because projecting every transcript in the store to answer one
+   * query is work no one asked for. A `LIKE` over `events.payload` narrows the
+   * candidates, then only those sessions are projected, and the projection is
+   * what decides which line matched and what the snippet says.
+   *
+   * `%` and `_` in the query are escaped, so a search for "50%" is a search for
+   * the literal three characters rather than a pattern that matches everything.
+   * An empty result is a normal answer, not an error, and it is what a query
+   * nothing matches gets.
+   */
+  search(query: string): SessionSearchRow[] {
+    const needle = query.trim();
+    if (needle.length === 0) return [];
+    const like = `%${escapeLike(needle)}%`;
+    const rows = this.handle()
+      .prepare(
+        `SELECT ${SESSION_COLUMNS} FROM sessions
+         WHERE title LIKE ? ESCAPE '\\'
+            OR store_id IN (SELECT store_id FROM events WHERE payload LIKE ? ESCAPE '\\')
+         ORDER BY updated_at DESC, store_id DESC`,
+      )
+      .all(like, like) as MetaRow[];
+
+    const summaries: SessionSummary[] = [];
+    for (const row of rows) {
+      if (summaries.length >= MAX_LISTED_SESSIONS) break;
+      const meta = rowToMeta(row);
+      if (meta === null) {
+        this.report(
+          "E_STORE_META_CORRUPT",
+          `unusable stored session ${asText(row, "store_id") ?? "unknown"}`,
+        );
+        continue;
+      }
+      summaries.push(this.toSummary(meta, this.snippetsFor(meta.storeId, needle)));
+    }
+    return summaries;
+  }
+
+  /**
+   * Up to `MAX_SNIPPETS_PER_SESSION` matched lines from one session's messages.
+   *
+   * Matched per record, not per projected turn, because a snippet names the
+   * record it came from and a turn is assembled from several. `turn.started`
+   * carries the prompt and each `turn.delta` on the text stream carries a piece
+   * of the reply, so those two are what a snippet is cut from.
+   *
+   * Driven by `SessionSnippetSchema.parse`, so a record whose payload no longer
+   * matches the contract cannot put an over-long or malformed snippet on the
+   * wire.
+   */
+  private snippetsFor(storeId: string, needle: string): SessionSnippet[] {
+    const wanted = needle.toLowerCase();
+    const found: SessionSnippet[] = [];
+    for (const record of this.allRecords(storeId)) {
+      const candidates: { text: string; role: "prompt" | "reply" }[] = [];
+      if (record.event.type === "turn.started") {
+        candidates.push({ text: record.event.userText, role: "prompt" });
+      } else if (record.event.type === "turn.delta" && record.event.stream === "text") {
+        candidates.push({ text: record.event.text, role: "reply" });
+      }
+      for (const { text, role } of candidates) {
+        if (!text.toLowerCase().includes(wanted)) continue;
+        const snippet = SessionSnippetSchema.safeParse({
+          seq: record.seq,
+          ts: record.ts,
+          role,
+          text: trimAround(text, wanted, SNIPPET_CHARS),
+        });
+        if (!snippet.success) continue;
+        found.push(snippet.data);
+        if (found.length >= MAX_SNIPPETS_PER_SESSION) return found;
+      }
+    }
+    return found;
+  }
+
+  /** Every record the store still holds for a session, oldest first. */
+  private allRecords(storeId: string): StoredEventRecord[] {
+    const meta = this.meta(storeId);
+    if (meta === null || meta.lastSeq === 0) return [];
+    const rows = this.handle()
+      .prepare("SELECT seq, ts, payload FROM events WHERE store_id = ? ORDER BY seq ASC")
+      .all(storeId) as MetaRow[];
+    const records: StoredEventRecord[] = [];
+    for (const row of rows) {
+      const payload = asText(row, "payload");
+      if (payload === null) continue;
+      const parsed = StoredEventRecordSchema.safeParse({
+        v: RECORD_VERSION,
+        seq: asInt(row, "seq"),
+        ts: asText(row, "ts") ?? "",
+        event: JSON.parse(payload) as unknown,
+      });
+      if (parsed.success) records.push(parsed.data);
+    }
+    return records;
   }
 
   summary(storeId: string): SessionSummary | null {
@@ -1361,8 +1506,11 @@ export class SessionStore {
     };
   }
 
-  private toSummary(meta: MetaFile): SessionSummary {
-    return SessionSummarySchema.parse({
+  private toSummary(
+    meta: MetaFile,
+    snippets?: readonly SessionSnippet[],
+  ): SessionSearchRow {
+    const parsed = SessionSummarySchema.safeParse({
       storeId: meta.storeId,
       title: meta.title,
       projectId: meta.projectId,
@@ -1377,6 +1525,12 @@ export class SessionStore {
       truncated: meta.truncated,
       droppedRecords: meta.droppedRecords,
     });
+    if (!parsed.success) {
+      throw new SessionStoreError("E_STORE_META_CORRUPT", `unusable stored session ${meta.storeId}`);
+    }
+    // Absent rather than empty on a plain list read: an empty array would read
+    // as "searched and found nothing", which is not what happened.
+    return { ...parsed.data, snippets: snippets === undefined ? undefined : [...snippets] };
   }
 
   /**

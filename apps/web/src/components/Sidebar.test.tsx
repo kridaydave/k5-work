@@ -82,3 +82,61 @@ describe("Sidebar task list", () => {
     expect(seen.map((s) => s.id)).toEqual(["s-1"]);
   });
 });
+
+describe("Sidebar search results", () => {
+  const twoThreads: Session[] = [
+    {
+      id: "s-1",
+      title: "write the docking plan",
+      meta: "2 turns",
+      group: "Work",
+      snippets: [
+        { role: "prompt", text: "find the zeppelin manifest" },
+        { role: "reply", text: "the zeppelin docks at pier four" },
+      ],
+    },
+    {
+      id: "s-2",
+      title: "fuel consumption",
+      meta: "1 turn",
+      group: "Work",
+      snippets: [{ role: "reply", text: "a zeppelin burns very little" }],
+    },
+  ];
+
+  it("shows the matched lines, and says which side said them", () => {
+    // Two threads share a phrase. The snippet is what tells them apart, and
+    // naming the side is what makes the line readable without opening either.
+    renderSidebar({ sessions: twoThreads, searchActive: true });
+    const section = tasks();
+    expect(within(section).getByText(/you: find the zeppelin manifest/)).toBeTruthy();
+    expect(within(section).getByText(/agent: the zeppelin docks at pier four/)).toBeTruthy();
+    expect(within(section).getByText(/agent: a zeppelin burns very little/)).toBeTruthy();
+  });
+
+  it("keeps a plain list read free of snippet lines", () => {
+    // The same rows without snippets are what a list read looks like, and an
+    // empty array read as "searched and found nothing" would be a lie about a
+    // read that never searched.
+    renderSidebar({ sessions: twoThreads.map(({ snippets: _drop, ...rest }) => rest) });
+    expect(within(tasks()).queryByText(/you: /)).toBeNull();
+    expect(within(tasks()).queryByText(/agent: /)).toBeNull();
+  });
+
+  it("reports a search that missed as a search, not an empty workspace", () => {
+    // The box leads the server's answer while a query is in flight, so the
+    // empty state follows what the store said rather than what was typed.
+    renderSidebar({ sessions: [], searchActive: true });
+    expect(within(tasks()).getByText("No matching tasks.")).toBeTruthy();
+    expect(within(tasks()).queryByText("No tasks yet.")).toBeNull();
+  });
+
+  it("hands the typed query to the caller, which is what searches the store", () => {
+    const seen: string[] = [];
+    renderSidebar({ sessions: twoThreads, onSearchChange: (value) => seen.push(value) });
+    fireEvent.change(screen.getByPlaceholderText("Search tasks"), {
+      target: { value: "zeppelin" },
+    });
+    expect(seen).toEqual(["zeppelin"]);
+  });
+});

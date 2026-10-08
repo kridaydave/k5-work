@@ -6,7 +6,7 @@ import {
   projectTranscript,
   type ProjectedTranscript,
   type SessionEventsResponse,
-  type SessionSummary,
+  type SessionSearchRow,
   type StoredEventSchema,
 } from "@k5-work/shared";
 import type { z } from "zod";
@@ -28,9 +28,11 @@ export interface StoredTranscript {
 }
 
 export interface StoredSessionState {
-  sessions: SessionSummary[];
+  sessions: SessionSearchRow[];
   loading: boolean;
   error: string | null;
+  /** True when the rows currently held came from a search rather than a list. */
+  searching: boolean;
   /**
    * Re-reads the list. Needed because the list is a snapshot of what was recorded
    * when this tab mounted, and a task recorded here changes while the tab is open:
@@ -41,23 +43,28 @@ export interface StoredSessionState {
   remove: (storeId: string) => Promise<boolean>;
 }
 
-export function useStoredSessions(): StoredSessionState {
-  const [sessions, setSessions] = useState<SessionSummary[]>([]);
+export function useStoredSessions(query: string = ""): StoredSessionState {
+  const [sessions, setSessions] = useState<SessionSearchRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [nonce, setNonce] = useState(0);
   // Guards against a slow response overwriting a newer one.
   const latest = useRef(0);
 
-  // Re-read on mount, and again whenever the caller says the list moved. Not
-  // polled: nothing here changes without the tab doing something, so a timer
-  // would be a request nobody asked for.
+  // Re-read on mount, and again whenever the caller says the list moved or the
+  // query changed. Not polled: nothing here changes without the tab doing
+  // something, so a timer would be a request nobody asked for.
   useEffect(() => {
     const request = ++latest.current;
+    const trimmed = query.trim();
+    const url =
+      trimmed.length === 0
+        ? "/api/sessions"
+        : `/api/sessions?q=${encodeURIComponent(trimmed)}`;
     setLoading(true);
     void (async () => {
       try {
-        const response = await fetch("/api/sessions", { headers: { Accept: "application/json" } });
+        const response = await fetch(url, { headers: { Accept: "application/json" } });
         if (!response.ok) throw new Error(`the server answered ${String(response.status)}`);
         const parsed = SessionListResponseSchema.parse(await response.json());
         if (request !== latest.current) return;
@@ -78,7 +85,7 @@ export function useStoredSessions(): StoredSessionState {
       // render cannot leave a late answer applying to new state.
       latest.current += 1;
     };
-  }, [nonce]);
+  }, [nonce, query]);
 
   const remove = useCallback(async (storeId: string): Promise<boolean> => {
     const response = await fetch(`/api/sessions/${encodeURIComponent(storeId)}`, {
@@ -95,6 +102,7 @@ export function useStoredSessions(): StoredSessionState {
     sessions,
     loading,
     error,
+    searching: query.trim().length > 0,
     refresh: useCallback(() => setNonce((value) => value + 1), []),
     remove,
   };

@@ -270,6 +270,60 @@ test("the session list is served with no harness process", async () => {
   }
 });
 
+test("a search is served on the same route as the list, with its snippets", async () => {
+  // Same route, same response shape, and the only difference is that a search
+  // row carries the matched line. A second route or a second shape would give a
+  // client two things to keep in step for no behaviour either one cannot have.
+  const harness = await startHarness();
+  try {
+    const created = await harness.store.create({
+      harness: "opencode",
+      harnessSessionId: "ses_1",
+      projectId: "proj-1",
+      projectName: "k5-work",
+      cwd: "/home/k5/code/k5-work",
+      title: "First task",
+    });
+    harness.store.append(created.storeId, {
+      type: "turn.started",
+      sessionId: "ses_live",
+      turnId: "t-1",
+      userText: "the zeppelin needs fuel",
+      attachments: [],
+    });
+    harness.store.append(created.storeId, {
+      type: "turn.delta",
+      sessionId: "ses_live",
+      turnId: "t-1",
+      stream: "text",
+      text: "the zeppelin burns very little",
+    });
+    await harness.store.flushMeta(created.storeId);
+
+    const listed = await get(harness, "/api/sessions");
+    const listBody = listed.body as { sessions: { snippets?: unknown }[] };
+    assert.equal(listBody.sessions[0]?.snippets, undefined, "a list row has no snippets");
+
+    const hit = await get(harness, "/api/sessions?q=zeppelin");
+    assert.equal(hit.status, 200);
+    const searchBody = hit.body as {
+      sessions: { storeId: string; snippets: { role: string; text: string; seq: number }[] }[];
+    };
+    assert.equal(searchBody.sessions.length, 1, "one session matched");
+    assert.equal(searchBody.sessions[0]?.storeId, created.storeId);
+    assert.equal(searchBody.sessions[0]?.snippets.length, 2, "prompt and reply");
+    assert.equal(searchBody.sessions[0]?.snippets[0]?.role, "prompt");
+    assert.equal(searchBody.sessions[0]?.snippets[1]?.role, "reply");
+    assert.ok(searchBody.sessions[0]?.snippets[0]?.text.includes("the zeppelin needs fuel"));
+
+    const miss = await get(harness, "/api/sessions?q=submarine");
+    const missBody = miss.body as { sessions: unknown[] };
+    assert.deepEqual(missBody.sessions, [], "a miss is empty, not the whole list");
+  } finally {
+    await harness.close();
+  }
+});
+
 test("events are paged by cursor and the four states are distinguishable", async () => {
   const harness = await startHarness();
   try {
