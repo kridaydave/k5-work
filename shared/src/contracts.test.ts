@@ -32,7 +32,6 @@ describe("browser command contract", () => {
       { ...base, type: "session.prompt", sessionId: "s-1", turnId: "t-1", text: "hi" },
       { ...base, type: "session.cancel", sessionId: "s-1" },
       { ...base, type: "session.close", sessionId: "s-1" },
-      { ...base, type: "session.list", projectId: "p-1" },
       {
         ...base,
         type: "session.load",

@@ -375,11 +375,11 @@ describe("a refusal and a straggler cannot take down a live view", () => {
   });
 });
 
-it("a failed discovery or continuation is not a turn failure", () => {
+it("a failed continuation or configuration is not a turn failure", () => {
   // A sidebar refresh that fails while the model is working used to kill the turn:
   // the dots stopped and every later delta was dropped, so a finished answer stayed
   // truncated with an error badge on it.
-  for (const scope of ["session.list", "session.load", "session.configure"] as const) {
+  for (const scope of ["session.load", "session.configure"] as const) {
     let state: K5ViewState = beginTurn(INITIAL_VIEW_STATE, "t-1", "do the thing");
     state = applyServerEvent(state, {
       type: "turn.started",

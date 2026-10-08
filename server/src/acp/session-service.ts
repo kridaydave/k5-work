@@ -320,9 +320,6 @@ export function createSessionHandlers(
         case "session.configure":
           void applyConfig(command);
           return;
-        case "session.list":
-          void listSessions(command);
-          return;
         case "session.load":
           void loadSession(command);
           return;
@@ -906,15 +903,6 @@ export function createSessionHandlers(
   }
 
   /**
-   * Asks the harness what sessions it knows about for a project.
-   *
-   * A short-lived headless seat, reaped as soon as the read is done: the whole
-   * point of the workspace's lazy spawn is that a list costs no lasting harness
-   * process. A harness that does not advertise `session/list` is reported as
-   * unsupported rather than as an empty list, because only one of those is a real
-   * answer.
-   */
-  /**
    * Tracks an outstanding read so waitForIdle can see it.
    *
    * A shutdown that lands mid-list must wait for the read, or it exits with a
@@ -938,76 +926,6 @@ export function createSessionHandlers(
     if (headlessInFlight === 0 && headlessResolve !== null) {
       headlessResolve();
       headlessResolve = null;
-    }
-  }
-
-  async function listSessions(command: Extract<BrowserCommand, { type: "session.list" }>) {
-    const projectPath = options.projects.resolve(command.projectId);
-    if (projectPath === null) {
-      emit({
-        type: "command.result",
-        commandId: command.commandId,
-        ok: false,
-        reason: "not-found",
-        message: `unknown project ${command.projectId}`,
-      });
-      return;
-    }
-    let headless: { child: AcpChild; acp: AcpSeat; release: () => void } | null = null;
-    let headlessRunning = false;
-    try {
-      headless = await options.runner.openHeadless({
-        projectId: command.projectId,
-        projectPath,
-        readOnly: true,
-      });
-      // Tracked before the read is awaited: a shutdown that lands while the read
-      // is still outstanding must still know there is a process to reap.
-      options.trackSeat?.(headless.child);
-      options.onChild?.(headless.child);
-      headlessRunning = true;
-      headlessStarted();
-      const sessions = await headless.acp.listSessions();
-      emit({ type: "command.result", commandId: command.commandId, ok: true, reason: "ok" });
-      emit({
-        type: "session.listed",
-        commandId: command.commandId,
-        projectId: command.projectId,
-        sessions,
-        unsupported: false,
-      });
-    } catch (err) {
-      if (err instanceof AcpCapabilityError) {
-        // Not a failure: the harness simply does not offer it.
-        emit({ type: "command.result", commandId: command.commandId, ok: true, reason: "ok" });
-        emit({
-          type: "session.listed",
-          commandId: command.commandId,
-          projectId: command.projectId,
-          sessions: [],
-          unsupported: true,
-        });
-        return;
-      }
-      const reason = err instanceof SeatOpenError ? err.reason : "internal";
-      emit({
-        type: "command.result",
-        commandId: command.commandId,
-        ok: false,
-        reason,
-        message: (err as Error).message.slice(0, 500),
-      });
-    } finally {
-      if (headlessRunning) headlessFinished();
-      // Reaped whatever happened, so a list never leaves a harness behind. The
-      // slot is released after the child is gone, because the child is what the
-      // cap bounds.
-      if (headless !== null) {
-        await headless.acp.close().catch(() => {});
-        await headless.child.close().catch(() => {});
-        headless.release();
-        options.untrackSeat?.(headless.child);
-      }
     }
   }
 

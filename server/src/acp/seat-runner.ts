@@ -121,7 +121,7 @@ export class SeatRunner {
    * happens before a child is spawned, and posture is verified before any
    * reservation so a failure cannot consume a cap slot.
    *
-   * Extracted because a read needs the same gate: `session/list` runs a command
+   * Extracted because a read needs the same gate: a read runs a command
    * against the harness, and a harness whose permissions cannot be verified is
    * not one to run one against.
    */
@@ -280,9 +280,9 @@ export class SeatRunner {
   /**
    * Opens a connection with no ACP session, for a read that must not create one.
    *
-   * `session/list` needs a live agent, and the workspace's promise is that an
-   * empty hero costs no lasting harness process. So a list gets a seat of its own
-   * and is reaped as soon as the read is done.
+   * A read needs a live agent, and the workspace's promise is that an empty hero
+   * costs no lasting harness process. So a read gets a seat of its own and is
+   * reaped as soon as it is done.
    *
    * It deliberately takes no keyed reservation — that is what would let a read
    * block a real session. But a keyed reservation is not the only bound, and
@@ -293,7 +293,7 @@ export class SeatRunner {
    *
    * The count covers the child's whole life rather than the open. Decrementing
    * when `openHeadless` returned measured nothing, because the caller then waits
-   * on `listSessions()` for as long as its timeout, and the cap read "two" while
+   * on `listSessions()` for as long as that call's timeout, and the cap read "two" while
    * a third, fourth and fifth child were already resident.
    */
   async openHeadless(input: {
@@ -306,9 +306,9 @@ export class SeatRunner {
      */
     readOnly?: boolean;
     /**
-     * Where a promoted seat's turn events go. A `session/list` read never runs a
-     * prompt and needs none; a continuation is about to run one, and a seat with
-     * no callback drops every delta the harness produces for it.
+     * Where a promoted seat's turn events go. A read never runs a prompt and
+     * needs none; a continuation is about to run one, and a seat with no callback
+     * drops every delta the harness produces for it.
      */
     onEvent?: (turnId: string, event: SeatStreamEvent) => void;
   }): Promise<{
@@ -345,11 +345,11 @@ export class SeatRunner {
         projectPath: input.projectPath,
         access: input.access ?? "full",
         // The posture resolver is a subprocess that measured 3.5 s on this
-        // machine, and it exists to bound what agent code may do. `session/list`
-        // runs no agent code: it spawns the harness, handshakes, and reads back
-        // metadata the harness already holds. Paying 3.5 s of that per sidebar
-        // refresh bought nothing. A continuation still pays it, because from that
-        // point the harness will run a prompt.
+        // machine, and it exists to bound what agent code may do. A read runs no
+        // agent code: it spawns the harness, handshakes, and reads back metadata
+        // the harness already holds. Paying 3.5 s of that for it bought nothing. A
+        // continuation still pays it, because from that point the harness will run
+        // a prompt.
         skipPosture: input.readOnly === true,
       });
       const child = await spawnAcpChild({ argv, cwd: input.projectPath, env });

@@ -164,7 +164,7 @@ interface Rig {
   readonly imageManifest: AttachmentManifestEntry;
   readonly textBytes: Buffer;
   readonly imageBytes: Buffer;
-  /** The id a real `session/new` created, which `session/list` then finds. */
+  /** The id a real `session/new` created, which a continuation then adopts. */
   readonly createdSessionId: string;
   readonly seat: AcpSeat;
   readonly child: AcpChild;
@@ -213,10 +213,9 @@ function buildRig(): Promise<Rig> {
     const textBytes = await store.readAttachment(k5Session.storeId, TEXT_ID);
     const imageBytes = await store.readAttachment(k5Session.storeId, IMAGE_ID);
 
-    // `session/list` has something to find only if a real session exists, so one
-    // is created with a real seat first and that seat is reaped. The list is then
-    // read from a separate short-lived headless seat, which is the shape k5 uses:
-    // a read must not leave a new session behind on every page load.
+    // The harness session id is created with a real seat first and that seat is
+    // reaped. The continuation opens its own short-lived headless seat, which is
+    // the shape k5 uses: an adopt must not leave a session behind on every load.
     const childA = await spawnAcpChild({ argv: OPENCODE_ARGV, cwd: harnessCwd });
     const seatAPid = childA.pid;
     const seatA = await AcpSeat.open(
@@ -354,7 +353,6 @@ describe("attachments and session adoption against a real opencode", () => {
     assert.equal(probed.embeddedContext, true);
     assert.equal(probed.image, true);
     assert.equal(probed.loadSession, true);
-    assert.equal(probed.list, true);
     assert.equal(probed.resume, true);
     assert.equal(probed.close, true);
     assert.deepEqual(
@@ -455,29 +453,13 @@ describe("attachments and session adoption against a real opencode", () => {
     }
   });
 
-  it("lists a real session on a headless seat and adopts it", async (t) => {
+  it("adopts the session a real session/new created", async (t) => {
     if (!requireOpencode(t)) return;
     const rig = await buildRig();
     const { seat } = rig;
 
-    // A read must not have created a session of its own.
-    assert.throws(() => seat.sessionId, /seat has no session/);
-
-    const listed = await seat.listSessions();
-    assert.ok(Array.isArray(listed), "session/list did not narrow to an array");
-
-    const found = listed.find((entry) => entry.sessionId === rig.createdSessionId);
-    assert.ok(
-      found,
-      `session/list did not return the session a real session/new created; got ${JSON.stringify(listed)}`,
-    );
-    assert.equal(found.cwd, rig.harnessCwd, "the seat's own cwd is what the agent filters on");
-    assert.ok(found.updatedAt !== null, "a real session has a real update time");
-    // Every row is usable by the stored-cwd check, which requires an absolute path.
-    for (const entry of listed) assert.ok(entry.cwd.startsWith("/"));
-
     // The adopt: session/resume of a stored session.
-    const adopted = await seat.adopt(found.sessionId);
+    const adopted = await seat.adopt(rig.createdSessionId);
     assert.equal(adopted.sessionId, rig.createdSessionId, "the response carries no id, so it is ours");
     assert.ok(
       adopted.configOptions.length > 0,

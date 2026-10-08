@@ -1,54 +1,8 @@
 import type { ActiveSession, ClientContext } from "@agentclientprotocol/sdk";
-import { MAX_LISTED_SESSIONS } from "@k5-work/shared";
-import type { SessionInfo } from "@agentclientprotocol/sdk";
 
-// The two pieces of ACP that the SDK does not hand a client, isolated here so
+// The one piece of ACP that the SDK does not hand a client, isolated here so
 // the seat has one place that reaches past the public API and one place to argue
 // about it.
-
-/** A harness-reported session, narrowed and length-bounded. */
-export interface HarnessSessionInfo {
-  readonly sessionId: string;
-  readonly cwd: string;
-  readonly title: string | null;
-  readonly updatedAt: string | null;
-}
-
-export /**
- * The wire caps this at the same number (shared/src/contracts.ts, the 100 on
- * `session.listed.sessions`). Kept as a named import rather than a literal so a
- * change to one is a compile error at the other rather than a silent truncation of
- * the list a user can see.
- */
-const MAX_LISTED_HARNESS_SESSIONS = MAX_LISTED_SESSIONS;
-const MAX_TITLE_CHARS = 200;
-
-/**
- * `SessionInfo` is harness-controlled and unbounded in the generated types, so
- * every field is checked and capped rather than trusted. A session without a
- * usable id or cwd is unusable to us, so it is dropped rather than half-kept.
- */
-export function toHarnessSessionInfo(raw: unknown): HarnessSessionInfo | null {
-  if (typeof raw !== "object" || raw === null) return null;
-  const entry = raw as Record<string, unknown>;
-  const sessionId = entry["sessionId"];
-  const cwd = entry["cwd"];
-  if (typeof sessionId !== "string" || sessionId.length === 0) return null;
-  // cwd must be absolute: ACP requires it, and a relative one would make the
-  // stored-cwd check meaningless.
-  if (typeof cwd !== "string" || !cwd.startsWith("/")) return null;
-  const title = entry["title"];
-  const updatedAt = entry["updatedAt"];
-  return {
-    sessionId: sessionId.slice(0, 256),
-    cwd: cwd.slice(0, 4096),
-    title: typeof title === "string" && title.length > 0 ? title.slice(0, MAX_TITLE_CHARS) : null,
-    updatedAt:
-      typeof updatedAt === "string" && Number.isFinite(Date.parse(updatedAt))
-        ? updatedAt.slice(0, 64)
-        : null,
-  };
-}
 
 /**
  * The shape `attachSession` is reached through.

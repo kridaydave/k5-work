@@ -43,11 +43,10 @@ for handing the model a history it has not seen; `session/resume` is for continu
 it has. Only `resume` is paired with the absence of a replay terminator, because k5
 never asks the harness to replay.
 
-`session/list` runs on a short-lived, headless seat, created on demand and torn down
-after the read. A listing is a read, so it must not take a live seat slot, must not
-create a session, and must not leave a harness process behind. Headless opens are
-capped and concurrent, because a user clicking refresh repeatedly is a normal thing to
-do and a pile of harnesses is not.
+A headless seat is short-lived, created on demand and torn down after the read. A read must
+not take a live seat slot, must not create a session, and must not leave a harness process
+behind. Headless opens are capped and concurrent, because a user clicking refresh
+repeatedly is a normal thing to do and a pile of harnesses is not.
 
 The cap counts resident harness processes, not in-progress opens. It is released when
 the child is gone, or when a continuation promotes the seat and the pool starts
@@ -106,8 +105,8 @@ instead of leaving the previous task's there.
 
 ## Command failures are scoped to what failed
 
-A failed `session.configure`, `session.list`, or `session.load` reports into the
-session message and changes nothing else. Treating any of them as a turn failure killed
+A failed `session.configure` or `session.load` reports into the
+session message and changes nothing else. Treating either as a turn failure killed
 the working dots and then dropped every remaining delta from a harness that was still
 streaming, so a finished answer stayed truncated with an error badge on it.
 

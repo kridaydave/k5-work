@@ -249,7 +249,8 @@ export function promptScript(
 }
 
 /**
- * Sessions the fake knows about, in the shape `session/list` returns.
+ * Sessions the fake knows about, and the ids `session/load` and
+ * `session/resume` accept.
  *
  * `cwd` comes from the request rather than from `process.cwd()`, because Node
  * resolves the child's own cwd to the real path: on macOS the client's temp
@@ -257,7 +258,7 @@ export function promptScript(
  * `/private/var`, so an exact-string filter dropped every fixture and the test
  * passed on an empty list it never meant to assert on.
  */
-function listSessionsFixture(requestedCwd: string | null): Json[] {
+function knownSessions(requestedCwd: string | null): Json[] {
   const cwd = requestedCwd ?? process.cwd();
   return [
     {
@@ -368,17 +369,11 @@ export function handleMessage(
       configOptions = next;
       return { result: { configOptions: next } };
     }
-    case "session/list": {
-      const filterCwd = typeof params?.cwd === "string" ? params.cwd : null;
-      const known = listSessionsFixture(filterCwd);
-      const sessions = filterCwd === null ? known : known.filter((s) => s.cwd === filterCwd);
-      return { result: { sessions } };
-    }
     case "session/load": {
       // ACP requires the replay to be streamed and only then answered, and the
       // client must have attached a queue before the request was issued.
       const loadId = String(params?.sessionId ?? "");
-      const known = listSessionsFixture(typeof params?.cwd === "string" ? params.cwd : null);
+      const known = knownSessions(typeof params?.cwd === "string" ? params.cwd : null);
       if (!known.some((s) => s.sessionId === loadId)) {
         return { error: { code: -32602, message: `no such session ${loadId}` } };
       }
@@ -387,7 +382,7 @@ export function handleMessage(
     }
     case "session/resume": {
       const resumeId = String(params?.sessionId ?? "");
-      const known = listSessionsFixture(typeof params?.cwd === "string" ? params.cwd : null);
+      const known = knownSessions(typeof params?.cwd === "string" ? params.cwd : null);
       if (!known.some((s) => s.sessionId === resumeId)) {
         return { error: { code: -32602, message: `no such session ${resumeId}` } };
       }

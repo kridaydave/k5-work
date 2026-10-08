@@ -12,9 +12,6 @@ import { MAX_CONFIG_OPTION_VALUES, MAX_CONFIG_OPTIONS } from "@k5-work/shared";
 import { NO_CAPABILITIES, probeCapabilities, type AcpCapabilities } from "./capabilities.js";
 import {
   attachSessionShim,
-  MAX_LISTED_HARNESS_SESSIONS,
-  toHarnessSessionInfo,
-  type HarnessSessionInfo,
 } from "./adopt.js";
 import { classifySessionUpdate } from "./updates.js";
 import type { ConfigOptionSummary } from "@k5-work/shared";
@@ -281,10 +278,10 @@ export class AcpSeat {
   /**
    * Opens a connection with no ACP session.
    *
-   * `session/list` is a read, and a read must not create a session: a sidebar
-   * that lists tasks would otherwise leave a new harness session behind on every
-   * page load. The same headless seat then adopts an existing session id through
-   * `adopt`, so there is one seat and one turn pump either way.
+   * A read must not create a session: a page that lists tasks would otherwise
+   * leave a new harness session behind on every load. The same headless seat then
+   * adopts an existing session id through `adopt`, so there is one seat and one
+   * turn pump either way.
    */
   static async openHeadless(
     child: AcpChild,
@@ -427,42 +424,6 @@ export class AcpSeat {
   }
 
   /**
-   * `session/list`, for discovering sessions the harness knows about.
-   *
-   * Gated on the advertised capability rather than attempted optimistically: the
-   * spec is explicit that a client MUST NOT call a method the agent did not
-   * advertise, and the failure would otherwise surface as an opaque JSON-RPC
-   * error. Only the first page is taken: k5 shows a bounded list and never
-   * persists a cursor, because the spec forbids storing one.
-   */
-  async listSessions(options: { limit?: number } = {}): Promise<HarnessSessionInfo[]> {
-    if (this.closed) throw new AcpSeatError("seat is closed");
-    if (this.context === null) throw new AcpSeatError("seat has no ACP context");
-    if (!this.capabilities.list) {
-      throw new AcpCapabilityError("list", "this harness does not offer session/list");
-    }
-    // A timeout, because the SDK has no default: it registers a pending response
-    // that only a response or a cancel settles. Without this a harness that never
-    // answers leaves the child alive forever, since the only thing that would tear
-    // it down is the teardown that is itself waiting on this call.
-    const response = (await this.context.request(
-      "session/list",
-      // cwd and cursor are the only members of ListSessionsRequest; mcpServers
-      // belongs to the lifecycle methods, not to this read.
-      { cwd: this.options.cwd },
-      { cancellationSignal: AbortSignal.timeout(this.openTimeoutMs) },
-    )) as { sessions?: unknown; nextCursor?: unknown };
-    const raw = Array.isArray(response.sessions) ? response.sessions : [];
-    // The cap is post-hoc: ACP has no page-size field, only a cursor, and the
-    // spec forbids persisting one. So this bounds what k5 keeps, not the bytes on
-    // the wire.
-    const capped = raw.slice(0, options.limit ?? MAX_LISTED_HARNESS_SESSIONS);
-    return capped
-      .map((entry) => toHarnessSessionInfo(entry))
-      .filter((entry): entry is HarnessSessionInfo => entry !== null);
-  }
-
-  /**
    * Adopts an existing harness session so this seat can prompt it.
    *
    * `session/resume` is the continue path, and `session/load` is deliberately
@@ -501,8 +462,8 @@ export class AcpSeat {
       response = (await context.request(
         "session/resume",
         { sessionId, cwd: this.options.cwd, mcpServers: [] },
-        // Bounded, for the same reason session/list is: an unanswered resume
-        // would hold the child open and wedge the connection that asked.
+        // Bounded, for the same reason a read is: an unanswered resume would hold
+        // the child open and wedge the connection that asked.
         { cancellationSignal: AbortSignal.timeout(this.openTimeoutMs) },
       )) as { configOptions?: unknown; modes?: unknown };
     } catch (err) {

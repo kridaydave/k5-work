@@ -5,8 +5,8 @@
 // client path never parses the initialize response at all: `sendRequest` resolves
 // `response.result` raw. So a harness that advertises a capability in a slightly
 // different shape loses it silently, with no error to notice. Measured: a
-// string "true" for loadSession yields `false`, and `{list: true}` yields an
-// object with both list and resume missing, `success: true` throughout.
+// string "true" for loadSession yields `false`, and `{resume: true}` yields an
+// object with resume missing, `success: true` throughout.
 //
 // The opposite trap is worse. A *strict* Zod schema over capabilities would
 // throw on such a response and fail the seat open entirely, bricking a harness
@@ -16,8 +16,6 @@
 export interface AcpCapabilities {
   /** Top-level boolean, per the spec's `agentCapabilities.loadSession`. */
   readonly loadSession: boolean;
-  /** `sessionCapabilities.list`, present as `{}` when supported. */
-  readonly list: boolean;
   readonly resume: boolean;
   readonly close: boolean;
   /** True when the harness advertised an image prompt capability. */
@@ -30,7 +28,6 @@ export interface AcpCapabilities {
 
 export const NO_CAPABILITIES: AcpCapabilities = {
   loadSession: false,
-  list: false,
   resume: false,
   close: false,
   image: false,
@@ -95,7 +92,6 @@ export function probeCapabilities(rawInitialize: unknown): AcpCapabilities {
 
   return {
     loadSession: strictBoolean(agent["loadSession"], "loadSession", false),
-    list: capability(sessionCaps["list"], "sessionCapabilities.list"),
     resume: capability(sessionCaps["resume"], "sessionCapabilities.resume"),
     close: capability(sessionCaps["close"], "sessionCapabilities.close"),
     image: strictBoolean(promptCaps["image"], "promptCapabilities.image", false),
