@@ -58,7 +58,7 @@ export interface SessionServiceOptions {
   /**
    * Reports every harness process this connection has spawned, including one a
    * read is still awaiting. A read holds no pool slot, so this is the only way a
-   * caller can assert that a list left nothing running.
+   * caller can assert that a read left nothing running.
    */
   onChild?: (child: AcpChild) => void;
   /**
@@ -905,7 +905,7 @@ export function createSessionHandlers(
   /**
    * Tracks an outstanding read so waitForIdle can see it.
    *
-   * A shutdown that lands mid-list must wait for the read, or it exits with a
+   * A shutdown that lands mid-read must wait for the read, or it exits with a
    * live harness behind it. An explicit deferred, not a poll: a timer loop here
    * would be both slower and less honest about when the work is actually done.
    */
@@ -980,7 +980,7 @@ export function createSessionHandlers(
     let headless: {
       child: AcpChild;
       acp: AcpSeat;
-      posture: ResolvedPosture | null;
+      posture: ResolvedPosture;
       release: () => void;
     } | null = null;
     let headlessRunning = false;
@@ -996,7 +996,8 @@ export function createSessionHandlers(
           forwardSeatEvent(state, turnId, event);
         },
       });
-      // Tracked before the adopt is awaited, for the same reason as the list.
+      // Tracked before the adopt is awaited, so a shutdown that lands mid-read
+      // still has a child to reap.
       options.trackSeat?.(headless.child);
       options.onChild?.(headless.child);
       headlessRunning = true;

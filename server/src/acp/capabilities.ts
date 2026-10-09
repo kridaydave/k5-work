@@ -4,9 +4,9 @@
 // `zSessionCapabilities` is wrapped in `.catch(...)` (zod.gen.js), and the SDK's
 // client path never parses the initialize response at all: `sendRequest` resolves
 // `response.result` raw. So a harness that advertises a capability in a slightly
-// different shape loses it silently, with no error to notice. Measured: a
-// string "true" for loadSession yields `false`, and `{resume: true}` yields an
-// object with resume missing, `success: true` throughout.
+// different shape loses it silently, with no error to notice. A string "true"
+// for loadSession reads as `false`, and `{resume: true}`, where the spec asks
+// for `{}`, reads as resume missing: `present()` wants the object itself.
 //
 // The opposite trap is worse. A *strict* Zod schema over capabilities would
 // throw on such a response and fail the seat open entirely, bricking a harness

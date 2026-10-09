@@ -132,8 +132,9 @@ test("a mis-shaped capability block opens the seat and refuses the method", asyn
 });
 
 test("a headless seat creates no ACP session", async () => {
-  // A sidebar that lists tasks must not leave a new harness session behind on
-  // every page load.
+  // A seat opened to adopt one that already exists must not also create one:
+  // the harness would bill a new session for a connection that only ever meant
+  // to resume an old one.
   const rig = await startRig("ok");
   try {
     assert.throws(() => rig.seat.sessionId, /seat has no session/);

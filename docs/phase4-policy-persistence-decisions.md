@@ -1,6 +1,6 @@
 # Phase 4: policy and persistence
 
-Durable decisions behind the session store, ACP discovery, and continuation. Code
+Durable decisions behind the session store and continuation. Code
 and tests carry the implementation; this file records only the choices that are not
 recoverable by reading either.
 
@@ -36,14 +36,15 @@ lowest record on disk, because it is the start of a read: a repair derived from
 its final record. `updatedAt` orders the list, because `lastSeq` counts records inside
 one session and says nothing about when it was last touched.
 
-## Continuation resumes; discovery lists
+## Continuation resumes on a headless seat
 
 Continuing a stored task uses `session/resume`, not `session/load`. `session/load` is
 for handing the model a history it has not seen; `session/resume` is for continuing one
 it has. Only `resume` is paired with the absence of a replay terminator, because k5
 never asks the harness to replay.
 
-A headless seat is short-lived, created on demand and torn down after the read. A read must
+A headless seat is short-lived, created on demand and reaped when the read is done, which
+for a continuation means the adopted seat is promoted rather than torn down. A read must
 not take a live seat slot, must not create a session, and must not leave a harness process
 behind. Headless opens are capped and concurrent, because a user clicking refresh
 repeatedly is a normal thing to do and a pile of harnesses is not.
@@ -65,7 +66,7 @@ they populate and a strict probe would refuse a harness that would have worked.
 ## `attachSession` is a runtime-checked shim
 
 ACP's `ClientContext` exposes no public `attachSession`, but the method exists at
-runtime. Adopting a listed session depends on it, so the call is feature-detected once
+runtime. Adopting a harness session depends on it, so the call is feature-detected once
 and refuses loudly when it is missing, rather than being assumed.
 
 ## `turn.started` carries the prompt

@@ -128,14 +128,12 @@ export class SeatRunner {
   private async gate(input: {
     projectPath: string;
     access: AccessProfile["label"];
-    /** Skips the posture resolver, for a read that runs no agent code. */
-    skipPosture?: boolean;
   }): Promise<{
     profile: AccessProfile;
     argv: string[];
     env: NodeJS.ProcessEnv;
-    /** What the resolver reported, or null only when it was skipped. */
-    posture: ResolvedPosture | null;
+    /** What the resolver reported. Always resolved: nothing skips it any more. */
+    posture: ResolvedPosture;
   }> {
     if (this.options.disableLiveSeats) {
       throw new SeatOpenError(
@@ -174,9 +172,6 @@ export class SeatRunner {
     }
 
     const env = this.options.env ?? process.env;
-    if (input.skipPosture === true) {
-      return { profile, argv, env, posture: null };
-    }
     // Kept, not merely checked: the service has to report what was actually
     // resolved, and re-resolving here would be a second subprocess answering a
     // question the seat was already accepted on.
@@ -212,16 +207,6 @@ export class SeatRunner {
       projectPath: request.projectPath,
       access: request.access,
     });
-    // Unreachable while `gate` is the only producer, and refused rather than
-    // tolerated if that ever stops being true: a seat with no resolved posture is
-    // a seat whose permissions nobody read, which is the one thing this whole
-    // path exists to prevent.
-    if (posture === null) {
-      throw new SeatOpenError(
-        "posture-unverifiable",
-        "the seat opened without a resolved permission posture",
-      );
-    }
     const key = {
       harness: request.harness,
       projectId: request.projectId,
@@ -293,18 +278,13 @@ export class SeatRunner {
    *
    * The count covers the child's whole life rather than the open. Decrementing
    * when `openHeadless` returned measured nothing, because the caller then waits
-   * on `listSessions()` for as long as that call's timeout, and the cap read "two" while
+   * on the read for as long as that read's timeout, and the cap read "two" while
    * a third, fourth and fifth child were already resident.
    */
   async openHeadless(input: {
     projectId: string;
     projectPath: string;
     access?: AccessProfile["label"];
-    /**
-     * True for a read that runs no agent code. A continuation must leave it
-     * false, because from that point the harness will run a prompt.
-     */
-    readOnly?: boolean;
     /**
      * Where a promoted seat's turn events go. A read never runs a prompt and
      * needs none; a continuation is about to run one, and a seat with no callback
@@ -315,8 +295,7 @@ export class SeatRunner {
     child: AcpChild;
     acp: AcpSeat;
     profile: AccessProfile;
-    /** Null only for a read that skipped the resolver; a live seat has one. */
-    posture: ResolvedPosture | null;
+    posture: ResolvedPosture;
     /**
      * Gives the read seat's cap slot back. Required: the slot is held for the
      * lifetime of the child, not for the length of the open, because the
@@ -328,7 +307,7 @@ export class SeatRunner {
     if (this.headlessInFlight >= MAX_INFLIGHT_HEADLESS) {
       throw new SeatOpenError(
         "seat-cap",
-        `already listing sessions in ${String(this.headlessInFlight)} places; try again shortly`,
+        `already continuing ${String(this.headlessInFlight)} tasks; try again shortly`,
       );
     }
     this.headlessInFlight += 1;
@@ -345,12 +324,9 @@ export class SeatRunner {
         projectPath: input.projectPath,
         access: input.access ?? "full",
         // The posture resolver is a subprocess that measured 3.5 s on this
-        // machine, and it exists to bound what agent code may do. A read runs no
-        // agent code: it spawns the harness, handshakes, and reads back metadata
-        // the harness already holds. Paying 3.5 s of that for it bought nothing. A
-        // continuation still pays it, because from that point the harness will run
-        // a prompt.
-        skipPosture: input.readOnly === true,
+        // machine, and it exists to bound what the harness on the other side of
+        // this seat is allowed to run. Every seat pays it, because the seat is
+        // about to run a prompt for the task it is continuing.
       });
       const child = await spawnAcpChild({ argv, cwd: input.projectPath, env });
       try {

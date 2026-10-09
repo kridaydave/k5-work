@@ -32,7 +32,7 @@ import { AcpAuthRequiredError, AcpProtocolMismatchError, AcpTerminalAuthUnsuppor
  * to a wire reason the browser can render.
  */
 export class AcpCapabilityError extends Error {
-  readonly capability: "load" | "resume" | "list" | "pump";
+  readonly capability: "load" | "resume" | "pump";
 
   constructor(capability: AcpCapabilityError["capability"], message: string) {
     super(message);
@@ -278,10 +278,10 @@ export class AcpSeat {
   /**
    * Opens a connection with no ACP session.
    *
-   * A read must not create a session: a page that lists tasks would otherwise
-   * leave a new harness session behind on every load. The same headless seat then
-   * adopts an existing session id through `adopt`, so there is one seat and one
-   * turn pump either way.
+   * A read must not create a session: the harness would bill k5 a new session
+   * for a connection that only ever adopts one that already exists. The same
+   * headless seat then adopts an existing session id through `adopt`, so there
+   * is one seat and one turn pump either way.
    */
   static async openHeadless(
     child: AcpChild,

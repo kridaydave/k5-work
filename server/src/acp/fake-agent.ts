@@ -95,7 +95,7 @@ export function initializeResult(scenario: Scenario): Json {
       ...base,
       agentCapabilities: {
         loadSession: "true",
-        sessionCapabilities: { list: true, resume: "yes" },
+        sessionCapabilities: { resume: "yes" },
       },
     };
   }

@@ -1412,6 +1412,43 @@ describe("session continuation", () => {
     }
   });
 
+  it("refuses to continue a task on a harness that cannot resume", async () => {
+    // The adopt is where the capability is found, and mapping that refusal onto
+    // a wire reason is the only thing the browser can render. Nothing else
+    // reaches this branch since the listing went: a continuation is the one
+    // path left that opens a headless seat and then discovers the harness
+    // cannot adopt with it.
+    const harness = await start({ record: true, scenario: "no-session-caps" });
+    try {
+      const store = harness.store;
+      assert.ok(store !== null);
+      const created = await store.create({
+        harness: "opencode",
+        harnessSessionId: "fake-session-1",
+        projectId: "p-1",
+        projectName: null,
+        cwd: harness.projectDir,
+        title: "a stored task",
+      });
+      const ws = await harness.connect("http://127.0.0.1:5173");
+      ws.send(
+        JSON.stringify({ commandId: "c-1", type: "session.load", storeId: created.storeId }),
+      );
+      const result = await waitForCommand(harness.events, "c-1");
+      assert.equal(result.ok, false);
+      assert.equal(result.reason, "capability-unsupported");
+      await waitUntil(() => harness.children.length > 0, "the read seat to spawn");
+      for (const child of harness.children) {
+        if (child.pid === undefined) continue;
+        await child.exited;
+        assert.equal(isAlive(child.pid), false, `read seat pid ${child.pid} outlived its refusal`);
+      }
+      ws.close();
+    } finally {
+      await harness.close();
+    }
+  });
+
   it("refuses to continue a task whose recorded cwd is not the project it is opened from", async () => {
     // ACP requires the request cwd to match the session's own, so a task whose
     // project moved must fail loudly rather than resume against another directory.
