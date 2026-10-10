@@ -10,6 +10,7 @@ import {
   MAX_ATTACHMENT_BYTES,
   projectTranscript,
   SessionEventsResponseSchema,
+  SNIPPET_CHARS,
 } from "@k5-work/shared";
 import {
   MAX_SESSION_BYTES,
@@ -2113,16 +2114,93 @@ test("search caps the snippets and does not spill them between sessions", async 
 });
 
 test("search does not treat a query as a pattern", async () => {
-  // `%` and `_` are LIKE metacharacters. Unescaped, "100%" matches every row in
-  // the store, which is the opposite of what was asked.
+  // `%` and `_` are LIKE metacharacters. Unescaped, a query of "%" matches
+  // every row in the store and "a_c" matches "abc", and neither is what was
+  // asked for. The fixtures below hold the literal characters, so deleting
+  // the escape cannot leave these assertions passing on nothing.
   await withStore(async (store) => {
+    const literals = await newSession(store, { title: "literals" });
+    store.append(literals.storeId, delta(1, "the batch ran at 100% and read a_c whole"));
     const plain = await newSession(store, { title: "plain" });
-    store.append(plain.storeId, delta(1, "no metacharacters here at all"));
+    store.append(plain.storeId, delta(1, "the batch ran at full and read abc whole"));
+    await store.flushMeta(literals.storeId);
     await store.flushMeta(plain.storeId);
 
-    assert.deepEqual(store.search("100%"), [], "a percent matches literally, not everything");
-    assert.deepEqual(store.search("a_c"), [], "and so does an underscore");
-    assert.equal(store.search("metachar").length, 1, "while a real word still matches");
+    assert.equal(store.search("100%").length, 1, "a percent matches the literal characters");
+    assert.equal(store.search("100%")[0]?.storeId, literals.storeId);
+    assert.equal(store.search("a_c").length, 1, "and so does an underscore");
+    assert.equal(store.search("a_c")[0]?.storeId, literals.storeId);
+    assert.equal(store.search("abc").length, 1, "while the plain word still matches");
+    assert.equal(store.search("abc")[0]?.storeId, plain.storeId);
+    assert.equal(store.search("%").length, 1, "a lone percent is a character, not everything");
+
+    // LIKE's own escape character is the backslash, so a query holding one is a
+    // literal rather than the start of an escape sequence.
+    const slashy = await newSession(store, { title: "backslashes" });
+    store.append(slashy.storeId, delta(1, "the path is C:\\work\\k5"));
+    await store.flushMeta(slashy.storeId);
+    assert.equal(store.search("C:\\work").length, 1, "a backslash matches literally");
+    assert.equal(store.search("\\").length, 1, "including as the whole query");
+  });
+});
+
+test("search keeps a matched line from the middle of a long message", async () => {
+  // The case the whole feature exists for: a long prompt's tail lives only in
+  // the transcript. A snippet over SNIPPET_CHARS fails the schema and is
+  // dropped, and the row then claims a match with nothing to show, so the
+  // window has to be clamped to the cap rather than merely centred.
+  await withStore(async (store) => {
+    const session = await newSession(store, { title: "a long prompt" });
+    const head = "x".repeat(400);
+    const tail = "y".repeat(400);
+    store.append(session.storeId, promptEvent(1, `${head} docking manifest ${tail}`));
+    await store.flushMeta(session.storeId);
+
+    const hit = store.search("docking manifest")[0];
+    assert.ok(hit, "the row comes back");
+    assert.equal(hit.snippets?.length, 1, "with its matched line");
+    const [snippet] = hit.snippets ?? [];
+    assert.ok(snippet, "the snippet exists");
+    assert.ok(snippet.text.includes("docking manifest"), "and the match is inside it");
+    assert.ok(snippet.text.length <= SNIPPET_CHARS, "and the whole snippet fits the cap");
+    assert.ok(snippet.text.startsWith("..."), "so it reads as an excerpt of the message");
+  });
+});
+
+test("search answers from messages, not from tool calls or reasoning", async () => {
+  // "Which task read this file" is a different question from "which task was
+  // about this", and the second is the one a transcript search is for. A
+  // candidate matched only by a tool call's title comes back with no matched
+  // line to show, so the candidates are the messages themselves.
+  await withStore(async (store) => {
+    const session = await newSession(store, { title: "a task about a zeppelin" });
+    store.append(session.storeId, promptEvent(1, "find the docking manifest"));
+    store.append(session.storeId, {
+      type: "tool.updated",
+      sessionId: "ses_live",
+      turnId: "t-1",
+      toolCallId: "call-1",
+      title: "read_file zeppelin-blueprints.txt",
+      status: "completed",
+      lifecycle: "active",
+    });
+    store.append(session.storeId, {
+      type: "turn.delta",
+      sessionId: "ses_live",
+      turnId: "t-1",
+      stream: "thought",
+      text: "the zeppelin needs fuel",
+    });
+    await store.flushMeta(session.storeId);
+
+    assert.equal(store.search("docking manifest").length, 1, "the prompt still matches");
+    assert.equal(store.search("read_file").length, 0, "a tool call's title is not a match");
+    assert.equal(
+      store.search("zeppelin-blueprints").length,
+      0,
+      "not even the filename inside it",
+    );
+    assert.equal(store.search("needs fuel").length, 0, "and a reasoning delta is not one");
   });
 });
 

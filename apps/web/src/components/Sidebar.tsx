@@ -1,13 +1,21 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { CloseIcon, FolderIcon, PlusIcon, SearchIcon } from "@/components/icons";
 import { cn } from "@/utils/cn";
 import type { Project } from "@k5-work/shared";
 import type { ConnectionState } from "@k5-work/shared";
 
+/** How long typing has to pause before the query leaves the component. */
+const SEARCH_DEBOUNCE_MS = 200;
+
 export type SessionSnippet = {
   /** Which side of the conversation the matched line came from. */
   role: "prompt" | "reply";
   text: string;
+  /**
+   * The record the line came from. What makes the snippet's key unique: the
+   * agent says "Done." in more than one thread, and more than once in one.
+   */
+  seq: number;
 };
 
 export type Session = {
@@ -54,7 +62,7 @@ type SidebarProps = {
    */
   sessions: Session[];
   /**
-   * The search box's text, as the user types it. The store searches the
+   * The search query, debounced out of the component. The store searches the
    * transcripts, so the query has to leave here rather than stay in the
    * component's own state. Optional because nothing else needs it.
    */
@@ -114,21 +122,36 @@ export function Sidebar({
     return () => media.removeEventListener("change", update);
   }, []);
 
+  // The query leaves the component debounced and the raw text stays here. The
+  // old shape kept the text in the app that also owns the transcript and the
+  // composer, so one keystroke re-rendered all three.
+  const notify = useRef(onSearchChange);
+  useEffect(() => {
+    notify.current = onSearchChange;
+  });
+  useEffect(() => {
+    const timer = setTimeout(() => notify.current?.(search.trim()), SEARCH_DEBOUNCE_MS);
+    return () => clearTimeout(timer);
+  }, [search]);
+
   const hidden = !open && compactViewport;
-  // The rows arrive already filtered when a search is on, because the store is
-  // what searches the transcripts. This local pass only trims what a client-side
-  // match can still narrow, which is nothing once the server has answered, so it
-  // exists to keep the live rows responsive while a query is in flight.
+  // Rows the store searched arrive already matched, and filtering them again can
+  // only remove hits the store found: a session whose matched line is in the
+  // transcript and not in its title would disappear with nothing explaining
+  // why. So the local pass runs only on rows that did not come from a search,
+  // which is the live list a query is still in flight against.
   const normalizedSearch = search.trim().toLowerCase();
   const groups: { label: string; sessions: Session[] }[] = groupSessions(sessions).map((group) => ({
     ...group,
-    sessions: group.sessions.filter(
-      (session) =>
-        !normalizedSearch ||
-        session.title.toLowerCase().includes(normalizedSearch) ||
-        session.meta.toLowerCase().includes(normalizedSearch) ||
-        session.snippets?.some((snippet) => snippet.text.toLowerCase().includes(normalizedSearch)) === true,
-    ),
+    sessions: searchActive
+      ? group.sessions
+      : group.sessions.filter(
+          (session) =>
+            !normalizedSearch ||
+            session.title.toLowerCase().includes(normalizedSearch) ||
+            session.meta.toLowerCase().includes(normalizedSearch) ||
+            session.snippets?.some((snippet) => snippet.text.toLowerCase().includes(normalizedSearch)) === true,
+        ),
   })).filter((group) => group.sessions.length > 0);
   const visibleSessions: Session[] = groups.flatMap((group) => group.sessions);
 
@@ -219,11 +242,10 @@ export function Sidebar({
                 type="search"
                 value={search}
                 onChange={(event) => {
-                  setSearch(event.target.value);
                   // The store searches the transcripts, so the query leaves the
-                  // component here. The sidebar still holds its own copy to draw
-                  // and to clear, and mirrors what the caller is searching.
-                  onSearchChange?.(event.target.value);
+                  // component through the debounce above. The sidebar holds its
+                  // own copy to draw and to clear.
+                  setSearch(event.target.value);
                 }}
                 placeholder="Search tasks"
                 aria-label="Search tasks"
@@ -236,8 +258,9 @@ export function Sidebar({
               aria-label="Expand and search tasks"
               title="Search tasks"
               onClick={() => {
-                setSearch("");
-                onSearchChange?.("");
+                // Expanding is all this does. Clearing an applied query here
+                // wiped a search that was still live while the sidebar was
+                // closed, from a button whose only label was "expand".
                 onToggle();
               }}
               className="grid h-10 w-full cursor-pointer place-items-center rounded-xl text-white/45 transition hover:bg-white/[0.07] hover:text-white"
@@ -372,7 +395,7 @@ export function Sidebar({
                                   two-line row. */}
                               {session.snippets?.map((snippet) => (
                                 <span
-                                  key={`${snippet.role}-${snippet.text}`}
+                                  key={`${snippet.role}-${snippet.seq}`}
                                   className="mt-1 block truncate pl-3.5 text-[11px] text-white/45"
                                   title={snippet.text}
                                 >

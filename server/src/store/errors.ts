@@ -15,7 +15,10 @@ export type SessionStoreErrorCode =
   // repairs: an unknown session is a stale id, and an unknown attachment inside a
   // live session is an upload that is gone.
   | "E_STORE_UNKNOWN_ATTACHMENT"
-  | "E_STORE_ROOT";
+  | "E_STORE_ROOT"
+  // A matched line that no longer satisfies the snippet contract. Dropping it
+  // silently is what left a search row with a matcher and no matched line.
+  | "E_STORE_SNIPPET_UNREADABLE";
 
 export class SessionStoreError extends Error {
   readonly code: SessionStoreErrorCode;

@@ -5,8 +5,10 @@ import {
   AttachmentIdSchema,
   MAX_ATTACHMENT_BYTES,
   MAX_EVENTS_PER_PAGE,
+  MAX_QUERY_CHARS,
   SessionEventsResponseSchema,
   SessionListResponseSchema,
+  SessionQuerySchema,
   UploadedAttachmentSchema,
   type SessionEventsResponse,
 } from "@k5-work/shared";
@@ -47,6 +49,7 @@ const STATUS_BY_CODE: Record<SessionStoreErrorCode, number> = {
   E_STORE_UNKNOWN_SESSION: 404,
   E_STORE_UNKNOWN_ATTACHMENT: 404,
   E_STORE_ROOT: 500,
+  E_STORE_SNIPPET_UNREADABLE: 500,
 };
 
 const MESSAGE_BY_CODE: Record<SessionStoreErrorCode, string> = {
@@ -61,6 +64,7 @@ const MESSAGE_BY_CODE: Record<SessionStoreErrorCode, string> = {
   E_STORE_UNKNOWN_SESSION: "No such stored session",
   E_STORE_UNKNOWN_ATTACHMENT: "No such attachment",
   E_STORE_ROOT: "The session store root is unusable",
+  E_STORE_SNIPPET_UNREADABLE: "A matched line could not be read back",
 };
 
 export function isSessionApiPath(pathname: string): boolean {
@@ -246,9 +250,20 @@ export function handleSessionApiRequest(
         //
         // `q` turns the same read into a search, and the response is the same
         // shape either way: rows, and a snippets array on each row that only a
-        // search fills. An empty search never falls back to the full list.
-        const query = new URL(req.url ?? "/", "http://k5.invalid").searchParams.get("q");
-        const sessions = query === null ? store.list() : store.search(query);
+        // search fills. The query is validated here rather than passed through:
+        // a present-but-blank or over-long `q` is a malformed request, and
+        // answering it as an empty search hides the mistake from the caller.
+        const rawQuery = new URL(req.url ?? "/", "http://k5.invalid").searchParams.get("q");
+        const parsedQuery =
+          rawQuery === null ? null : SessionQuerySchema.safeParse(rawQuery);
+        if (parsedQuery !== null && !parsedQuery.success) {
+          sendJson(res, 400, {
+            error: `A search needs one to ${String(MAX_QUERY_CHARS)} characters`,
+          });
+          return;
+        }
+        const sessions =
+          parsedQuery === null ? store.list() : store.search(parsedQuery.data);
         const body = SessionListResponseSchema.parse({ sessions });
         sendJson(res, 200, body);
         return;

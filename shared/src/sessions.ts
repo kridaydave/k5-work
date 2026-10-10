@@ -104,6 +104,17 @@ export type SessionSummary = z.infer<typeof SessionSummarySchema>;
 
 export const MAX_LISTED_SESSIONS = 500;
 
+/**
+ * The longest a search query may be, trimmed. A query longer than this is a
+ * paste, not a question, and it is refused at the boundary rather than
+ * searched: every session's payload is scanned per candidate.
+ */
+export const MAX_QUERY_CHARS = 200;
+
+/** A search query as it arrives on the wire: trimmed, and bounded. */
+export const SessionQuerySchema = z.string().trim().min(1).max(MAX_QUERY_CHARS);
+export type SessionQuery = z.infer<typeof SessionQuerySchema>;
+
 /** The longest a snippet runs before it is cut with an ellipsis at either end. */
 export const SNIPPET_CHARS = 200;
 

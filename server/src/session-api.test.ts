@@ -324,6 +324,36 @@ test("a search is served on the same route as the list, with its snippets", asyn
   }
 });
 
+test("a search query is validated at the boundary", async () => {
+  // `q` arrives from a URL, so it is untrusted like any other input. Answering
+  // a blank or absurd query as an empty search hides the mistake from the
+  // caller, and a paste of a whole document is not a question.
+  const harness = await startHarness();
+  try {
+    await harness.store.create({
+      harness: "opencode",
+      harnessSessionId: "ses_1",
+      projectId: "p",
+      projectName: null,
+      cwd: "/tmp/p",
+      title: "First task",
+    });
+
+    const blank = await get(harness, "/api/sessions?q=");
+    assert.equal(blank.status, 400);
+    const spaced = await get(harness, "/api/sessions?q=%20%20");
+    assert.equal(spaced.status, 400, "whitespace is blank once trimmed");
+    const huge = await get(harness, `/api/sessions?q=${"z".repeat(201)}`);
+    assert.equal(huge.status, 400, "a query over the cap is refused, not searched");
+    const atCap = await get(harness, `/api/sessions?q=${"z".repeat(200)}`);
+    assert.equal(atCap.status, 200, "a query at the cap is still a query");
+    const noQuery = await get(harness, "/api/sessions");
+    assert.equal(noQuery.status, 200, "no q at all is the plain list, not an error");
+  } finally {
+    await harness.close();
+  }
+});
+
 test("events are paged by cursor and the four states are distinguishable", async () => {
   const harness = await startHarness();
   try {

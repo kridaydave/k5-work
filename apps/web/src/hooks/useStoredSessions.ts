@@ -31,7 +31,14 @@ export interface StoredSessionState {
   sessions: SessionSearchRow[];
   loading: boolean;
   error: string | null;
-  /** True when the rows currently held came from a search rather than a list. */
+  /**
+   * True when the rows currently held came from a search rather than a list.
+   *
+   * Read off the answer, not off the query: a query that was just cleared still
+   * holds the previous answer, and reporting that as a plain list is what made
+   * a workspace with tasks say "No tasks yet." for as long as the fresh read
+   * took to land.
+   */
   searching: boolean;
   /**
    * Re-reads the list. Needed because the list is a snapshot of what was recorded
@@ -47,6 +54,7 @@ export function useStoredSessions(query: string = ""): StoredSessionState {
   const [sessions, setSessions] = useState<SessionSearchRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [searching, setSearching] = useState(false);
   const [nonce, setNonce] = useState(0);
   // Guards against a slow response overwriting a newer one.
   const latest = useRef(0);
@@ -69,6 +77,9 @@ export function useStoredSessions(query: string = ""): StoredSessionState {
         const parsed = SessionListResponseSchema.parse(await response.json());
         if (request !== latest.current) return;
         setSessions(parsed.sessions);
+        // Off the answer, so the flag means what the rows are rather than what
+        // was asked for.
+        setSearching(trimmed.length > 0);
         setError(null);
       } catch (cause) {
         if (request !== latest.current) return;
@@ -102,7 +113,7 @@ export function useStoredSessions(query: string = ""): StoredSessionState {
     sessions,
     loading,
     error,
-    searching: query.trim().length > 0,
+    searching,
     refresh: useCallback(() => setNonce((value) => value + 1), []),
     remove,
   };

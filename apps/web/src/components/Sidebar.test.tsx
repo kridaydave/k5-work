@@ -1,5 +1,5 @@
-import { fireEvent, render, screen, within } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
 import { Sidebar, type Session } from "./Sidebar";
 import type { Project } from "@k5-work/shared";
 
@@ -91,8 +91,8 @@ describe("Sidebar search results", () => {
       meta: "2 turns",
       group: "Work",
       snippets: [
-        { role: "prompt", text: "find the zeppelin manifest" },
-        { role: "reply", text: "the zeppelin docks at pier four" },
+        { role: "prompt", text: "find the zeppelin manifest", seq: 1 },
+        { role: "reply", text: "the zeppelin docks at pier four", seq: 2 },
       ],
     },
     {
@@ -100,7 +100,7 @@ describe("Sidebar search results", () => {
       title: "fuel consumption",
       meta: "1 turn",
       group: "Work",
-      snippets: [{ role: "reply", text: "a zeppelin burns very little" }],
+      snippets: [{ role: "reply", text: "a zeppelin burns very little", seq: 3 }],
     },
   ];
 
@@ -131,12 +131,41 @@ describe("Sidebar search results", () => {
     expect(within(tasks()).queryByText("No tasks yet.")).toBeNull();
   });
 
-  it("hands the typed query to the caller, which is what searches the store", () => {
-    const seen: string[] = [];
-    renderSidebar({ sessions: twoThreads, onSearchChange: (value) => seen.push(value) });
+  it("keeps a search hit whose title does not contain the query", () => {
+    // The store matched the transcript, and the row it returned is the answer.
+    // Filtering a search answer locally again could only remove hits: this row
+    // has no snippet line (its matched line was cut from the transcript) and
+    // no title match, and it used to vanish with nothing on screen to say why.
+    renderSidebar({
+      sessions: [{ id: "s-1", title: "an unrelated title", meta: "1 turn", group: "Work" }],
+      searchActive: true,
+    });
     fireEvent.change(screen.getByPlaceholderText("Search tasks"), {
       target: { value: "zeppelin" },
     });
-    expect(seen).toEqual(["zeppelin"]);
+    expect(within(tasks()).getByText("an unrelated title")).toBeTruthy();
+    expect(within(tasks()).queryByText("No matching tasks.")).toBeNull();
+  });
+
+  it("hands the typed query to the caller, debounced", () => {
+    // The store searches the transcripts, so the query has to leave the
+    // component. Debounced, because one request per keystroke is a request
+    // nobody asked for, and the raw text stays here so a keystroke does not
+    // re-render everything the app owns.
+    vi.useFakeTimers();
+    try {
+      const seen: string[] = [];
+      renderSidebar({ sessions: twoThreads, onSearchChange: (value) => seen.push(value) });
+      fireEvent.change(screen.getByPlaceholderText("Search tasks"), {
+        target: { value: "zeppelin" },
+      });
+      expect(seen).toEqual([], "nothing leaves before the typing pauses");
+      act(() => {
+        vi.advanceTimersByTime(200);
+      });
+      expect(seen).toEqual(["zeppelin"], "and exactly the trimmed query when it does");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

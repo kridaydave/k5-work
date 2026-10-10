@@ -420,22 +420,22 @@ function escapeLike(needle: string): string {
  * An ellipsis at either cut, so a snippet never looks like the whole message.
  * A line short enough that the match is already inside the window is returned
  * unchanged, including when it is shorter than `max`.
+ *
+ * The window keeps six characters back for the two ellipses, so the result is
+ * never over `max` no matter where the match sits. Getting this wrong was
+ * silent: an over-long snippet failed the schema and was dropped, so the row
+ * came back with no matched line at all, which is the exact case a long
+ * prompt's tail lives in.
  */
 function trimAround(text: string, wanted: string, max: number): string {
   const at = text.toLowerCase().indexOf(wanted);
   if (at < 0) return text.slice(0, max);
   if (text.length <= max) return text;
-  const half = Math.floor((max - 3) / 2);
-  let start = at - half;
-  let end = at + wanted.length + half;
-  if (start <= 0) {
-    start = 0;
-    end = max - 3;
-  }
-  if (end >= text.length) {
-    end = text.length;
-    start = Math.max(0, end - max + 3);
-  }
+  const room = max - 6;
+  const lead = Math.max(0, Math.floor((room - wanted.length) / 2));
+  let start = at - lead;
+  start = Math.max(0, Math.min(start, text.length - room));
+  const end = start + room;
   const head = start > 0 ? "..." : "";
   const tail = end < text.length ? "..." : "";
   return `${head}${text.slice(start, end)}${tail}`;
@@ -1373,9 +1373,9 @@ export class SessionStore {
    * Sessions whose title or transcript mentions the query, newest first.
    *
    * Two steps, because projecting every transcript in the store to answer one
-   * query is work no one asked for. A `LIKE` over `events.payload` narrows the
-   * candidates, then only those sessions are projected, and the projection is
-   * what decides which line matched and what the snippet says.
+   * query is work no one asked for. A `LIKE` over the message payloads narrows
+   * the candidates, then only those sessions are projected, and the projection
+   * is what decides which line matched and what the snippet says.
    *
    * `%` and `_` in the query are escaped, so a search for "50%" is a search for
    * the literal three characters rather than a pattern that matches everything.
@@ -1386,14 +1386,30 @@ export class SessionStore {
     const needle = query.trim();
     if (needle.length === 0) return [];
     const like = `%${escapeLike(needle)}%`;
+    // The candidates come from message payloads only: the prompt on
+    // `turn.started` and the text stream of `turn.delta`, which is exactly the
+    // set a snippet can be cut from. A LIKE over the whole payload would also
+    // match a tool call's title or a reasoning delta, and the row would come
+    // back matcher-and-all with nothing on it to show. `json_valid` first,
+    // because json_extract throws on a payload that is not JSON at all.
     const rows = this.handle()
       .prepare(
         `SELECT ${SESSION_COLUMNS} FROM sessions
          WHERE title LIKE ? ESCAPE '\\'
-            OR store_id IN (SELECT store_id FROM events WHERE payload LIKE ? ESCAPE '\\')
+            OR store_id IN (
+              SELECT store_id FROM events
+              WHERE json_valid(payload)
+                AND (
+                  (json_extract(payload, '$.type') = 'turn.started'
+                   AND json_extract(payload, '$.userText') LIKE ? ESCAPE '\\')
+                  OR (json_extract(payload, '$.type') = 'turn.delta'
+                      AND json_extract(payload, '$.stream') = 'text'
+                      AND json_extract(payload, '$.text') LIKE ? ESCAPE '\\')
+                )
+            )
          ORDER BY updated_at DESC, store_id DESC`,
       )
-      .all(like, like) as MetaRow[];
+      .all(like, like, like) as MetaRow[];
 
     const summaries: SessionSummary[] = [];
     for (const row of rows) {
@@ -1441,7 +1457,16 @@ export class SessionStore {
           role,
           text: trimAround(text, wanted, SNIPPET_CHARS),
         });
-        if (!snippet.success) continue;
+        // Reported, not dropped quietly. A matched session whose only matched
+        // line fails the contract has to be visible somewhere, or the row
+        // reaches the browser claiming a match with nothing to show for it.
+        if (!snippet.success) {
+          this.report(
+            "E_STORE_SNIPPET_UNREADABLE",
+            `dropped a matched line in ${storeId}: ${snippet.error.message}`,
+          );
+          continue;
+        }
         found.push(snippet.data);
         if (found.length >= MAX_SNIPPETS_PER_SESSION) return found;
       }

@@ -89,18 +89,11 @@ export default function App() {
     selectProject,
     openPath,
   } = useProjects();
-  const [search, setSearch] = useState("");
-  // Debounced, so a search request goes out once the typing has paused rather
-  // than once per keystroke.
-  const [searchQuery, setSearchQuery] = useState("");
-  useEffect(() => {
-    const timer = setTimeout(() => setSearchQuery(search.trim()), 200);
-    return () => clearTimeout(timer);
-  }, [search]);
-
   // The durable task list, read over HTTP with no harness process involved. The
   // sidebar is populated from disk, not from the live session alone, so a reload
-  // shows the history that is actually there.
+  // shows the history that is actually there. The query arrives debounced from
+  // the sidebar, which keeps a keystroke from re-rendering the transcript.
+  const [searchQuery, setSearchQuery] = useState("");
   const {
     sessions: storedSessions,
     searching: storedSessionsSearching,
@@ -260,6 +253,7 @@ export default function App() {
       snippets: entry.snippets?.map((snippet) => ({
         role: snippet.role,
         text: snippet.text,
+        seq: snippet.seq,
       })),
       meta: entry.turnCount === 1 ? "1 turn" : `${String(entry.turnCount)} turns`,
       group: entry.truncated || entry.droppedRecords > 0 ? "Incomplete" : "Tasks",
@@ -537,7 +531,7 @@ export default function App() {
           // workspace. The rows themselves are already the filtered answer; this
           // only tells the sidebar which of its two empty states to draw.
           searchActive={storedSessionsSearching}
-          onSearchChange={setSearch}
+          onSearchChange={setSearchQuery}
           sessions={sidebarSessions}
           connection={state.connection}
         />
