@@ -159,11 +159,11 @@ describe("Sidebar search results", () => {
       fireEvent.change(screen.getByPlaceholderText("Search tasks"), {
         target: { value: "zeppelin" },
       });
-      expect(seen).toEqual([], "nothing leaves before the typing pauses");
+      expect(seen, "nothing leaves before the typing pauses").toEqual([]);
       act(() => {
         vi.advanceTimersByTime(200);
       });
-      expect(seen).toEqual(["zeppelin"], "and exactly the trimmed query when it does");
+      expect(seen, "and exactly the trimmed query when it does").toEqual(["zeppelin"]);
     } finally {
       vi.useRealTimers();
     }
