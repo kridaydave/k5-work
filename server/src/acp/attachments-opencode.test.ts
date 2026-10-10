@@ -9,6 +9,7 @@ import type { AttachmentManifestEntry } from "@k5-work/shared";
 import { AcpSeat, type SeatStreamEvent } from "./acp-seat.js";
 import { probeCapabilities, type AcpCapabilities } from "./capabilities.js";
 import { planPromptBlocks } from "./prompt-blocks.js";
+import { pinModelIn } from "./real-harness-config.js";
 import { spawnAcpChild, type AcpChild } from "./spawn.js";
 import { SessionStore } from "../store/session-store.js";
 
@@ -45,7 +46,7 @@ const PROMPT_TEXT = "What is on the attached checklist?";
 /**
  * A decodable 1x1 PNG, not a signature fragment.
  *
- * This is a load-bearing fixture choice, measured against real OpenCode 1.18.32:
+ * This is a load-bearing fixture choice, measured against real OpenCode 2.0.24:
  * a resource block whose blob is not a decodable image comes back as a JSON-RPC
  * -32603 "OpenCode service failure" (data.service "session"), and the user's
  * text goes down with it. The four-byte fragment in prompt-blocks.test.ts is the
@@ -185,6 +186,9 @@ function buildRig(): Promise<Rig> {
     // A real working directory for the harness, deliberately not the store's, so
     // a path leak cannot hide behind the two being the same string.
     const harnessCwd = mkdtempSync(path.join(tmpdir(), "k5-attach-cwd-"));
+    // Same reason as the slow-turn file: the turn below runs on a pinned model,
+    // not on whatever this machine happens to default to.
+    pinModelIn(harnessCwd);
 
     const k5Session = await store.create({
       harness: "opencode",
@@ -336,11 +340,13 @@ describe("attachments and session adoption against a real opencode", () => {
 
     assert.equal(agent["loadSession"], true, "observed loadSession");
     const sessions = asRecord(agent["sessionCapabilities"], "sessionCapabilities");
-    // `fork` is advertised and k5 does not read it, so it is named here rather
-    // than ignored: a harness that drops `resume` takes away session adoption.
+    // `fork`, `delete` and `additionalDirectories` are advertised and k5 reads
+    // none of them, so they are named here rather than silently ignored: a
+    // harness that drops `resume` takes away session adoption, and one that
+    // drops `close` takes away the deliberate session close.
     assert.deepEqual(
       Object.keys(sessions).sort(),
-      ["close", "fork", "list", "resume"],
+      ["additionalDirectories", "close", "delete", "fork", "list", "resume"],
       "the set of session capabilities the real harness advertises changed",
     );
 

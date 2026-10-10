@@ -11,35 +11,50 @@ import {
   verifyPosture,
 } from "./posture.js";
 
-// A stand-in for `opencode debug agent`, so the parser and the refusal path are
+// A stand-in for `opencode debug agents`, so the parser and the refusal path are
 // exercised without a live harness. The real resolver is covered separately
 // against the installed binary in posture-opencode.test.ts.
+//
+// The v2 resolver lists every agent as `{ id, permissions }`, the permission
+// name lives in `action`, its pattern in `resource`, and the verdict in
+// `effect`. The resolver picks the agent whose `id` matches the one it was
+// asked for, so each fixture carries exactly one agent, under the name the
+// test asks for.
 const FIXTURES: Record<string, unknown> = {
-  build: { permission: [{ permission: "*", action: "allow", pattern: "*" }] },
-  narrow: {
-    permission: [
-      { permission: "read", action: "allow", pattern: "*" },
-      { permission: "edit", action: "deny", pattern: "*" },
-      { permission: "bash", action: "ask", pattern: "*" },
-    ],
-  },
-  bashallow: {
-    permission: [
-      { permission: "read", action: "allow", pattern: "*" },
-      { permission: "bash", action: "allow", pattern: "*" },
-    ],
-  },
-  scoped: {
-    permission: [
-      { permission: "external_directory", action: "allow", pattern: "/tmp/*" },
-    ],
-  },
-  plan: {
-    permission: [
-      { permission: "*", action: "allow", pattern: "*" },
-      { permission: "edit", action: "deny", pattern: "*" },
-    ],
-  },
+  build: [
+    {
+      id: "build",
+      permissions: [{ action: "*", resource: "*", effect: "allow" }],
+    },
+  ],
+  narrow: [
+    {
+      id: "narrow",
+      permissions: [
+        { action: "read", resource: "*", effect: "allow" },
+        { action: "edit", resource: "*", effect: "deny" },
+        { action: "bash", resource: "*", effect: "ask" },
+      ],
+    },
+  ],
+  bashallow: [
+    {
+      id: "bashallow",
+      permissions: [
+        { action: "read", resource: "*", effect: "allow" },
+        { action: "bash", resource: "*", effect: "allow" },
+      ],
+    },
+  ],
+  scoped: [
+    {
+      id: "scoped",
+      permissions: [
+        { action: "external_directory", resource: "/tmp/*", effect: "allow" },
+      ],
+    },
+  ],
+  // Parses as JSON, but it is not the agents array the resolver now emits.
   broken: "not-an-array",
   notjson: "__NOT_JSON__",
 };
@@ -78,8 +93,9 @@ if (name === "slow") {
     { mode: 0o755 },
   );
   return {
-    // The script itself is the command: the resolver appends `debug agent <n>`,
-    // so it must be directly executable rather than a node module path.
+    // The script itself is the command: the resolver appends `debug agents`
+    // and selects the agent from the output itself, so the command must be
+    // directly executable rather than a node module path.
     command: script,
     fixture: (name: string) => ({
       ...process.env,
@@ -98,7 +114,9 @@ function probeArgs(name: string) {
     command,
     cwd: process.cwd(),
     env: fixture(name),
-    agent: "build",
+    // The fixture's own agent id: the v2 resolver selects by id, so asking for
+    // the fixture's name is what makes each fixture answer for itself.
+    agent: name,
     timeoutMs: 5_000,
   };
 }
