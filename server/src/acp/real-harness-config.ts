@@ -17,11 +17,17 @@ import path from "node:path";
  */
 export const PINNED_MODEL = "opencode/step-5-preview-free";
 
-/** Writes the minimal project config that pins PINNED_MODEL into `cwd`. */
+/**
+ * Writes the minimal project config that pins PINNED_MODEL into `cwd`.
+ *
+ * `wx`, so a call against a directory that already has an `opencode.json` fails
+ * loudly instead of overwriting a project's real configuration. Every current
+ * caller passes a fresh `mkdtemp` directory.
+ */
 export function pinModelIn(cwd: string): void {
   writeFileSync(
     path.join(cwd, "opencode.json"),
     `${JSON.stringify({ model: PINNED_MODEL }, null, 2)}\n`,
-    "utf8",
+    { encoding: "utf8", flag: "wx" },
   );
 }

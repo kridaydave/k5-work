@@ -1546,7 +1546,7 @@ describe("the seat's resolved posture reaches the browser", () => {
   const namedRules = {
     permissions: [
       { action: "read", resource: "*", effect: "allow" },
-      { action: "bash", resource: "*", effect: "deny" },
+      { action: "shell", resource: "*", effect: "deny" },
       { action: "external_directory", resource: "/tmp/*", effect: "allow" },
       { action: "question", resource: "*", effect: "ask" },
     ],

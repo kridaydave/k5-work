@@ -25,8 +25,10 @@ import { readStoredTranscript, useStoredSessions } from "@/hooks/useStoredSessio
 import { cn } from "@/utils/cn";
 
 // Only `full` is servable: OpenCode resolves a blanket `*: allow` as the first
-// rule, so the harness never asks and a narrower pill would be a promise k5
-// cannot keep. Measured on 2.0.24, see docs/posture-and-trust-decisions.md.
+// rule, and the posture check refuses a wildcard for `read` and `review` before
+// it reads any other rule, so a narrower pill would be a promise k5 cannot
+// keep. The harness does ask about some rules (`*.env` reads); the seat answers
+// `cancelled`. See docs/posture-and-trust-decisions.md.
 // Model and mode start empty and are filled from what the harness advertises.
 // Naming a vendor model up front would offer a choice that fails for anyone
 // without those credentials.

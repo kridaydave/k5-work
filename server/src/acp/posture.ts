@@ -63,6 +63,11 @@ export interface ResolvePostureOptions {
   env: NodeJS.ProcessEnv;
   /** Agent whose merged configuration governs the seat. */
   agent: string;
+  /**
+   * Budget for the whole resolve, cold-start retry included. It is not a
+   * per-attempt cap: a caller that can afford one resolver call cannot be made
+   * to wait twice because the harness answered empty on the first one.
+   */
   timeoutMs?: number;
 }
 
@@ -111,31 +116,29 @@ function runResolver(
 }
 
 /**
- * Runs the harness's own resolver in the seat's real environment. Anything
- * project-supplied (opencode.json, .opencode/agents, plugins) is part of the
- * command, which is the point: the merged result is what actually applies, so
- * an injected profile cannot be assumed to defeat an override.
- */
-/**
  * Reads the agents array, spending one retry on the harness's cold start.
  *
  * The harness answers the first `debug agents` in a project directory it has
  * not initialised with an empty array, and the full list on the very next
- * call; measured as call 1 returning 0 agents and call 2 returning 9 in every
- * fresh directory tried, so the retry is call-based rather than timed. An
- * empty list is not a posture, so the second call is spent before the posture
- * is declared unreadable. Returns null when both answers were empty.
+ * call; measured as call 1 returning 0 agents and call 2 returning every agent
+ * in every fresh directory tried (7 in a clean XDG sandbox, 9 on a machine with
+ * user config), so the retry is call-based rather than timed. An empty list is
+ * not a posture, so the second call is spent before the posture is declared
+ * unreadable. Returns null when both answers were empty.
+ *
+ * Both attempts share one `deadline`: the budget belongs to the resolve, so
+ * spending it on a retry cannot hand the harness a second full window.
  */
 async function readAgents(
   options: ResolvePostureOptions,
-  timeoutMs: number,
+  deadline: number,
 ): Promise<unknown[] | null> {
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const result = await runResolver(
       options.command,
       options.cwd,
       options.env,
-      timeoutMs,
+      Math.max(1, deadline - Date.now()),
     );
     if (!result.ok) throw new PostureUnverifiableError(result.reason);
 
@@ -156,11 +159,17 @@ async function readAgents(
   return null;
 }
 
+/**
+ * Runs the harness's own resolver in the seat's real environment. Anything
+ * project-supplied (opencode.json, .opencode/agents, plugins) is part of the
+ * command, which is the point: the merged result is what actually applies, so
+ * an injected profile cannot be assumed to defeat an override.
+ */
 export async function resolvePosture(
   options: ResolvePostureOptions,
 ): Promise<ResolvedPosture> {
-  const timeoutMs = options.timeoutMs ?? POSTURE_TIMEOUT_MS;
-  const agents = await readAgents(options, timeoutMs);
+  const deadline = Date.now() + (options.timeoutMs ?? POSTURE_TIMEOUT_MS);
+  const agents = await readAgents(options, deadline);
   if (agents === null) {
     throw new PostureUnverifiableError("resolver reported no agents to read");
   }
@@ -185,6 +194,8 @@ export async function resolvePosture(
   // The harness names the permission in `action`, its pattern in `resource`,
   // and the verdict in `effect`. Normalised here so the classification below
   // reads one shape and the harness's wire vocabulary stops at this function.
+  // The verdict is lowercased on the way in: a differently-cased action must
+  // not be silently dropped, because dropping an `allow` widens the posture.
   const rules = rawRules.map((rule) => {
     const r = isRecord(rule) ? rule : {};
     return {
@@ -199,17 +210,11 @@ export async function resolvePosture(
   let wildcardAllow = false;
   let unrecognisedActions = 0;
 
-  for (const rule of rules) {
-    const r = rule as { permission?: unknown; action?: unknown; pattern?: unknown };
-    // Compared case-insensitively: a differently-cased action must not be
-    // silently dropped, because dropping an `allow` widens the posture.
-    const action = typeof r.action === "string" ? r.action.toLowerCase() : "";
+  for (const { action, permission, pattern } of rules) {
     if (action !== "allow") {
       if (action !== "deny" && action !== "ask") unrecognisedActions += 1;
       continue;
     }
-    const permission = typeof r.permission === "string" ? r.permission : "";
-    const pattern = typeof r.pattern === "string" ? r.pattern : "*";
     if (permission === "" || permission === "*") {
       if (pattern === "*") {
         wildcardAllow = true;

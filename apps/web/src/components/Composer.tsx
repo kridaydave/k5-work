@@ -31,8 +31,9 @@ const MODELS_DISCOVERY_HINT = "Discovering models…";
 const MODELS_EMPTY_HINT = "No models available from this harness";
 
 // Only `full` is offered. OpenCode resolves a blanket `*: allow` as the first
-// rule, so the harness never asks and a narrower pill would promise something
-// k5 cannot enforce.
+// rule, and the posture check refuses a wildcard for `read` and `review` before
+// it reads any other rule, so a narrower pill would promise something k5 cannot
+// enforce. See docs/posture-and-trust-decisions.md.
 const PERMISSION_MODES: MenuItem[] = [
   { id: "full", label: "Full access", meta: "Read, edit, and run project commands" },
 ];

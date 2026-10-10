@@ -132,13 +132,29 @@ facts were re-measured rather than assumed. The resolver changed shape:
 agent as `{ id, permissions }`, with each rule naming the permission in `action`,
 its pattern in `resource`, and its verdict in `effect`. `server/src/acp/posture.ts`
 normalises that triple into the existing `ResolvedPosture` contract and selects
-the agent by `id`, so no consumer of that contract changed.
+the agent by `id`, so no consumer of that contract changed. The binary moved
+again to 2.0.26 before this was reviewed, and the facts below were read once
+more on it: the same six `build` rules, the same empty-then-full cold start.
 
-**Decision 1 still holds.** The `build` agent's first resolved rule is still the
-blanket `{"action": "*", "resource": "*", "effect": "allow"}`. The wildcard means
-the harness still never asks, so a `session/request_permission` gate still cannot
-supply enforcement, and `read` and `review` remain promises k5 cannot keep. The
-revisit condition in decision 1 has not fired.
+**Decision 1 still holds, but not for the reason decision 1 gives.** The `build`
+agent's first resolved rule is still the blanket
+`{"action": "*", "resource": "*", "effect": "allow"}`. It is not the only rule:
+`ask read *.env` and `ask read *.env.*` come after it, and a specific rule beats
+the wildcard exactly the way the `deny` rows in the table below do. So the
+harness does ask, about `.env` reads, and "the wildcard means the harness never
+asks" above is not what v2 answers. What keeps `read` and `review` unservable is
+`isPostureAcceptable`, which refuses a wildcard on its own before it reads any
+rule at all, so both profiles fail every seat opened on the default posture
+whether or not the harness asks. The revisit condition in decision 1 has not
+fired.
+
+**What happens when it does ask.** `AcpSeat.handshake` in
+`server/src/acp/acp-seat.ts` answers every `session/request_permission` with
+`outcome: "cancelled"`, because there is no permission screen to put in front of
+anyone. An agent that reaches for a `.env` file is refused mid-turn rather than
+granted it. Fail-closed, so not a hole, and narrower than the harness default,
+which is the safe direction to be wrong in. It is user-visible all the same: the
+turn stops on a file and nothing in the UI explains why.
 
 **What changed is the configuration route.** In a clean config sandbox
 (`XDG_CONFIG_HOME` and friends pointed at an empty tree, service port moved off

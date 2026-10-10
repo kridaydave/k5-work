@@ -95,7 +95,9 @@ describe("access profiles", () => {
   it("denies shell in every profile except full", () => {
     for (const label of ["read", "review"] as const) {
       // Both names, because v2 reports `shell` while the config key and older
-      // builds still say `bash`; denying only one would leave the other open.
+      // builds still say `bash`. The list is not what stops either of them:
+      // `isPostureAcceptable` only passes a capability named in `allow` or
+      // `ask`, so `shell` is refused under read because it is in neither.
       for (const name of ["bash", "shell"]) {
         assert.ok(
           resolveAccessProfile(label).deny.includes(name),
@@ -124,9 +126,9 @@ describe("posture acceptability", () => {
   });
 
   it("refuses a wildcard posture for the read profile", () => {
-    // This is what `opencode debug agent build` actually resolves to.
+    // This is what `opencode debug agents` actually resolves to for `build`.
     const result = isPostureAcceptable(
-      ["*", "bash", "edit"],
+      ["*", "shell", "edit"],
       resolveAccessProfile("read"),
     );
     assert.equal(result.ok, false);
