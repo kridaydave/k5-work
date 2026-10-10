@@ -87,8 +87,6 @@ Locked decisions: `docs/posture-and-trust-decisions.md`.
 ## Not done
 
 - [ ] Phase 5 — discovery and policy
-  - Search across stored transcripts. The list is recency-ordered and capped; a
-    query over the `events` table is what would back it.
   - A permission screen, if a harness ever asks. It needs the wire contract, the
     reducer state and the browser decision path back; today the refusal is
     unconditional.

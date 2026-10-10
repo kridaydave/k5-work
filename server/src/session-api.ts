@@ -240,9 +240,16 @@ export function handleSessionApiRequest(
           res.setHeader("Allow", "GET");
           sendJson(res, 405, { error: "Method not allowed" });
           return;
-        }        // Bounded by MAX_LISTED_SESSIONS inside the store, so the response cannot
+        }
+        // Bounded by MAX_LISTED_SESSIONS inside the store, so the response cannot
         // grow without limit as the workspace accumulates sessions.
-        const body = SessionListResponseSchema.parse({ sessions: store.list() });
+        //
+        // `q` turns the same read into a search, and the response is the same
+        // shape either way: rows, and a snippets array on each row that only a
+        // search fills. An empty search never falls back to the full list.
+        const query = new URL(req.url ?? "/", "http://k5.invalid").searchParams.get("q");
+        const sessions = query === null ? store.list() : store.search(query);
+        const body = SessionListResponseSchema.parse({ sessions });
         sendJson(res, 200, body);
         return;
       }

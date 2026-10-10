@@ -89,15 +89,25 @@ export default function App() {
     selectProject,
     openPath,
   } = useProjects();
+  const [search, setSearch] = useState("");
+  // Debounced, so a search request goes out once the typing has paused rather
+  // than once per keystroke.
+  const [searchQuery, setSearchQuery] = useState("");
+  useEffect(() => {
+    const timer = setTimeout(() => setSearchQuery(search.trim()), 200);
+    return () => clearTimeout(timer);
+  }, [search]);
+
   // The durable task list, read over HTTP with no harness process involved. The
   // sidebar is populated from disk, not from the live session alone, so a reload
   // shows the history that is actually there.
   const {
     sessions: storedSessions,
+    searching: storedSessionsSearching,
     error: storedSessionsError,
     remove: removeStored,
     refresh: refreshStored,
-  } = useStoredSessions();
+  } = useStoredSessions(searchQuery);
   // Re-read the transcript after a reconnect, before the new socket can deliver
   // anything: a turn that finished while the socket was down would otherwise be
   // silently lost, because the socket never replays and the store is the record.
@@ -247,6 +257,10 @@ export default function App() {
     const stored: Session[] = storedSessions.map((entry) => ({
       id: entry.storeId,
       title: entry.title,
+      snippets: entry.snippets?.map((snippet) => ({
+        role: snippet.role,
+        text: snippet.text,
+      })),
       meta: entry.turnCount === 1 ? "1 turn" : `${String(entry.turnCount)} turns`,
       group: entry.truncated || entry.droppedRecords > 0 ? "Incomplete" : "Tasks",
     }));
@@ -519,6 +533,11 @@ export default function App() {
           onSelectSession={handleSelectSession}
           onRemoveSession={handleRemoveSession}
           storedSessionsError={storedSessionsError}
+          // Passed so a search that finds nothing is not reported as an empty
+          // workspace. The rows themselves are already the filtered answer; this
+          // only tells the sidebar which of its two empty states to draw.
+          searchActive={storedSessionsSearching}
+          onSearchChange={setSearch}
           sessions={sidebarSessions}
           connection={state.connection}
         />

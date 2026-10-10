@@ -1,6 +1,7 @@
 import { afterEach, assert, describe, expect, it, vi } from "vitest";
+import { renderHook, waitFor } from "@testing-library/react";
 import type { SessionEventsResponse, ServerEvent } from "@k5-work/shared";
-import { readStoredTranscript, isUnrecorded } from "./useStoredSessions";
+import { readStoredTranscript, isUnrecorded, useStoredSessions } from "./useStoredSessions";
 
 const originalFetch = globalThis.fetch;
 let fetchCalls = 0;
@@ -309,5 +310,77 @@ describe("stored transcript ordering", () => {
     ]);
     const result = await readStoredTranscript("11111111-1111-4111-8111-111111111111");
     assert.equal(result.transcript.turns[0]?.assistantText, "thirdfourth");
+  });
+});
+
+// --- the query that leaves the browser ---
+
+describe("useStoredSessions", () => {
+  const summary = {
+    storeId: "11111111-1111-4111-8111-111111111111",
+    title: "a task",
+    projectId: "p-1",
+    projectName: "k5-work",
+    cwd: "/home/k5/code/k5-work",
+    harness: "opencode",
+    createdAt: "2026-10-08T00:00:00.000Z",
+    updatedAt: "2026-10-08T00:00:00.000Z",
+    turnCount: 1,
+    firstSeq: 1,
+    lastSeq: 1,
+    truncated: false,
+    droppedRecords: 0,
+  };
+
+  /** Serves one list response, recording the URLs that were asked for. */
+  function serveList(body: unknown): string[] {
+    const urls: string[] = [];
+    vi.stubGlobal("fetch", (url: string) => {
+      urls.push(String(url));
+      return Promise.resolve(
+        new Response(JSON.stringify(body), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+    });
+    return urls;
+  }
+
+  it("asks for the list with no query, and reports that it is not searching", async () => {
+    // A search is a different read from a list, and the difference has to be
+    // visible to the caller: an empty search result and an empty workspace are
+    // two facts.
+    const urls = serveList({ sessions: [summary] });
+    const view = renderHook(() => useStoredSessions());
+    await waitFor(() => assert.equal(view.result.current.sessions.length, 1));
+
+    assert.equal(view.result.current.searching, false, "no query, so not searching");
+    assert.equal(urls.length, 1);
+    assert.equal(urls[0], "/api/sessions", "one request, to the list");
+  });
+
+  it("sends the query to the store, and reports that it is searching", async () => {
+    const urls = serveList({
+      sessions: [{ ...summary, snippets: [{ seq: 1, ts: "t", role: "reply", text: "matched" }] }],
+    });
+    const view = renderHook(() => useStoredSessions("zeppelin"));
+    await waitFor(() => assert.equal(view.result.current.sessions.length, 1));
+
+    assert.equal(view.result.current.searching, true, "a query was given");
+    assert.equal(view.result.current.sessions[0]?.snippets?.length, 1, "and the snippets came back");
+    assert.equal(urls[0], "/api/sessions?q=zeppelin");
+  });
+
+  it("encodes a query rather than pasting it into the URL", async () => {
+    // A query with a space or an ampersand is a query, and a raw paste is how a
+    // second parameter gets invented.
+    const urls = serveList({ sessions: [] });
+    const view = renderHook(() => useStoredSessions("a task & more"));
+    await waitFor(() => assert.equal(view.result.current.loading, false));
+
+    assert.equal(urls[0], "/api/sessions?q=a%20task%20%26%20more");
+    assert.equal(view.result.current.sessions.length, 0);
+    assert.equal(view.result.current.searching, true, "still searching, just with nothing found");
   });
 });

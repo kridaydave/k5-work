@@ -4,7 +4,23 @@ import { cn } from "@/utils/cn";
 import type { Project } from "@k5-work/shared";
 import type { ConnectionState } from "@k5-work/shared";
 
-export type Session = { id: string; title: string; meta: string; group: string };
+export type SessionSnippet = {
+  /** Which side of the conversation the matched line came from. */
+  role: "prompt" | "reply";
+  text: string;
+};
+
+export type Session = {
+  id: string;
+  title: string;
+  meta: string;
+  group: string;
+  /**
+   * Matched lines, present only while the list came from a search. A plain list
+   * read has none, because there was nothing to match against.
+   */
+  snippets?: SessionSnippet[];
+};
 
 type SidebarProps = {
   open: boolean;
@@ -37,6 +53,19 @@ type SidebarProps = {
    * happened as if it had.
    */
   sessions: Session[];
+  /**
+   * The search box's text, as the user types it. The store searches the
+   * transcripts, so the query has to leave here rather than stay in the
+   * component's own state. Optional because nothing else needs it.
+   */
+  onSearchChange?: (value: string) => void;
+  /**
+   * True when the rows currently held are a search result rather than the full
+   * list, which is what tells the two empty states apart. The box's own text is
+   * not enough: it leads the server's answer, so a query that has been typed but
+   * not yet answered would still claim a miss.
+   */
+  searchActive?: boolean;
   connection?: ConnectionState;
 };
 
@@ -69,6 +98,8 @@ export function Sidebar({
   onRemoveSession,
   storedSessionsError,
   sessions,
+  onSearchChange,
+  searchActive = false,
   connection = "connecting",
 }: SidebarProps) {
   const [search, setSearch] = useState("");
@@ -84,6 +115,10 @@ export function Sidebar({
   }, []);
 
   const hidden = !open && compactViewport;
+  // The rows arrive already filtered when a search is on, because the store is
+  // what searches the transcripts. This local pass only trims what a client-side
+  // match can still narrow, which is nothing once the server has answered, so it
+  // exists to keep the live rows responsive while a query is in flight.
   const normalizedSearch = search.trim().toLowerCase();
   const groups: { label: string; sessions: Session[] }[] = groupSessions(sessions).map((group) => ({
     ...group,
@@ -91,7 +126,8 @@ export function Sidebar({
       (session) =>
         !normalizedSearch ||
         session.title.toLowerCase().includes(normalizedSearch) ||
-        session.meta.toLowerCase().includes(normalizedSearch),
+        session.meta.toLowerCase().includes(normalizedSearch) ||
+        session.snippets?.some((snippet) => snippet.text.toLowerCase().includes(normalizedSearch)) === true,
     ),
   })).filter((group) => group.sessions.length > 0);
   const visibleSessions: Session[] = groups.flatMap((group) => group.sessions);
@@ -182,7 +218,13 @@ export function Sidebar({
               <input
                 type="search"
                 value={search}
-                onChange={(event) => setSearch(event.target.value)}
+                onChange={(event) => {
+                  setSearch(event.target.value);
+                  // The store searches the transcripts, so the query leaves the
+                  // component here. The sidebar still holds its own copy to draw
+                  // and to clear, and mirrors what the caller is searching.
+                  onSearchChange?.(event.target.value);
+                }}
                 placeholder="Search tasks"
                 aria-label="Search tasks"
                 className="min-w-0 flex-1 bg-transparent text-[13px] text-white/90 placeholder:text-white/35 focus:outline-none"
@@ -193,7 +235,11 @@ export function Sidebar({
               type="button"
               aria-label="Expand and search tasks"
               title="Search tasks"
-              onClick={onToggle}
+              onClick={() => {
+                setSearch("");
+                onSearchChange?.("");
+                onToggle();
+              }}
               className="grid h-10 w-full cursor-pointer place-items-center rounded-xl text-white/45 transition hover:bg-white/[0.07] hover:text-white"
             >
               <SearchIcon className="h-4 w-4" />
@@ -321,6 +367,19 @@ export function Sidebar({
                                 </span>
                               </span>
                               <span className="mt-0.5 block pl-3.5 text-[11px] text-white/30">{session.meta}</span>
+                              {/* A search's matched lines. Rendered only when the
+                                  store sent them, so a plain list keeps its
+                                  two-line row. */}
+                              {session.snippets?.map((snippet) => (
+                                <span
+                                  key={`${snippet.role}-${snippet.text}`}
+                                  className="mt-1 block truncate pl-3.5 text-[11px] text-white/45"
+                                  title={snippet.text}
+                                >
+                                  {snippet.role === "prompt" ? "you: " : "agent: "}
+                                  {snippet.text}
+                                </span>
+                              ))}
                             </button>
                             {onRemoveSession !== undefined ? (
                               <button
@@ -348,7 +407,14 @@ export function Sidebar({
                 </p>
               ) : (
                 <p className="px-2 py-2 text-[12px] text-white/35">
-                  {sessions.length === 0 ? "No tasks yet." : "No matching tasks."}
+                  {/* Three states, not two messages. An empty workspace has no
+                      tasks; a search that missed has tasks but none matching;
+                      and while a search is in flight the rows are the filtered
+                      answer, so a query that has not answered yet still counts
+                      as a search rather than as an empty workspace. */}
+                  {sessions.length === 0 && !searchActive
+                    ? "No tasks yet."
+                    : "No matching tasks."}
                 </p>
               )}
             </section>

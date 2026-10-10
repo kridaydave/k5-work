@@ -2040,3 +2040,125 @@ test("the shipped caps hold their documented relationships", () => {
   assert.ok(MAX_SESSION_BYTES < MAX_STORE_BYTES, "one session cannot outgrow the whole store");
   assert.ok(MAX_LINE_BYTES < MAX_SESSION_BYTES, "one record cannot outgrow a session");
 });
+
+// --- search ---
+
+const promptEvent = (seq: number, text: string): ServerEvent => ({
+  type: "turn.started",
+  sessionId: "ses_live",
+  turnId: `t-${seq}`,
+  userText: text,
+  attachments: [],
+});
+
+test("search finds a transcript word and names the message it is in", async () => {
+  // The whole feature, in one assertion set: the row comes back, and it says
+  // which side said the matched line and where that line sits in the log.
+  await withStore(async (store) => {
+    const session = await newSession(store, { title: "a task about a zeppelin" });
+    store.append(session.storeId, promptEvent(1, "find the docking manifest"));
+    store.append(session.storeId, delta(2, "the zeppelin docks at pier four"));
+    await store.flushMeta(session.storeId);
+
+    const hits = store.search("zeppelin");
+    assert.equal(hits.length, 1, "one session mentions it");
+    const [hit] = hits;
+    assert.ok(hit, "the hit exists");
+    assert.equal(hit.title, "a task about a zeppelin");
+    assert.equal(hit.snippets?.length, 1, "one matched line");
+    const [snippet] = hit.snippets ?? [];
+    assert.equal(snippet?.role, "reply", "it came from the assistant's side");
+    assert.equal(snippet?.seq, 2, "and it names the record it came from");
+    assert.ok(snippet?.text.includes("the zeppelin docks at pier four"), "with the line itself");
+    assert.ok(snippet?.ts.length > 0, "and a timestamp to go with it");
+  });
+});
+
+test("search matches the prompt as well as the reply", async () => {
+  // The title is capped at 200 characters, so a long prompt's tail exists only
+  // in the transcript. A search over replies alone would miss it.
+  await withStore(async (store) => {
+    const session = await newSession(store, { title: `${"z".repeat(200)}-tail` });
+    store.append(session.storeId, promptEvent(1, `${"z".repeat(200)} the unreachable tail word`));
+    await store.flushMeta(session.storeId);
+
+    const hits = store.search("unreachable");
+    assert.equal(hits.length, 1);
+    assert.equal(hits[0]?.snippets?.[0]?.role, "prompt");
+    assert.ok(hits[0]?.snippets?.[0]?.text.includes("the unreachable tail word"));
+  });
+});
+
+test("search caps the snippets and does not spill them between sessions", async () => {
+  // Two threads sharing a phrase is the case the snippet exists for, and the cap
+  // is what stops a row from becoming a document.
+  await withStore(async (store) => {
+    const first = await newSession(store, { title: "first thread" });
+    const second = await newSession(store, { title: "second thread" });
+    for (const session of [first, second]) {
+      for (let seq = 1; seq <= 5; seq += 1) {
+        store.append(session.storeId, delta(seq, `line ${seq} the same phrase again`));
+      }
+      await store.flushMeta(session.storeId);
+    }
+
+    const hits = store.search("phrase");
+    assert.equal(hits.length, 2, "both sessions mention it");
+    for (const hit of hits) {
+      assert.equal(hit.snippets?.length, 3, "capped at three");
+    }
+    // Distinct rows, and neither one's snippets are the other's.
+    assert.notEqual(hits[0]?.storeId, hits[1]?.storeId);
+  });
+});
+
+test("search does not treat a query as a pattern", async () => {
+  // `%` and `_` are LIKE metacharacters. Unescaped, "100%" matches every row in
+  // the store, which is the opposite of what was asked.
+  await withStore(async (store) => {
+    const plain = await newSession(store, { title: "plain" });
+    store.append(plain.storeId, delta(1, "no metacharacters here at all"));
+    await store.flushMeta(plain.storeId);
+
+    assert.deepEqual(store.search("100%"), [], "a percent matches literally, not everything");
+    assert.deepEqual(store.search("a_c"), [], "and so does an underscore");
+    assert.equal(store.search("metachar").length, 1, "while a real word still matches");
+  });
+});
+
+test("search leaves a plain list read alone", async () => {
+  // The two reads are the same route and the same response shape. A search
+  // result carries snippets and every row carries none.
+  await withStore(async (store) => {
+    const session = await newSession(store, { title: "one task" });
+    store.append(session.storeId, delta(1, "findme"));
+    await store.flushMeta(session.storeId);
+
+    for (const row of store.list()) {
+      assert.equal(row.snippets, undefined, "a list row has no snippets");
+    }
+    assert.equal(store.search("findme")[0]?.snippets?.length, 1, "a search row does");
+    assert.equal(store.search("   ").length, 0, "a blank search is not a full list");
+    assert.equal(store.search("nothing here").length, 0, "and a miss is empty, not everything");
+  });
+});
+
+test("search reads a long transcript without projecting the whole store", async () => {
+  // A store with many sessions where only one matches. The candidate set is
+  // narrowed by SQL before any transcript is read, so the answer does not cost
+  // every session's records.
+  await withStore(async (store) => {
+    for (let index = 0; index < 40; index += 1) {
+      const session = await newSession(store, { title: `filler ${index}` });
+      store.append(session.storeId, delta(1, `nothing to see in ${index}`));
+      await store.flushMeta(session.storeId);
+    }
+    const needle = await newSession(store, { title: "the one that matters" });
+    store.append(needle.storeId, delta(1, "the only matching line"));
+    await store.flushMeta(needle.storeId);
+
+    const hits = store.search("matching");
+    assert.equal(hits.length, 1, "one session matched, not forty");
+    assert.equal(hits[0]?.storeId, needle.storeId);
+  });
+});
