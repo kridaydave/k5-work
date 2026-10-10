@@ -30,9 +30,9 @@ import {
 const MODELS_DISCOVERY_HINT = "Discovering models…";
 const MODELS_EMPTY_HINT = "No models available from this harness";
 
-// Only `full` is offered. OpenCode 1.18.31 resolves a blanket `*: allow` and
-// drops any config that would narrow it, so a narrower pill would promise
-// something k5 cannot enforce.
+// Only `full` is offered. OpenCode resolves a blanket `*: allow` as the first
+// rule, so the harness never asks and a narrower pill would promise something
+// k5 cannot enforce.
 const PERMISSION_MODES: MenuItem[] = [
   { id: "full", label: "Full access", meta: "Read, edit, and run project commands" },
 ];

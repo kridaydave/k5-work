@@ -95,3 +95,22 @@ Locked decisions: `docs/posture-and-trust-decisions.md`.
     different question from "which task was about this"
   - The sidebar renders the matched line with the side that said it, debounced
     on its way out of the component
+
+- [x] Ported the seat and posture resolver to OpenCode 2.0.24
+  - `opencode debug agents` replaces `debug agent <name>`: it lists every agent,
+    and each rule names the permission in `action`, its pattern in `resource`,
+    its verdict in `effect`. `posture.ts` normalises that triple into the same
+    `ResolvedPosture` contract and selects the agent by `id`, so no consumer of
+    the contract changed
+  - `access.ts` learned the v2 names (`shell` for `bash`, `subagent` for
+    `task`) and the new `lsp` and `browser`, which no profile allows, so a
+    posture that allows one is refused visibly rather than granted silently
+  - The real-turn tests pin `opencode/step-5-preview-free` in their own project
+    config, so a machine's default model going deprecated cannot turn the suite
+    red again
+  - Trust decisions re-measured rather than assumed: the `build` wildcard is
+    still the first resolved rule, a top-level `permission` block is still
+    dropped, and an `agent.build.permission` block now merges. `full` stays the
+    only servable profile. Evidence in
+    `docs/posture-and-trust-decisions.md` section 5
+  - Research (cdres): `CD_res/implementation/opencode-v2-migration/opencode-v2-migration-research.md`

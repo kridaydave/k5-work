@@ -123,3 +123,57 @@ The HTTP surface additionally refuses any `Host` header outside the allowlist
 with `421`. A rebound DNS name makes a request same-origin, so that check — not
 CORS — is what stops a hostile page from reading the project list or opening
 arbitrary directories through `/api/projects/open`.
+
+## 5. Re-measured against OpenCode 2.0.24 (2026-10-10)
+
+Everything above was measured on 1.18.31. The harness moved to 2.0.24 and the
+facts were re-measured rather than assumed. The resolver changed shape:
+`opencode debug agent <name>` became `opencode debug agents`, which lists every
+agent as `{ id, permissions }`, with each rule naming the permission in `action`,
+its pattern in `resource`, and its verdict in `effect`. `server/src/acp/posture.ts`
+normalises that triple into the existing `ResolvedPosture` contract and selects
+the agent by `id`, so no consumer of that contract changed.
+
+**Decision 1 still holds.** The `build` agent's first resolved rule is still the
+blanket `{"action": "*", "resource": "*", "effect": "allow"}`. The wildcard means
+the harness still never asks, so a `session/request_permission` gate still cannot
+supply enforcement, and `read` and `review` remain promises k5 cannot keep. The
+revisit condition in decision 1 has not fired.
+
+**What changed is the configuration route.** In a clean config sandbox
+(`XDG_CONFIG_HOME` and friends pointed at an empty tree, service port moved off
+the machine's live server, project directory separate):
+
+| project `opencode.json` | resolved `build` rules |
+| --- | --- |
+| none | 6 rules, first is `* *=allow` |
+| `permission: {shell, edit: "deny"}` | the same 6 rules, unchanged |
+| `agent: {build: {permission: {shell, edit: "deny"}}}` | 8 rules, wildcard still first, then `shell *=deny`, `edit *=deny` |
+
+So a top-level `permission` block is still dropped, matching the 1.18.31
+measurement, and the agent-scoped block is now merged. The merged rules are all
+`deny`, and the wildcard stays first, so the direction of the change is
+narrowing: a project can shrink its own seat and cannot widen one. `opencode
+debug config` confirms the project document contributes
+`agents.build.permissions` in the third row.
+
+**What that does and does not mean for k5.** `resolvePosture` builds its grants
+from `allow` rules only, so a `deny` never appears in the k5 record. A project
+that narrows itself is read by k5 as the wildcard posture it already had, which
+is the safe direction: k5 never promises less reach than the harness could still
+grant. Decision 3 is unchanged in force. A project plugin is code the harness
+executes, which no permission vocabulary describes, and a narrowing config block
+is not a substitute for that. The plugin guard's comment was rewritten to say
+this in v2 terms rather than citing the dropped-config fact it was built on.
+
+**Plan agent.** Under `plan` the edit grant is still scoped rather than global
+(`/home/kriday/.opencode/plan/*` on this machine), and `shell` is not named, so
+everything still falls through the wildcard. Decision 1's note about `plan`
+stands as written.
+
+**Other v2 facts recorded.** `opencode acp` is unchanged, `protocolVersion` is
+still 1, `promptCapabilities` is still exactly `embeddedContext: true` and
+`image: true` (asserted against the real binary in
+`attachments-opencode.test.ts`), and the advertised session capabilities grew to
+`additionalDirectories`, `close`, `delete`, `fork`, `list`, `resume`. k5 reads
+`resume` and `close` and records the rest in that assertion so drift is loud.
