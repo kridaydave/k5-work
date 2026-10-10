@@ -43,7 +43,7 @@ export const SCENARIOS = [
 export type Scenario = (typeof SCENARIOS)[number];
 
 // Absent `type` is the documented "agent" default: the agent handles login
-// itself through `authenticate`. This is the shape OpenCode 1.18.31 returns.
+// itself through `authenticate`. This is the shape OpenCode 2.0.24 returns.
 const AGENT_AUTH_METHOD = { id: "fake-login", name: "Login with fake" };
 
 const TERMINAL_AUTH_METHOD = {
@@ -56,8 +56,8 @@ export function initializeResult(scenario: Scenario): Json {
   const base: Json = {
     protocolVersion: 1,
     agentInfo: { name: "FakeAgent", version: "0.0.0" },
-    // Real OpenCode 1.18.32 advertises loadSession plus
-    // {close, fork, list, resume}, so the default fake matches it and the
+    // Real OpenCode 2.0.24 advertises loadSession plus a session capability
+    // set wider than k5 reads, so the default fake matches it and the
     // capability gates are exercised on the happy path.
     agentCapabilities: {
       loadSession: true,

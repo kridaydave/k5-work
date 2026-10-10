@@ -10,10 +10,19 @@ export type ComposerAccessLabel = z.infer<typeof ComposerAccessLabelSchema>;
 
 /**
  * Permissions that grant real capability: reading, changing, or executing.
- * Verified against `opencode debug agent`, the resolved `permission` array
- * also contains control-flow gates (see below) that gate the agent's own
+ * Verified against `opencode debug agents`, whose rules name the permission in
+ * `action`, its pattern in `resource`, and the verdict in `effect`. The resolved
+ * set also contains control-flow gates (see below) that gate the agent's own
  * reasoning rather than its reach, and treating those as capabilities would
  * refuse every seat for no security benefit.
+ *
+ * The v2 harness renamed two of these and reports the new names: `bash` is
+ * reported as `shell` and `task` as `subagent`. Both old names stay listed,
+ * because the config key is still accepted and an older harness build still
+ * reports them. `lsp` and `browser` are new in v2 and are classified as
+ * capabilities, but deliberately absent from every profile's allow list below:
+ * k5 does not promise an LSP or a browser, so a posture that allows one is
+ * refused visibly instead of being granted silently.
  */
 export const CAPABILITY_PERMISSIONS = [
   "read",
@@ -24,11 +33,15 @@ export const CAPABILITY_PERMISSIONS = [
   "write",
   "patch",
   "bash",
+  "shell",
   "task",
+  "subagent",
   "todowrite",
   "skill",
   "webfetch",
   "websearch",
+  "lsp",
+  "browser",
   "invalid",
 ] as const;
 
@@ -85,7 +98,9 @@ export const ACCESS_PROFILES: Record<ComposerAccessLabel, AccessProfile> = {
     label: "read",
     description: "Read files only. No edits, no shell.",
     allow: READ_TOOLS,
-    deny: ["edit", "write", "patch", "bash", "task", "invalid"],
+    // `shell` is the v2 name of `bash` and `subagent` the v2 name of `task`;
+    // both are denied because both are the same reach either way.
+    deny: ["edit", "write", "patch", "bash", "shell", "task", "subagent", "invalid"],
     ask: ["external_directory", "doom_loop"],
     allowWildcard: false,
   },
@@ -93,7 +108,7 @@ export const ACCESS_PROFILES: Record<ComposerAccessLabel, AccessProfile> = {
     label: "review",
     description: "Read files and plan. Edits are proposed, never applied.",
     allow: REVIEW_TOOLS,
-    deny: ["bash", "task", "invalid"],
+    deny: ["bash", "shell", "task", "subagent", "invalid"],
     ask: ["edit", "write", "patch", "external_directory", "doom_loop"],
     allowWildcard: false,
   },
@@ -109,7 +124,10 @@ export const ACCESS_PROFILES: Record<ComposerAccessLabel, AccessProfile> = {
       "write",
       "patch",
       "bash",
+      "shell",
       "todowrite",
+      "task",
+      "subagent",
       "skill",
       "webfetch",
       "websearch",
@@ -131,11 +149,15 @@ export function resolveAccessProfile(
 /**
  * The only profiles a seat may be opened with.
  *
- * OpenCode 1.18.31 always resolves `*: allow` for its agents, and both
- * top-level and per-agent config blocks are dropped rather than merged, so the
- * harness never asks and a permission gate never fires. A narrower profile
- * would therefore be a promise k5 cannot keep. See
- * docs/posture-and-trust-decisions.md.
+ * OpenCode's `build` agent resolves `*: allow` by default, verified against
+ * 2.0.24 with no project config, and v2 merges project and agent permission
+ * config on top of that default rather than dropping it. A narrower profile is
+ * a promise the harness's own default contradicts: `isPostureAcceptable`
+ * refuses a wildcard for `read` and `review`, so both would fail every seat
+ * open on the default posture. A project can narrow the resolved posture, at
+ * which point the narrower profiles could be servable; that is a product
+ * decision to take deliberately, not a side effect of a harness upgrade.
+ * See docs/posture-and-trust-decisions.md.
  */
 export const SERVABLE_PROFILES = ["full"] as const satisfies readonly ComposerAccessLabel[];
 

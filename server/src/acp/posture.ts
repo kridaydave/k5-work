@@ -55,14 +55,19 @@ export function reportPosture(posture: ResolvedPosture): ResolvedPostureReport {
 export interface ResolvePostureOptions {
   /**
    * Harness binary only, e.g. "opencode". The resolver is a different
-   * subcommand from the seat's (`debug agent` vs `acp`), so passing the seat
-   * argv would ask `opencode acp debug agent ...`, which the CLI rejects.
+   * subcommand from the seat's (`debug agents` vs `acp`), so passing the seat
+   * argv would ask `opencode acp debug agents ...`, which the CLI rejects.
    */
   command: string;
   cwd: string;
   env: NodeJS.ProcessEnv;
   /** Agent whose merged configuration governs the seat. */
   agent: string;
+  /**
+   * Budget for the whole resolve, cold-start retry included. It is not a
+   * per-attempt cap: a caller that can afford one resolver call cannot be made
+   * to wait twice because the harness answered empty on the first one.
+   */
   timeoutMs?: number;
 }
 
@@ -70,9 +75,12 @@ const POSTURE_TIMEOUT_MS = 20_000;
 
 type RunResult = { ok: true; stdout: string } | { ok: false; reason: string };
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 function runResolver(
   command: string,
-  agent: string,
   cwd: string,
   env: NodeJS.ProcessEnv,
   timeoutMs: number,
@@ -82,11 +90,13 @@ function runResolver(
       resolve({ ok: false, reason: "no harness command configured" });
       return;
     }
-    // `debug agent` already emits JSON; it takes no --json flag and prints
-    // help instead, which would otherwise be parsed as a broken posture.
+    // `debug agents` already emits JSON; it takes no --json flag and prints
+    // help instead, which would otherwise be parsed as a broken posture. It
+    // lists every agent, so the one being verified is selected from the output
+    // rather than named on the command line.
     execFile(
       command,
-      ["debug", "agent", agent],
+      ["debug", "agents"],
       { cwd, env, timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024 },
       (error, stdout, stderr) => {
         if (!error) {
@@ -106,6 +116,50 @@ function runResolver(
 }
 
 /**
+ * Reads the agents array, spending one retry on the harness's cold start.
+ *
+ * The harness answers the first `debug agents` in a project directory it has
+ * not initialised with an empty array, and the full list on the very next
+ * call; measured as call 1 returning 0 agents and call 2 returning every agent
+ * in every fresh directory tried (7 in a clean XDG sandbox, 9 on a machine with
+ * user config), so the retry is call-based rather than timed. An empty list is
+ * not a posture, so the second call is spent before the posture is declared
+ * unreadable. Returns null when both answers were empty.
+ *
+ * Both attempts share one `deadline`: the budget belongs to the resolve, so
+ * spending it on a retry cannot hand the harness a second full window.
+ */
+async function readAgents(
+  options: ResolvePostureOptions,
+  deadline: number,
+): Promise<unknown[] | null> {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const result = await runResolver(
+      options.command,
+      options.cwd,
+      options.env,
+      Math.max(1, deadline - Date.now()),
+    );
+    if (!result.ok) throw new PostureUnverifiableError(result.reason);
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(result.stdout);
+    } catch {
+      throw new PostureUnverifiableError("resolver output was not JSON");
+    }
+
+    if (!Array.isArray(parsed)) {
+      throw new PostureUnverifiableError(
+        "resolver output was not the agents array the harness advertises",
+      );
+    }
+    if (parsed.length > 0) return parsed;
+  }
+  return null;
+}
+
+/**
  * Runs the harness's own resolver in the seat's real environment. Anything
  * project-supplied (opencode.json, .opencode/agents, plugins) is part of the
  * command, which is the point: the merged result is what actually applies, so
@@ -114,44 +168,53 @@ function runResolver(
 export async function resolvePosture(
   options: ResolvePostureOptions,
 ): Promise<ResolvedPosture> {
-  const timeoutMs = options.timeoutMs ?? POSTURE_TIMEOUT_MS;
-  const result = await runResolver(
-    options.command,
-    options.agent,
-    options.cwd,
-    options.env,
-    timeoutMs,
+  const deadline = Date.now() + (options.timeoutMs ?? POSTURE_TIMEOUT_MS);
+  const agents = await readAgents(options, deadline);
+  if (agents === null) {
+    throw new PostureUnverifiableError("resolver reported no agents to read");
+  }
+
+  const agent = agents.find(
+    (entry): entry is Record<string, unknown> =>
+      isRecord(entry) && entry["id"] === options.agent,
   );
-  if (!result.ok) throw new PostureUnverifiableError(result.reason);
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(result.stdout);
-  } catch {
-    throw new PostureUnverifiableError("resolver output was not JSON");
+  if (agent === undefined) {
+    // Named, not assumed: an agent that has since been renamed or removed must
+    // not silently fall through to a different agent's posture.
+    throw new PostureUnverifiableError(
+      `resolver listed no agent named "${options.agent}"`,
+    );
   }
 
-  const rules = (parsed as { permission?: unknown }).permission;
-  if (!Array.isArray(rules)) {
-    throw new PostureUnverifiableError("resolver output had no permission array");
+  const rawRules = agent["permissions"];
+  if (!Array.isArray(rawRules)) {
+    throw new PostureUnverifiableError("resolver output had no permissions array");
   }
+
+  // The harness names the permission in `action`, its pattern in `resource`,
+  // and the verdict in `effect`. Normalised here so the classification below
+  // reads one shape and the harness's wire vocabulary stops at this function.
+  // The verdict is lowercased on the way in: a differently-cased action must
+  // not be silently dropped, because dropping an `allow` widens the posture.
+  const rules = rawRules.map((rule) => {
+    const r = isRecord(rule) ? rule : {};
+    return {
+      permission: typeof r["action"] === "string" ? r["action"] : "",
+      pattern: typeof r["resource"] === "string" ? r["resource"] : "*",
+      action: typeof r["effect"] === "string" ? r["effect"].toLowerCase() : "",
+    };
+  });
 
   const allowedTools: string[] = [];
   const grants: AllowedGrant[] = [];
   let wildcardAllow = false;
   let unrecognisedActions = 0;
 
-  for (const rule of rules) {
-    const r = rule as { permission?: unknown; action?: unknown; pattern?: unknown };
-    // Compared case-insensitively: a differently-cased action must not be
-    // silently dropped, because dropping an `allow` widens the posture.
-    const action = typeof r.action === "string" ? r.action.toLowerCase() : "";
+  for (const { action, permission, pattern } of rules) {
     if (action !== "allow") {
       if (action !== "deny" && action !== "ask") unrecognisedActions += 1;
       continue;
     }
-    const permission = typeof r.permission === "string" ? r.permission : "";
-    const pattern = typeof r.pattern === "string" ? r.pattern : "*";
     if (permission === "" || permission === "*") {
       if (pattern === "*") {
         wildcardAllow = true;

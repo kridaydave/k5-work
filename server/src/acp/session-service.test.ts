@@ -72,11 +72,13 @@ async function start(options: {
   /** Test-only override of the one-prompt attachment budget. */
   maxPromptAttachmentBytes?: number;
   /**
-   * The rule list a real resolver reports. Omitted means the resolver cannot be
-   * read at all, which is the state every other scenario in this file is already
-   * in: `node debug agent build` is not a thing node does.
+   * The permission rules a real resolver reports, in the harness's own v2
+   * vocabulary: `action` names the permission, `resource` is its pattern, and
+   * `effect` is the verdict. Omitted means the resolver cannot be read at
+   * all, which is the state every other scenario in this file is already
+   * in: `node debug agents` is not a thing node does.
    */
-  postureRules?: unknown;
+  postureRules?: { readonly permissions: unknown };
 } = {}): Promise<Harness> {
   const projectDir = mkdtempSync(path.join(tmpdir(), "k5-session-"));
   if (options.pluginBearing) {
@@ -192,14 +194,21 @@ async function start(options: {
  * A harness command that answers both questions the seat runner asks of it.
  *
  * The seat is spawned as the whole argv, and the resolver is spawned as
- * `argv[0]` with `debug agent build` — one binary, two jobs, so a stand-in has
+ * `argv[0]` with `debug agents` — one binary, two jobs, so a stand-in has
  * to be both. `exec` on the seat path means the seat's pid is still the agent's,
  * so a reap asserted by pid is a reap of the harness and not of a wrapper.
  */
-function harnessWithResolver(dir: string, rules: unknown, seatArgv: string): string {
-  const fixture = path.join(dir, "resolved-posture.json");
+function harnessWithResolver(
+  dir: string,
+  rules: { readonly permissions: unknown },
+  seatArgv: string,
+): string {
+  const fixture = path.join(dir, "resolved-agents.json");
   const script = path.join(dir, "harness-with-resolver.sh");
-  writeFileSync(fixture, JSON.stringify(rules), "utf8");
+  // The v2 resolver lists every agent and the caller selects by id; the seat
+  // runner asks for `build`, so the fixture is the agents array carrying these
+  // permissions under that id.
+  writeFileSync(fixture, JSON.stringify([{ id: "build", permissions: rules.permissions }]), "utf8");
   writeFileSync(
     script,
     `#!/bin/sh
@@ -1530,15 +1539,16 @@ async function moveStoredCwd(
 }
 
 describe("the seat's resolved posture reaches the browser", () => {
-  // The OpenCode 1.18.31 shape, minus the wildcard: a named allow list with one
+  // The OpenCode 2.0.24 shape, minus the wildcard: a named allow list with one
   // capability scoped to a subtree, which is the case a list of bare permission
-  // names cannot express.
+  // names cannot express. Each rule names the permission in `action`, its
+  // pattern in `resource`, and the verdict in `effect`.
   const namedRules = {
-    permission: [
-      { permission: "read", action: "allow", pattern: "*" },
-      { permission: "bash", action: "deny", pattern: "*" },
-      { permission: "external_directory", action: "allow", pattern: "/tmp/*" },
-      { permission: "question", action: "ask", pattern: "*" },
+    permissions: [
+      { action: "read", resource: "*", effect: "allow" },
+      { action: "shell", resource: "*", effect: "deny" },
+      { action: "external_directory", resource: "/tmp/*", effect: "allow" },
+      { action: "question", resource: "*", effect: "ask" },
     ],
   };
 
@@ -1577,7 +1587,7 @@ describe("the seat's resolved posture reaches the browser", () => {
 
   it("reports a blanket wildcard as its own fact", async () => {
     const h = await start({
-      postureRules: { permission: [{ permission: "*", action: "allow", pattern: "*" }] },
+      postureRules: { permissions: [{ action: "*", resource: "*", effect: "allow" }] },
     });
     try {
       const ws = await h.connect("http://127.0.0.1:5173");
@@ -1594,7 +1604,7 @@ describe("the seat's resolved posture reaches the browser", () => {
   });
 
   it("claims nothing when the resolver could not be read", async () => {
-    // The default harness here is `node`, and `node debug agent build` fails, so
+    // The default harness here is `node`, and `node debug agents` fails, so
     // the seat is accepted on `full`'s tolerance of an unreadable posture. That
     // tolerance hands back `wildcardAllow: true` with nothing behind it, which is
     // exactly why the wire carries `verified`.

@@ -24,9 +24,11 @@ import { useProjects } from "@/hooks/useProjects";
 import { readStoredTranscript, useStoredSessions } from "@/hooks/useStoredSessions";
 import { cn } from "@/utils/cn";
 
-// Only `full` is servable: OpenCode 1.18.31 resolves a blanket `*: allow` and
-// drops any config that would narrow it, so a narrower pill would be a promise
-// k5 cannot keep. See docs/posture-and-trust-decisions.md.
+// Only `full` is servable: OpenCode resolves a blanket `*: allow` as the first
+// rule, and the posture check refuses a wildcard for `read` and `review` before
+// it reads any other rule, so a narrower pill would be a promise k5 cannot
+// keep. The harness does ask about some rules (`*.env` reads); the seat answers
+// `cancelled`. See docs/posture-and-trust-decisions.md.
 // Model and mode start empty and are filled from what the harness advertises.
 // Naming a vendor model up front would offer a choice that fails for anyone
 // without those credentials.

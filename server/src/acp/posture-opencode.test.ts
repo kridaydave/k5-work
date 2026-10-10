@@ -95,8 +95,8 @@ describe("real opencode posture", () => {
     assert.ok(editGrant, "plan does allow edit for plan files");
     assert.notEqual(editGrant.pattern, "*", "the edit grant must stay scoped");
     assert.ok(
-      !posture.grants.some((g) => g.permission === "bash"),
-      "bash is not named, so it falls through the wildcard to allow",
+      !posture.grants.some((g) => g.permission === "shell"),
+      "shell is not named, so it falls through the wildcard to allow",
     );
     await assert.rejects(
       verifyPosture({

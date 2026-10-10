@@ -18,10 +18,16 @@ const MAX_CONFIG_BYTES = 1024 * 1024;
  * Detects project-supplied behaviour that lives outside any k5 profile.
  *
  * A project's own config, agents, and plugins are inside the trust boundary.
- * Since OpenCode 1.18.31 drops permission config rather than merging it
- * (docs/posture-and-trust-decisions.md), a plugin is the remaining way to widen
- * behaviour once the configuration route is closed. Such a project is refused
- * and the offending signal is named.
+ * Measured against OpenCode 2.0.24 in a clean config sandbox: a top-level
+ * `permission` block is still dropped rather than merged, and an
+ * `agent.<name>.permission` block now merges into the resolved rules. Either
+ * way the wildcard `*: allow` stays the first rule, so a project's config can
+ * narrow its own seat and can never widen one past what the profile already
+ * grants. A plugin is the remaining way to widen behaviour, because it is code
+ * inside the harness and no permission vocabulary describes it. Such a project
+ * is refused and the offending signal is named. Re-measured evidence and the
+ * narrowed-versus-widened reasoning live in docs/posture-and-trust-decisions.md
+ * section 5.
  */
 export function findPluginSignals(projectRoot: string): PluginFinding[] {
   const found: PluginFinding[] = [];

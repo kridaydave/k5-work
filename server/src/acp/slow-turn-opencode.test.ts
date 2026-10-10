@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, describe, it, type TestContext } from "node:test";
 import { AcpSeat, type SeatStreamEvent, type SeatStopReason } from "./acp-seat.js";
+import { pinModelIn } from "./real-harness-config.js";
 import { spawnAcpChild, type AcpChild } from "./spawn.js";
 
 // The regression this file exists for, against the real binary.
@@ -122,6 +123,10 @@ let rigPromise: Promise<Rig> | null = null;
 function buildRig(): Promise<Rig> {
   rigPromise ??= (async () => {
     const cwd = mkdtempSync(path.join(tmpdir(), "k5-slow-turn-"));
+    // The turn must run on a model this test chose, not on whatever the
+    // machine defaults to: the previous default was deprecated and every real
+    // turn died with a provider error that had nothing to do with k5.
+    pinModelIn(cwd);
     const child = await spawnAcpChild({ argv: OPENCODE_ARGV, cwd });
     const textByTurn = new Map<string, string[]>();
     const seat = await AcpSeat.open(

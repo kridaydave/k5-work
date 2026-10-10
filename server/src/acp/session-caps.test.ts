@@ -47,7 +47,7 @@ async function startRig(
 // --- the capability probe, which is where a wrong answer becomes a wrong call ---
 
 test("capabilities are read leniently off the raw initialize result", () => {
-  // The real OpenCode 1.18.32 shape, from a live probe.
+  // The real OpenCode 2.0.24 shape, from a live probe.
   const real = probeCapabilities(initializeResult("ok"));
   assert.equal(real.loadSession, true);
   assert.equal(real.resume, true);

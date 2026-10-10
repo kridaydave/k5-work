@@ -56,10 +56,35 @@ describe("access profiles", () => {
   });
 
   it("classifies every name a real harness resolves", () => {
-    // These are the named `allow` permissions `opencode debug agent build`
-    // resolves today. If the harness adds one, the posture check must still
-    // treat it as a capability rather than ignoring it.
-    for (const name of ["external_directory", "plan_enter", "question", "read", "edit", "bash"]) {
+    // These are the named permissions `opencode debug agents` resolves in
+    // 2.0.24, probed by setting every candidate key in a project config and
+    // reading the resolved rules back. `shell` is the v2 name of `bash` and
+    // `subagent` the v2 name of `task`; `lsp` and `browser` are new. If the
+    // harness adds one, the posture check must still treat it as a capability
+    // rather than ignoring it.
+    for (const name of [
+      "external_directory",
+      "plan_enter",
+      "plan_exit",
+      "question",
+      "doom_loop",
+      "read",
+      "edit",
+      "glob",
+      "grep",
+      "list",
+      "shell",
+      "bash",
+      "subagent",
+      "task",
+      "todowrite",
+      "skill",
+      "webfetch",
+      "websearch",
+      "lsp",
+      "browser",
+      "invalid",
+    ]) {
       assert.ok(
         isCapabilityPermission(name) || isControlFlowPermission(name),
         `${name} must be classified`,
@@ -69,12 +94,21 @@ describe("access profiles", () => {
 
   it("denies shell in every profile except full", () => {
     for (const label of ["read", "review"] as const) {
-      assert.ok(
-        resolveAccessProfile(label).deny.includes("bash"),
-        `${label} must deny bash`,
-      );
+      // Both names, because v2 reports `shell` while the config key and older
+      // builds still say `bash`. The list is not what stops either of them:
+      // `isPostureAcceptable` only passes a capability named in `allow` or
+      // `ask`, so `shell` is refused under read because it is in neither.
+      for (const name of ["bash", "shell"]) {
+        assert.ok(
+          resolveAccessProfile(label).deny.includes(name),
+          `${label} must deny ${name}`,
+        );
+      }
     }
-    assert.ok(!resolveAccessProfile("full").deny.includes("bash"));
+    for (const name of ["bash", "shell"]) {
+      assert.ok(!resolveAccessProfile("full").deny.includes(name));
+      assert.ok(resolveAccessProfile("full").allow.includes(name));
+    }
   });
 
   it("denies edits in the read profile", () => {
@@ -92,9 +126,9 @@ describe("posture acceptability", () => {
   });
 
   it("refuses a wildcard posture for the read profile", () => {
-    // This is what `opencode debug agent build` actually resolves to.
+    // This is what `opencode debug agents` actually resolves to for `build`.
     const result = isPostureAcceptable(
-      ["*", "bash", "edit"],
+      ["*", "shell", "edit"],
       resolveAccessProfile("read"),
     );
     assert.equal(result.ok, false);

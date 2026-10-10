@@ -190,7 +190,8 @@ k5's disk is one the harness provably cannot open, and a link renders as a real 
 while delivering nothing. `resource` is exactly the variant gated on `embeddedContext`, so
 that one capability covers every kind and a harness without it refuses the turn outright
 rather than accepting one that claims an attachment the model never saw. Real OpenCode
-1.18.32 advertises `embeddedContext: true`, so the path is live.
+advertises `embeddedContext: true`, measured on 1.18.32 when this was written and still
+true on 2.0.24, so the path is live.
 
 Attachment ids are k5-minted and opaque (`k5-attachment:<id>`). No filesystem path reaches
 a block, and a real 1x1 PNG was read back by the model through that scheme.
