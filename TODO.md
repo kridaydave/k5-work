@@ -95,10 +95,3 @@ Locked decisions: `docs/posture-and-trust-decisions.md`.
     different question from "which task was about this"
   - The sidebar renders the matched line with the side that said it, debounced
     on its way out of the component
-
-## Not done
-
-- [ ] Phase 5 — discovery and policy
-  - A permission screen, if a harness ever asks. It needs the wire contract, the
-    reducer state and the browser decision path back; today the refusal is
-    unconditional.
