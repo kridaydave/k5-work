@@ -46,8 +46,8 @@ never asks the harness to replay.
 A headless seat is short-lived, created on demand and reaped when the read is done, which
 for a continuation means the adopted seat is promoted rather than torn down. A read must
 not take a live seat slot, must not create a session, and must not leave a harness process
-behind. Headless opens are capped and concurrent, because a user clicking refresh
-repeatedly is a normal thing to do and a pile of harnesses is not.
+behind. Headless opens are capped and concurrent, because a user opening three tasks in
+a row is a normal thing to do and a pile of harnesses is not.
 
 The cap counts resident harness processes, not in-progress opens. It is released when
 the child is gone, or when a continuation promotes the seat and the pool starts

@@ -265,9 +265,8 @@ export class SeatRunner {
   /**
    * Opens a connection with no ACP session, for a read that must not create one.
    *
-   * A read needs a live agent, and the workspace's promise is that an empty hero
-   * costs no lasting harness process. So a read gets a seat of its own and is
-   * reaped as soon as it is done.
+   * A read needs a live agent, so it gets a seat of its own, and that seat is
+   * reaped as soon as the read is done.
    *
    * It deliberately takes no keyed reservation — that is what would let a read
    * block a real session. But a keyed reservation is not the only bound, and
@@ -286,8 +285,8 @@ export class SeatRunner {
     projectPath: string;
     access?: AccessProfile["label"];
     /**
-     * Where a promoted seat's turn events go. A read never runs a prompt and
-     * needs none; a continuation is about to run one, and a seat with no callback
+     * Where a promoted seat's turn events go. A headless open is always a
+     * continuation now, and it is about to run a prompt: a seat with no callback
      * drops every delta the harness produces for it.
      */
     onEvent?: (turnId: string, event: SeatStreamEvent) => void;

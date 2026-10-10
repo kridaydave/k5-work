@@ -374,7 +374,7 @@ export class AcpSeat {
             seat.context = ctx;
             if (mode === "headless") {
               // No session is created. The connection is still held for the
-              // seat's lifetime so a later adopt, or a list, has a live context.
+              // seat's lifetime so a later adopt has a live context.
               resolve({
                 sessionId: "",
                 configOptions: [],

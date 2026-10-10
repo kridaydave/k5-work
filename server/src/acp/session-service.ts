@@ -244,14 +244,10 @@ export function createSessionHandlers(
    * persisted: the recorder filters it out, and a transcript is the wrong home
    * for a property of the seat. `emit` already swallows a delivery failure, so
    * this can never fail the open that produced it.
-   *
-   * A null posture means the resolver was skipped for a read that runs no agent
-   * code, so there is nothing to report. It is not turned into a placeholder:
-   * claiming a posture nobody resolved is the failure this whole path guards.
    */
-  const publishPosture = (posture: ResolvedPosture | null): boolean => {
+  const publishPosture = (posture: ResolvedPosture): boolean => {
     const sessionId = state.sessionId;
-    if (sessionId === null || posture === null) return false;
+    if (sessionId === null) return false;
     return emit({ type: "session.posture", sessionId, posture: reportPosture(posture) });
   };
 
