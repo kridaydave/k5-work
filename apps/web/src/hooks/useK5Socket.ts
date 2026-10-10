@@ -459,13 +459,11 @@ export function useK5Socket(options: UseK5SocketOptions = {}): K5Socket {
     /**
      * Sends the continuation command, so the caller never builds a wire shape.
      *
-     * There is deliberately no `listSessions` here. The server implements
-     * `session.list` against the harness, but nothing in the browser asks for it:
-     * the sidebar is populated from the store over HTTP, because that is the list
-     * of transcripts that actually exist. A button that listed the harness's own
-     * sessions would show work k5 has no record of and cannot reopen. The command
-     * stays on the wire and stays tested until there is a screen that can be honest
-     * about what such a row would mean.
+     * There is deliberately no session listing here. The harness knows about
+     * sessions k5 never ran, and the sidebar is populated from the store because
+     * that is the list of transcripts that actually exist. Listing the harness's
+     * own sessions would show work k5 has no record of and cannot reopen, so
+     * there is nothing here to list and nothing to wait for.
      */
     loadSession: useCallback(
       (storeId: string) => send({ commandId: nextCommandId(), type: "session.load", storeId }),

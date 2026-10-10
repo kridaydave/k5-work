@@ -371,12 +371,10 @@ export function applyServerEvent(
         turnReason: isTurnTerminal(state.turnStatus) ? state.turnReason : event.reason,
       };
 
-    case "session.listed":
     case "session.loaded":
-      // Discovery and continuation are reported through command.result and the
-      // session's own events. Neither changes view state on its own: a listed
-      // session is not a session, and a loaded one announces itself with
-      // session.opened semantics on the same connection.
+      // Continuation is reported through command.result and the session's own
+      // events. It changes no view state on its own: a loaded session announces
+      // itself with session.opened semantics on the same connection.
       return state;
 
     case "session.updated":
@@ -413,13 +411,12 @@ export function applyServerEvent(
     case "command.result": {
       if (event.ok) return state;
       // A command that is not the turn must report into the session message and
-      // nothing else. A failed model change is about a model, and a failed list
-      // or continuation is about discovery; treating either as a turn failure
+      // nothing else. A failed model change is about a model, and a failed
+      // continuation is about discovery; treating either as a turn failure
       // killed the working dots and then dropped every remaining delta from a
       // harness that was still streaming, so a finished answer stayed truncated.
       if (
         commandScope === "session.configure" ||
-        commandScope === "session.list" ||
         commandScope === "session.load"
       ) {
         return {

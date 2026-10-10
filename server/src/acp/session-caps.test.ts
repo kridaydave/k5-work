@@ -50,7 +50,6 @@ test("capabilities are read leniently off the raw initialize result", () => {
   // The real OpenCode 1.18.32 shape, from a live probe.
   const real = probeCapabilities(initializeResult("ok"));
   assert.equal(real.loadSession, true);
-  assert.equal(real.list, true);
   assert.equal(real.resume, true);
   assert.equal(real.close, true);
   assert.equal(real.image, true);
@@ -58,17 +57,16 @@ test("capabilities are read leniently off the raw initialize result", () => {
   assert.deepEqual(real.mismatches, []);
 
   // Absent means unsupported, and `{}` means supported.
-  const empty = probeCapabilities({ agentCapabilities: { sessionCapabilities: { list: {}, resume: {} } } });
+  const empty = probeCapabilities({ agentCapabilities: { sessionCapabilities: { resume: {} } } });
   assert.equal(empty.loadSession, false);
-  assert.equal(empty.list, true);
   assert.equal(empty.resume, true);
   assert.equal(empty.close, false);
 
   // A harness that advertises nothing at all.
-  assert.equal(probeCapabilities({}).list, false);
-  assert.equal(probeCapabilities({ agentCapabilities: null }).loadSession, false);
-  assert.equal(probeCapabilities(null).list, false);
-  assert.equal(probeCapabilities("nonsense").list, false);
+  assert.equal(probeCapabilities({}).loadSession, false);
+  assert.equal(probeCapabilities({ agentCapabilities: null }).resume, false);
+  assert.equal(probeCapabilities(null).loadSession, false);
+  assert.equal(probeCapabilities("nonsense").resume, false);
 });
 
 test("a mis-shaped capability is reported and treated as unsupported, never thrown", () => {
@@ -77,11 +75,9 @@ test("a mis-shaped capability is reported and treated as unsupported, never thro
   // open entirely, bricking a harness that merely spelled it differently.
   const weird = probeCapabilities(initializeResult("weird-caps"));
   assert.equal(weird.loadSession, false, 'a string "true" is not a boolean');
-  assert.equal(weird.list, false, "true is not an empty capability object");
   assert.equal(weird.resume, false);
   assert.deepEqual([...weird.mismatches].sort(), [
     "loadSession",
-    "sessionCapabilities.list",
     "sessionCapabilities.resume",
   ]);
 
@@ -97,7 +93,6 @@ test("a seat reports the harness's real capabilities", async () => {
   const rig = await startRig("ok");
   try {
     assert.equal(rig.seat.capabilities.loadSession, true);
-    assert.equal(rig.seat.capabilities.list, true);
     assert.equal(rig.seat.capabilities.resume, true);
   } finally {
     await rig.close();
@@ -109,14 +104,9 @@ test("a harness advertising none of them gates every method", async () => {
   try {
     const caps = rig.seat.capabilities;
     assert.equal(caps.loadSession, false);
-    assert.equal(caps.list, false);
     assert.equal(caps.resume, false);
     // The spec is explicit that a client MUST NOT call a method the agent did
     // not advertise, so the gate fires before the wire.
-    await assert.rejects(
-      () => rig.seat.listSessions(),
-      (error: unknown) => error instanceof AcpCapabilityError && error.capability === "list",
-    );
     await assert.rejects(
       () => rig.seat.adopt("fake-session-1"),
       (error: unknown) => error instanceof AcpCapabilityError && error.capability === "resume",
@@ -133,7 +123,7 @@ test("a mis-shaped capability block opens the seat and refuses the method", asyn
   try {
     assert.equal(rig.seat.capabilities.loadSession, false);
     await assert.rejects(
-      () => rig.seat.listSessions(),
+      () => rig.seat.adopt("fake-session-1"),
       (error: unknown) => error instanceof AcpCapabilityError,
     );
   } finally {
@@ -142,65 +132,14 @@ test("a mis-shaped capability block opens the seat and refuses the method", asyn
 });
 
 test("a headless seat creates no ACP session", async () => {
-  // A sidebar that lists tasks must not leave a new harness session behind on
-  // every page load.
+  // A seat opened to adopt one that already exists must not also create one:
+  // the harness would bill a new session for a connection that only ever meant
+  // to resume an old one.
   const rig = await startRig("ok");
   try {
     assert.throws(() => rig.seat.sessionId, /seat has no session/);
-    // But it is a live connection, so the read works.
-    const sessions = await rig.seat.listSessions();
-    assert.ok(sessions.length > 0);
-  } finally {
-    await rig.close();
-  }
-});
-
-test("session/list is narrowed, bounded, and filtered by the seat's cwd", async () => {
-  const rig = await startRig("ok");
-  try {
-    // The seat sends its own cwd, and the agent filters on it: the third fixture
-    // lives in /somewhere/else and must not come back.
-    const mine = await rig.seat.listSessions();
-    assert.equal(mine.length, 2);
-    assert.deepEqual(
-      mine.map((s) => s.sessionId).sort(),
-      ["fake-session-1", "fake-session-3"],
-    );
-    const first = mine.find((s) => s.sessionId === "fake-session-1");
-    assert.equal(first?.cwd, rig.cwd);
-    assert.equal(first?.title, "A previous task");
-    assert.equal(first?.updatedAt, "2026-09-27T09:00:00.000Z");
-    // A session the harness has not named yet is kept, with the field null
-    // rather than an invented title.
-    assert.equal(mine.find((s) => s.sessionId === "fake-session-3")?.title, null);
-
-    // Every reported cwd is absolute, which is what the stored-cwd check needs.
-    for (const entry of mine) assert.ok(entry.cwd.startsWith("/"));
-
-    // And the cap is honoured.
-    assert.equal((await rig.seat.listSessions({ limit: 1 })).length, 1);
-  } finally {
-    await rig.close();
-  }
-});
-
-test("a session with no usable id or an absolute cwd is dropped, not half-kept", async () => {
-  const rig = await startRig("ok");
-  try {
-    // Exercised through the narrowing helper directly, because a real agent
-    // would have to be broken in a very specific way to send these.
-    const { toHarnessSessionInfo } = await import("./adopt.js");
-    assert.equal(toHarnessSessionInfo({ cwd: "/abs" }), null, "no id");
-    assert.equal(toHarnessSessionInfo({ sessionId: "s" }), null, "no cwd");
-    assert.equal(toHarnessSessionInfo({ sessionId: "s", cwd: "relative/path" }), null, "a relative cwd");
-    assert.equal(toHarnessSessionInfo({ sessionId: "", cwd: "/abs" }), null, "an empty id");
-    assert.equal(toHarnessSessionInfo(null), null);
-    assert.equal(toHarnessSessionInfo("nonsense"), null);
-    // An unparseable timestamp becomes null rather than a value that would make
-    // the row un-evictable by age.
-    const odd = toHarnessSessionInfo({ sessionId: "s", cwd: "/abs", updatedAt: "not a date" });
-    assert.equal(odd?.updatedAt, null);
-    assert.equal(odd?.title, null);
+    // But it is a live connection.
+    assert.ok(rig.seat.busy === false);
   } finally {
     await rig.close();
   }
@@ -259,10 +198,9 @@ test("a seat cannot adopt twice", async () => {
   }
 });
 
-test("a seat that has been closed refuses to list or adopt", async () => {
+test("a seat that has been closed refuses to adopt", async () => {
   const rig = await startRig("ok");
   await rig.seat.close();
-  await assert.rejects(() => rig.seat.listSessions(), /seat is closed/);
   await assert.rejects(() => rig.seat.adopt("fake-session-1"), /seat is closed/);
   rmSync(rig.cwd, { recursive: true, force: true });
 });

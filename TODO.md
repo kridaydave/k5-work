@@ -87,10 +87,6 @@ Locked decisions: `docs/posture-and-trust-decisions.md`.
 ## Not done
 
 - [ ] Phase 5 — discovery and policy
-  - The harness's own sessions are not listed. `session.list` is implemented and
-    tested against a real seat, but nothing in the browser asks for it, because a
-    row for a session k5 has no transcript of could not be reopened honestly. It
-    needs a decision about what such a row means before it gets a screen.
   - Search across stored transcripts. The list is recency-ordered and capped; a
     query over the `events` table is what would back it.
   - A permission screen, if a harness ever asks. It needs the wire contract, the

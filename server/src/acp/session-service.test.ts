@@ -1201,67 +1201,9 @@ async function waitForAll(
   }
 }
 
-// --- discovery and continuation ---
+// --- continuation ---
 
-describe("session discovery and continuation", () => {
-  it("lists harness sessions without creating one, and reaps the read seat", async () => {
-    // The workspace's promise is that an empty hero costs no harness process, so
-    // a list gets its own short-lived seat and leaves nothing behind.
-    const harness = await start({ record: true });
-    try {
-      const ws = await harness.connect("http://127.0.0.1:5173");
-      ws.send(JSON.stringify({ commandId: "c-1", type: "session.list", projectId: "p-1" }));
-      const listed = await waitFor(harness.events, "session.listed");
-      assert.equal(listed.type, "session.listed");
-      if (listed.type !== "session.listed") return;
-      assert.equal(listed.unsupported, false);
-      assert.ok(listed.sessions.length > 0, "the fake reports sessions for this cwd");
-      // No session was created by a read.
-      assert.equal(
-        harness.events.some((e) => e.type === "session.opened"),
-        false,
-        "listing must not open a session",
-      );
-      // The read seat must be reaped, asserted on the process rather than on the
-      // pool: a read takes no slot, so pool.activeCount is 0 whether or not the
-      // child died. The reviewer removed the reap from the built output and this
-      // assertion still passed.
-      assert.ok(harness.children.length > 0, "a list must have spawned a harness");
-      for (const child of harness.children) {
-        if (child.pid === undefined) continue;
-        await child.exited;
-        assert.equal(isAlive(child.pid), false, `read seat pid ${child.pid} is still running`);
-      }
-      ws.close();
-    } finally {
-      await harness.close();
-    }
-  });
-
-  it("reports an unsupportable harness as unsupported, not as an empty list", async () => {
-    // Only one of these two is a real answer, and the difference matters to a user.
-    const harness = await start({ scenario: "no-session-caps" });
-    try {
-      const ws = await harness.connect("http://127.0.0.1:5173");
-      ws.send(JSON.stringify({ commandId: "c-1", type: "session.list", projectId: "p-1" }));
-      const listed = await waitFor(harness.events, "session.listed");
-      assert.equal(listed.type, "session.listed");
-      if (listed.type !== "session.listed") return;
-      assert.equal(listed.unsupported, true);
-      assert.deepEqual(listed.sessions, []);
-      const result = await waitForCommand(harness.events, "c-1");
-      assert.equal(result.ok, true, "an unsupported capability is not a command failure");
-      for (const child of harness.children) {
-        if (child.pid === undefined) continue;
-        await child.exited;
-        assert.equal(isAlive(child.pid), false, `read seat pid ${child.pid} is still running`);
-      }
-      ws.close();
-    } finally {
-      await harness.close();
-    }
-  });
-
+describe("session continuation", () => {
   it("continues a stored task and refuses one whose project has moved", async () => {
     const harness = await start({ record: true });
     try {
@@ -1466,6 +1408,43 @@ describe("session discovery and continuation", () => {
       assert.equal(harness.children.length, 2, "and no third harness was spawned");
     } finally {
       for (const ws of sockets) ws.close();
+      await harness.close();
+    }
+  });
+
+  it("refuses to continue a task on a harness that cannot resume", async () => {
+    // The adopt is where the capability is found, and mapping that refusal onto
+    // a wire reason is the only thing the browser can render. Nothing else
+    // reaches this branch since the listing went: a continuation is the one
+    // path left that opens a headless seat and then discovers the harness
+    // cannot adopt with it.
+    const harness = await start({ record: true, scenario: "no-session-caps" });
+    try {
+      const store = harness.store;
+      assert.ok(store !== null);
+      const created = await store.create({
+        harness: "opencode",
+        harnessSessionId: "fake-session-1",
+        projectId: "p-1",
+        projectName: null,
+        cwd: harness.projectDir,
+        title: "a stored task",
+      });
+      const ws = await harness.connect("http://127.0.0.1:5173");
+      ws.send(
+        JSON.stringify({ commandId: "c-1", type: "session.load", storeId: created.storeId }),
+      );
+      const result = await waitForCommand(harness.events, "c-1");
+      assert.equal(result.ok, false);
+      assert.equal(result.reason, "capability-unsupported");
+      await waitUntil(() => harness.children.length > 0, "the read seat to spawn");
+      for (const child of harness.children) {
+        if (child.pid === undefined) continue;
+        await child.exited;
+        assert.equal(isAlive(child.pid), false, `read seat pid ${child.pid} outlived its refusal`);
+      }
+      ws.close();
+    } finally {
       await harness.close();
     }
   });

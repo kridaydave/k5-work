@@ -196,20 +196,6 @@ export const SessionCloseCommandSchema = z
 export type SessionCloseCommand = z.infer<typeof SessionCloseCommandSchema>;
 
 /**
- * Asks the harness what sessions it knows about for a project. The server opens
- * a short-lived headless seat for the read, so a list never creates a session
- * and never holds a pool slot.
- */
-export const SessionListCommandSchema = z
-  .object({
-    ...commandBase,
-    type: z.literal("session.list"),
-    projectId: z.string().min(1).max(256),
-  })
-  .strict();
-export type SessionListCommand = z.infer<typeof SessionListCommandSchema>;
-
-/**
  * Continues a stored session on the harness. The browser names a k5 store id,
  * never a harness session id: the harness id is opaque, harness-controlled, and
  * up to 256 chars, so it never crosses the wire as an addressable identity.
@@ -237,7 +223,6 @@ export const BROWSER_COMMAND_TYPES = [
   "session.prompt",
   "session.cancel",
   "session.close",
-  "session.list",
   "session.load",
 ] as const;
 
@@ -259,7 +244,6 @@ const BROWSER_COMMAND_SCHEMAS = {
   "session.prompt": SessionPromptCommandSchema,
   "session.cancel": SessionCancelCommandSchema,
   "session.close": SessionCloseCommandSchema,
-  "session.list": SessionListCommandSchema,
   "session.load": SessionLoadCommandSchema,
 } satisfies Record<BrowserCommandType, z.ZodTypeAny>;
 
@@ -269,7 +253,6 @@ const BrowserCommandUnionSchema = z.discriminatedUnion("type", [
   BROWSER_COMMAND_SCHEMAS["session.prompt"],
   BROWSER_COMMAND_SCHEMAS["session.cancel"],
   BROWSER_COMMAND_SCHEMAS["session.close"],
-  BROWSER_COMMAND_SCHEMAS["session.list"],
   BROWSER_COMMAND_SCHEMAS["session.load"],
 ]);
 
@@ -568,31 +551,6 @@ export const SessionPostureEventSchema = z
   .strict();
 export type SessionPostureEvent = z.infer<typeof SessionPostureEventSchema>;
 
-// What the harness reports for a project, from a short-lived read. Distinct from
-// a stored session on purpose: these are sessions k5 has no record of, and the
-// sidebar shows them differently rather than pretending they are history.
-export const HarnessSessionSchema = z
-  .object({
-    sessionId: z.string().min(1).max(256),
-    cwd: z.string().min(1).max(4096),
-    title: z.string().min(1).max(200).nullable(),
-    updatedAt: z.string().min(1).max(64).nullable(),
-  })
-  .strict();
-export type HarnessSession = z.infer<typeof HarnessSessionSchema>;
-
-export const SessionListedEventSchema = z
-  .object({
-    type: z.literal("session.listed"),
-    commandId: CommandIdSchema,
-    projectId: z.string().min(1).max(256),
-    sessions: z.array(HarnessSessionSchema).max(100),
-    /** True when the harness does not offer session/list at all. */
-    unsupported: z.boolean(),
-  })
-  .strict();
-export type SessionListedEvent = z.infer<typeof SessionListedEventSchema>;
-
 export const SessionLoadedEventSchema = z
   .object({
     type: z.literal("session.loaded"),
@@ -637,7 +595,6 @@ export const ServerEventSchema = z.discriminatedUnion("type", [
   TurnDeltaEventSchema,
   ToolUpdatedEventSchema,
   TurnCompletedEventSchema,
-  SessionListedEventSchema,
   SessionLoadedEventSchema,
   SeatReapedEventSchema,
   SessionUpdatedEventSchema,
