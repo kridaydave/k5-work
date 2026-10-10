@@ -84,6 +84,18 @@ Locked decisions: `docs/posture-and-trust-decisions.md`.
   - Component-level coverage for the composer, tool cards, attachments and the
     stored-session read path.
 
+- [x] Transcript search, so a stored task is findable by what it said
+  - `GET /api/sessions?q=...` on the existing route, same response shape, with
+    `snippets` present only on a row that came back from a search
+  - The store narrows candidates with a LIKE over `events.payload` before
+    reading any transcript, and escapes `%` and `_`
+  - Snippets come from prompts and replies only, matched per record so each one
+    names the sequence it came from, capped at three per session
+  - Tool calls are deliberately not searched: "which task read this file" is a
+    different question from "which task was about this"
+  - The sidebar renders the matched line with the side that said it, debounced
+    on its way out of the component
+
 ## Not done
 
 - [ ] Phase 5 — discovery and policy
