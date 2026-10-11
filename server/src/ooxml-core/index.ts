@@ -28,9 +28,17 @@ export type { RelEntry, RelTargetMode } from "./rels.js";
 export { ZipWriter, PINNED_MTIME, DEFAULT_LEVEL } from "./zip.js";
 export type { ZipAddOptions } from "./zip.js";
 export { PackageBuilder, CONTENT_TYPES_PATH } from "./package.js";
-export { assertValid, validateSpec, validateZipBytes } from "./validate.js";
+export type { PackageBuildOptions } from "./package.js";
+export {
+  assertValid,
+  MAX_XML_DEPTH,
+  MAX_XML_ELEMENTS,
+  validateSpec,
+  validateZipBytes,
+} from "./validate.js";
 export type {
   IssueKind,
+  MainRelationship,
   PackageSpecInput,
   SpecPart,
   SpecRel,

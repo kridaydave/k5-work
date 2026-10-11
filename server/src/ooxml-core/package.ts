@@ -19,6 +19,7 @@ import {
   resolveRelTarget,
 } from "./rels.js";
 import { assertValid, validateSpec, validateZipBytes } from "./validate.js";
+import type { MainRelationship } from "./validate.js";
 import { assertLegalXmlChars } from "./xml.js";
 import { ZipWriter } from "./zip.js";
 
@@ -65,6 +66,39 @@ function assertNoProtoKeys(input: unknown): void {
   }
 }
 
+export interface PackageBuildOptions {
+  /**
+   * Declares the relationship a reader follows to find the part it opens first,
+   * so a package that ships its document without pointing at it is refused
+   * instead of loading as a blank file. Left off, the builder stays generic
+   * over OPC content types and cannot know what the caller considers main.
+   */
+  readonly mainRelationship?: MainRelationship;
+}
+
+/**
+ * build() takes plain options rather than a Zod schema, so a caller can hand it
+ * anything. A malformed option is refused here with the same typed error as any
+ * other bad input, instead of surfacing as a TypeError from inside a gate.
+ */
+function assertMainRelationship(
+  option: MainRelationship | undefined,
+): MainRelationship | undefined {
+  if (option === undefined) return undefined;
+  if (typeof option !== "object" || option === null) {
+    throw new OoxmlError("E_REL_BAD_TARGET", "mainRelationship must be an object");
+  }
+  for (const field of ["type", "target"] as const) {
+    if (typeof option[field] !== "string" || option[field].trim().length === 0) {
+      throw new OoxmlError(
+        "E_REL_BAD_TARGET",
+        `mainRelationship.${field} must be a non-empty string`,
+      );
+    }
+  }
+  return option;
+}
+
 export class PackageBuilder {
   private readonly spec: OoxmlPackageSpec;
 
@@ -81,8 +115,9 @@ export class PackageBuilder {
 
   // Runs every write-time gate, then packs. Deterministic: same spec in,
   // same bytes out (sorted entries, pinned mtime, fixed levels).
-  build(): Uint8Array {
-    assertValid(validateSpec(this.spec));
+  build(options: PackageBuildOptions = {}): Uint8Array {
+    const mainRelationship = assertMainRelationship(options.mainRelationship);
+    assertValid(validateSpec(this.spec, { mainRelationship }));
     const parts = this.canonicalParts();
     const table = new ContentTypes();
     table.addDefault("rels", RELS_CONTENT_TYPE);
@@ -137,7 +172,15 @@ export class PackageBuilder {
       zip.add(p.name, p.xml, { level: compressionLevel(p.name) });
     }
     const bytes = zip.build();
-    assertValid(validateZipBytes(bytes));
+    // engineBuilt: these bytes are ours, packed from XML that was size-capped
+    // and validated a few lines above. The ratio heuristic would otherwise
+    // refuse a large empty-cell table as if it were a zip bomb.
+    assertValid(
+      validateZipBytes(bytes, {
+        engineBuilt: true,
+        mainRelationship,
+      }),
+    );
     return bytes;
   }
 

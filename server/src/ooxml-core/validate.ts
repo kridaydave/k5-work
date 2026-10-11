@@ -55,12 +55,32 @@ export interface PackageSpecInput {
   readonly partRels?: Readonly<Record<string, readonly SpecRel[]>>;
 }
 
+/**
+ * The relationship a reader follows to find the part it has to open first.
+ * The engine is generic over OPC content types and cannot know what a caller
+ * considers main, so a caller names the type and target it needs declared.
+ */
+export interface MainRelationship {
+  readonly type: string;
+  readonly target: string;
+}
+
 export interface SpecValidateOptions {
   readonly mainPart?: string;
+  readonly mainRelationship?: MainRelationship;
 }
 
 export interface ZipValidateOptions {
   readonly mainPart?: string;
+  readonly mainRelationship?: MainRelationship;
+  /**
+   * These bytes came out of our own ZipWriter, from size-capped XML that was
+   * validated before it was packed. The compression-ratio heuristic exists to
+   * catch a bomb in bytes somebody else wrote, and a highly repetitive but
+   * entirely legitimate document trips it, so it stays armed for every other
+   * caller. The size caps still apply either way; those are what bound memory.
+   */
+  readonly engineBuilt?: boolean;
 }
 
 const CONTENT_TYPES_PATH = "[Content_Types].xml";
@@ -82,8 +102,10 @@ const WORD_NAMESPACES = new Set([
   "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
   "http://purl.oclc.org/ooxml/wordprocessingml/main",
 ]);
-const MAX_XML_DEPTH = 256;
-const MAX_XML_ELEMENTS = 100_000;
+// Exported so a driver can refuse a document against the same numbers the
+// engine refuses it with, instead of guessing and letting the engine say no.
+export const MAX_XML_DEPTH = 256;
+export const MAX_XML_ELEMENTS = 100_000;
 
 class XmlLimitError extends Error {}
 
@@ -538,8 +560,8 @@ function checkRelationships(
   source: string,
   files: ReadonlyMap<string, string>,
   issues: Issues,
-): Set<string> {
-  const ids = new Set<string>();
+): Map<string, RelationshipEntry> {
+  const entries = new Map<string, RelationshipEntry>();
   const root = parsed.root;
   if (root.uri !== RELS_NS || root.local !== "Relationships") {
     issues.error(
@@ -547,7 +569,7 @@ function checkRelationships(
       `${path}: root must be Relationships in ${RELS_NS}`,
       path,
     );
-    return ids;
+    return entries;
   }
   if (hasNonWhitespaceText(root)) {
     issues.error("E_XML_MALFORMED", `${path}: Relationships cannot contain text`, path);
@@ -589,11 +611,11 @@ function checkRelationships(
       issues.error("E_REL_BAD_TARGET", `${path}: ${id} is not a valid relationship Id`, path);
       continue;
     }
-    if (ids.has(id)) {
+    if (entries.has(id)) {
       issues.error("E_REL_DUP_RID", `${path}: duplicate ${id}`, path);
       continue;
     }
-    ids.add(id);
+    entries.set(id, { id, type, target, mode });
     if (mode !== "Internal" && mode !== "External") {
       issues.error(
         "E_REL_BAD_TARGET",
@@ -622,12 +644,12 @@ function checkRelationships(
     }
     checkInternalTarget(`${path}: ${id}`, source, target, files, issues);
   }
-  return ids;
+  return entries;
 }
 
 function checkRelationshipReferences(
   documents: ReadonlyMap<string, ParsedXml>,
-  scopes: ReadonlyMap<string, Set<string>>,
+  scopes: ReadonlyMap<string, ReadonlyMap<string, RelationshipEntry>>,
   issues: Issues,
 ): void {
   for (const [path, parsed] of documents) {
@@ -700,6 +722,103 @@ function checkWordOrder(parsed: ParsedXml, path: string, issues: Issues): void {
       );
     }
   });
+}
+
+// Package-level relationships resolve against the package root rather than a
+// source part, so both gates name that root the same way.
+const PACKAGE_SOURCE = "package";
+
+interface DeclaredRel {
+  readonly type: string;
+  /** Resolved package path, or null when the target is external or malformed. */
+  readonly internal: string | null;
+}
+
+interface RelationshipEntry {
+  readonly id: string;
+  readonly type: string;
+  readonly target: string;
+  readonly mode: string;
+}
+
+/**
+ * Resolved path of an internal target, or null when there is nothing internal
+ * to resolve. A target that throws here is one the shape checks have already
+ * refused, so this reports nothing and only declines to walk it.
+ */
+function internalTarget(
+  source: string,
+  target: string,
+  mode: string | undefined,
+): string | null {
+  // A .rels file spells the mode "External"; a declared spec spells it
+  // "external". Both are the same thing here.
+  if (mode !== undefined && asciiLower(mode) === "external") return null;
+  if (isExternalTarget(target)) return null;
+  try {
+    return asciiLower(resolveRelTarget(source, target));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Walks out from the package relationships and names every part nothing
+ * reaches. Only the other direction used to be checked (a content-type
+ * override naming a part that does not exist), which is how word/styles.xml
+ * ships and then gets ignored. Relationship parts are exempt because OPC binds
+ * one to its source by naming convention, and [Content_Types].xml is named by
+ * no relationship at all.
+ */
+function checkReachability(
+  parts: ReadonlyMap<string, string>,
+  edges: ReadonlyMap<string, readonly DeclaredRel[]>,
+  issues: Issues,
+): void {
+  const reached = new Set<string>([""]);
+  const pending = [""];
+  while (pending.length > 0) {
+    const source = pending.pop();
+    if (source === undefined) break;
+    for (const rel of edges.get(source) ?? []) {
+      if (rel.internal === null || reached.has(rel.internal)) continue;
+      reached.add(rel.internal);
+      pending.push(rel.internal);
+    }
+  }
+  for (const [key, name] of parts) {
+    if (key === CONTENT_TYPES_PATH_LOWER || reached.has(key)) continue;
+    issues.error(
+      "E_PACKAGE_UNREACHABLE",
+      `${name}: no relationship points at this part`,
+      name,
+    );
+  }
+}
+
+function checkMainRelationship(
+  edges: ReadonlyMap<string, readonly DeclaredRel[]>,
+  required: MainRelationship,
+  issues: Issues,
+): void {
+  let want: string;
+  try {
+    want = asciiLower(resolveRelTarget(PACKAGE_SOURCE, required.target));
+  } catch (error) {
+    issues.error("E_REL_BAD_TARGET", `main relationship: ${errorMessage(error)}`, required.target);
+    return;
+  }
+  const type = asciiLower(required.type);
+  const declared = (edges.get("") ?? []).some(
+    (rel) => rel.internal === want && asciiLower(rel.type) === type,
+  );
+  if (!declared) {
+    issues.error(
+      "E_PACKAGE_MAIN_REL",
+      `package declares no ${required.type} relationship to ${required.target}`,
+      PACKAGE_RELS_PATH,
+    );
+  }
 }
 
 function checkDeclaredRelationship(
@@ -921,6 +1040,43 @@ export function validateSpec(
     }
   }
 
+  // Last, so a package whose relationships are already broken reports the
+  // specific broken relationship instead of the fact that nothing is reachable.
+  const edges = new Map<string, DeclaredRel[]>();
+  const addEdges = (source: string, rels: readonly SpecRel[] | undefined): void => {
+    for (const rel of rels ?? []) {
+      const list = edges.get(source) ?? [];
+      list.push({
+        type: rel.type,
+        internal: internalTarget(
+          source === "" ? PACKAGE_SOURCE : source,
+          rel.target,
+          rel.mode,
+        ),
+      });
+      edges.set(source, list);
+    }
+  };
+  addEdges("", spec.packageRels);
+  for (const [rawSource, rels] of Object.entries(spec.partRels ?? {})) {
+    try {
+      addEdges(asciiLower(toZipPath(rawSource)), rels);
+    } catch {
+      // The scope loop above reports the unusable source name.
+    }
+  }
+  // The main relationship is checked first because "you never declared it"
+  // explains a missing one better than "nothing is reachable" does.
+  if (options.mainRelationship !== undefined) {
+    checkMainRelationship(edges, options.mainRelationship, issues);
+  }
+  const parts = new Map<string, string>();
+  for (const [key, name] of files) {
+    if (key === CONTENT_TYPES_PATH_LOWER || key.endsWith(".rels")) continue;
+    parts.set(key, name);
+  }
+  checkReachability(parts, edges, issues);
+
   return issues.result();
 }
 
@@ -1028,7 +1184,11 @@ function inspectExtraFields(extra: Uint8Array): boolean | null {
   return false;
 }
 
-function inspectZip(data: Uint8Array, issues: Issues): ZipEntry[] | null {
+function inspectZip(
+  data: Uint8Array,
+  issues: Issues,
+  engineBuilt: boolean,
+): ZipEntry[] | null {
   if (data.byteLength < 22) {
     issues.error("E_ZIP_FORMAT", "file is too small to be a ZIP");
     return null;
@@ -1156,6 +1316,7 @@ function inspectZip(data: Uint8Array, issues: Issues): ZipEntry[] | null {
       return null;
     }
     if (
+      !engineBuilt &&
       method === 8 &&
       size >= 64 * 1024 &&
       (compressedSize === 0 ||
@@ -1406,7 +1567,7 @@ export function validateZipBytes(
     );
     return issues.result();
   }
-  const entries = inspectZip(data, issues);
+  const entries = inspectZip(data, issues, options.engineBuilt === true);
   if (entries === null) return issues.result();
 
   const exact = new Set(
@@ -1542,7 +1703,8 @@ export function validateZipBytes(
     if (parsed !== null) documents.set(entry.name, parsed);
   }
 
-  const scopes = new Map<string, Set<string>>();
+  const scopes = new Map<string, Map<string, RelationshipEntry>>();
+  const edges = new Map<string, DeclaredRel[]>();
   for (const entry of entries) {
     if (entry.isDirectory || !asciiLower(entry.name).endsWith(".rels")) continue;
     const parsed = documents.get(entry.name);
@@ -1563,9 +1725,32 @@ export function validateZipBytes(
         entry.name,
       );
     }
-    const ids = checkRelationships(entry.name, parsed, source, fileNames, issues);
-    scopes.set(asciiLower(entry.name), ids);
+    const rels = checkRelationships(entry.name, parsed, source, fileNames, issues);
+    scopes.set(asciiLower(entry.name), rels);
+    const key = source === "" ? "" : asciiLower(source);
+    const list = edges.get(key) ?? [];
+    for (const rel of rels.values()) {
+      list.push({
+        type: rel.type,
+        internal: internalTarget(
+          source === "" ? PACKAGE_SOURCE : source,
+          rel.target,
+          rel.mode,
+        ),
+      });
+    }
+    edges.set(key, list);
   }
+
+  const parts = new Map<string, string>();
+  for (const [lower, name] of fileNames) {
+    if (lower === CONTENT_TYPES_PATH_LOWER || lower.endsWith(".rels")) continue;
+    parts.set(lower, name);
+  }
+  if (options.mainRelationship !== undefined) {
+    checkMainRelationship(edges, options.mainRelationship, issues);
+  }
+  checkReachability(parts, edges, issues);
 
   checkRelationshipReferences(documents, scopes, issues);
   for (const [path, parsed] of documents) {

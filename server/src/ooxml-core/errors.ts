@@ -24,7 +24,9 @@ export type OoxmlErrorCode =
   | "E_XML_LIMIT"
   | "E_PACKAGE_MISSING_PART"
   | "E_PACKAGE_DUP_PART"
-  | "E_PACKAGE_ORDER";
+  | "E_PACKAGE_ORDER"
+  | "E_PACKAGE_MAIN_REL"
+  | "E_PACKAGE_UNREACHABLE";
 
 export class OoxmlError extends Error {
   readonly code: OoxmlErrorCode;

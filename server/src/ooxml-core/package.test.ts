@@ -14,6 +14,8 @@ const STYLES_REL =
   "http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles";
 const HYPERLINK =
   "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink";
+const IMAGE_REL =
+  "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image";
 const W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
 
 const DOC_XML =
@@ -119,7 +121,18 @@ describe("ooxml-core package builder (D-3)", () => {
       packageRels: [
         { type: OFFICE_DOC, target: "word/document.xml", mode: "internal" },
       ],
-      partRels: {},
+      // Every media part is pointed at, because a part no relationship reaches
+      // is refused. A real document.xml carries one image rel per image.
+      partRels: {
+        "word/document.xml": [
+          { type: IMAGE_REL, target: "media/a.png", mode: "internal" },
+          { type: IMAGE_REL, target: "media/b.jpg", mode: "internal" },
+          { type: IMAGE_REL, target: "media/c.jpeg", mode: "internal" },
+          { type: IMAGE_REL, target: "media/d.PNG", mode: "internal" },
+          { type: IMAGE_REL, target: "media/e.Jpeg", mode: "internal" },
+          { type: IMAGE_REL, target: "media/f.gif", mode: "internal" },
+        ],
+      },
     }).build();
     const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.length);
     const methods = new Map<string, number>();
@@ -264,17 +277,27 @@ describe("ooxml-core package builder (D-3)", () => {
     );
   });
 
-  it("emits a valid empty package rels file when no rels are declared", () => {
+  it("writes an empty Relationships part for a scope with no rels, and refuses a package that declares none", () => {
     const bytes = PackageBuilder.parse({
-      parts: [{ name: "word/document.xml", contentType: DOC_MAIN, xml: DOC_XML }],
-      packageRels: [],
-      partRels: {},
+      ...minimalSpec(),
+      partRels: { "word/document.xml": [] },
     }).build();
     const back = unzipSync(bytes);
-    assert.ok(Object.hasOwn(back, "_rels/.rels"));
-    const rels = strFromU8(back["_rels/.rels"]);
+    const rels = strFromU8(back["word/_rels/document.xml.rels"]);
     assert.ok(rels.includes("<Relationships"));
     assert.ok(!rels.includes("<Relationship "));
+    // No relationship at all means no reader can find the document, which is
+    // the repair-dialog package LibreOffice already refuses to open.
+    assert.throws(
+      () =>
+        PackageBuilder.parse({
+          parts: [{ name: "word/document.xml", contentType: DOC_MAIN, xml: DOC_XML }],
+          packageRels: [],
+          partRels: {},
+        }).build(),
+      (e: unknown) =>
+        e instanceof OoxmlError && e.code === "E_PACKAGE_UNREACHABLE",
+    );
   });
 
   it("refuses internal mode with an absolute-URL target", () => {
