@@ -11,7 +11,7 @@ import { mkdtempSync, readFileSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { DOCX_TOOL_ENV, type DocxDocument, type ResolvedPostureReport } from "@k5-work/shared";
+import { DOCX_TOOL_ENV, DOCX_TOOL_RATE_LIMIT, type DocxDocument, type ResolvedPostureReport } from "@k5-work/shared";
 import { buildDocx } from "../docx/driver.js";
 
 const CHILD = fileURLToPath(new URL("./docx-mcp.js", import.meta.url));
@@ -171,6 +171,40 @@ test("a traversal filename is an MCP error the harness can read", async (t) => {
   assert.match(text, /path, not a filename/);
   // The refusal is only real if nothing landed outside the project root.
   assert.equal(existsSync(path.join(path.dirname(root), "escape.docx")), false);
+});
+
+test("the served path counts calls: the 21st in one window is refused", async (t) => {
+  const root = mkdtempSync(path.join(tmpdir(), "k5-docx-mcp-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const pipe = new McpPipe(toolEnv(root));
+  t.after(() => pipe.close());
+  pipe.listen();
+  await handshake(pipe);
+
+  // The gate's rate limit is 20 calls per 10 seconds, and the counter lives
+  // in the child for the life of the process. A gate that defaulted to a
+  // fresh counter per call would serve all 21 — this is the test that
+  // distinguishes them. The same filename repeats, so calls 2..20 are
+  // served as reuses: a repeat is still a call, and it still counts.
+  for (let i = 1; i <= DOCX_TOOL_RATE_LIMIT; i += 1) {
+    const served = await pipe.request("tools/call", {
+      name: "create_docx",
+      arguments: { filename: "notes.docx", document: DOCUMENT },
+    });
+    assert.notEqual(served.result?.isError, true, `call ${String(i)} must be served`);
+  }
+  // One past the window's limit: the counter lives in the child, so this
+  // call is the 21st the process has admitted.
+  const refused = await pipe.request("tools/call", {
+    name: "create_docx",
+    arguments: { filename: "notes.docx", document: DOCUMENT },
+  });
+  const result = refused.result ?? {};
+  assert.equal(result.isError, true, "the 21st call must be refused");
+  const text = ((result.content ?? []) as { text?: string }[])[0]?.text ?? "";
+  assert.match(text, /capped at 20 calls per 10000 ms/);
+  // The served file is intact after the burst.
+  assert.deepEqual(readFileSync(path.join(root, "notes.docx")), Buffer.from(buildDocx(DOCUMENT)));
 });
 
 test("a child with no posture dies loudly instead of guessing", async (t) => {

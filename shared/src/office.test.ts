@@ -288,6 +288,22 @@ describe("office document model (D-6 unit 1)", () => {
     );
   });
 
+  it("caps the text a document carries, not just the elements it emits", () => {
+    // The element budget counts w:t elements, and one run is one element
+    // however long its text: 400 paragraphs of maximum-length runs are
+    // 12.8 million characters against 400 elements. Without a character
+    // budget that reaches the engine and the zip size caps behind it.
+    const longRun = (): unknown => run("x".repeat(MAX_RUN_CHARS));
+    const proseOf = (blocks: number): unknown =>
+      doc(Array.from({ length: blocks }, () => ({ type: "paragraph", runs: [longRun()] })));
+
+    // Inside the budget: 100 paragraphs of maximum runs is 800,000 chars.
+    assert.ok(DocxDocumentSchema.safeParse(proseOf(100)).success);
+    // Past it: 200 of them is 1.6 million, with the element count unchanged
+    // in kind — still just 200 paragraph elements.
+    assert.match(firstIssue(proseOf(200)), /characters of text/);
+  });
+
   it("weights a block by what it emits", () => {
     const weighted = (block: unknown) =>
       blockWeight(DocxDocumentSchema.parse(doc([block])).blocks[0] as Block);

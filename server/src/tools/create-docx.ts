@@ -80,8 +80,12 @@ function refuseFilename(filename: string): string | null {
  * spawned by the harness for one seat and dies with it, so the process *is*
  * the session scope. Keying on an id would mean inventing one and then
  * believing it.
+ *
+ * Exported so a caller that serves many calls from one process can build
+ * one window and hand it to every call. The default a lone call gets is a
+ * window of its own, which is only correct for a caller that calls once.
  */
-class FixedWindow {
+export class FixedWindow {
   private windowStart = Date.now();
   private accepted = 0;
 
@@ -207,7 +211,11 @@ export async function createDocx(
 
   // Written through a temp file and renamed, so a reader never sees a half
   // document and an interrupted call cannot leave a truncated .docx behind.
-  const temp = `${target}.${process.pid}.tmp`;
+  // Dot-prefixed: it lives in the project root for the moment it takes to
+  // write, and a harness listing that directory must not see a file it did
+  // not ask for and cannot account for. The name is derived from the
+  // validated filename plus this process's pid, so it stays one segment.
+  const temp = path.join(path.dirname(target), `.${parsed.data.filename}.${process.pid}.tmp`);
   try {
     await fsp.writeFile(temp, bytes);
     await fsp.rename(temp, target);

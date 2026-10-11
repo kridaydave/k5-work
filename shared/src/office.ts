@@ -53,6 +53,17 @@ export const MAX_RUN_CHARS = 8_000;
 /** Items in one list. */
 export const MAX_LIST_ITEMS = 6_000;
 /**
+ * Characters of run text in one whole document.
+ *
+ * The element budget is not a character budget: one run is one w:t element
+ * however long its text, so a document of few very long runs passes the
+ * engine's 100,000-element backstop while carrying tens of megabytes of
+ * text. A million characters is roughly two hundred dense pages, past any
+ * document a model should emit in one call, and it keeps the packed .docx
+ * inside the engine's own size caps with room to spare.
+ */
+export const MAX_DOCUMENT_CHARS = 1_000_000;
+/**
  * Nesting levels in one list. Nine, because that is what Word writes and what
  * a reader expects: a definition that declares fewer imports as plain
  * paragraphs with no list at all.
@@ -219,6 +230,32 @@ export function blockWeight(block: Block): number {
   }
 }
 
+/**
+ * How many characters of run text a block carries.
+ *
+ * A sibling of `blockWeight` for the same reason: the element budget counts
+ * w:t elements, and one run is one element however long its text. Only a
+ * character count bounds the text itself.
+ */
+export function blockChars(block: Block): number {
+  const runChars = (runs: readonly Run[]): number =>
+    runs.reduce((total, run) => total + run.text.length, 0);
+  switch (block.type) {
+    case "paragraph":
+    case "heading":
+      return runChars(block.runs);
+    case "list":
+      return block.items.reduce((total, item) => total + runChars(item.runs), 0);
+    case "table":
+      return block.rows.reduce(
+        (total, row) => total + row.reduce((cells, cell) => cells + runChars(cell.runs), 0),
+        0,
+      );
+    case "pageBreak":
+      return 0;
+  }
+}
+
 // --- document ---
 
 /**
@@ -287,6 +324,24 @@ export const DocxDocumentSchema = z
           `this document emits ${String(total)} paragraphs and cells, over the ` +
           `budget of ${String(MAX_DOCUMENT_CELLS)}. Shorten it rather than ` +
           `splitting it: a document this size stops being a document`,
+      });
+    }
+
+    // The character budget, for the same reason the element budget exists:
+    // an element count cannot see text length, and without this a document
+    // of a few very long runs reaches the engine while carrying megabytes.
+    const chars = document.blocks.reduce((sum, block) => sum + blockChars(block), 0);
+    if (chars > MAX_DOCUMENT_CHARS) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.too_big,
+        maximum: MAX_DOCUMENT_CHARS,
+        type: "string",
+        inclusive: true,
+        path: ["blocks"],
+        message:
+          `this document carries ${String(chars)} characters of text, over the ` +
+          `budget of ${String(MAX_DOCUMENT_CHARS)}. A document this long is ` +
+          `several books, not a document`,
       });
     }
   });

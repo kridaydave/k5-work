@@ -12,7 +12,7 @@ import {
   type DocxDocument,
   type ResolvedPostureReport,
 } from "@k5-work/shared";
-import { createDocx, type DocxToolLimits } from "./create-docx.js";
+import { createDocx, FixedWindow, type DocxToolLimits } from "./create-docx.js";
 import { buildDocx } from "../docx/driver.js";
 
 function posture(overrides: Partial<ResolvedPostureReport> = {}): ResolvedPostureReport {
@@ -135,6 +135,29 @@ test("a zero rate limit refuses before anything is written", () =>
     if (outcome.ok) return;
     assert.equal(outcome.code, "rate-limited");
     assert.equal(existsSync(path.join(root, "notes.docx")), false);
+  }));
+
+test("one shared window refuses past its limit, including repeats", () =>
+  withRoot(async (root) => {
+    // The window a multi-call caller must hand every call. Without it the
+    // gate defaults to a fresh counter per call and never refuses, so this
+    // is the test that distinguishes a working rate gate from a dead one:
+    // the first two calls succeed (the second as a reuse, which still
+    // counts), the third is refused.
+    const window = new FixedWindow(2, 10_000);
+    const args = { filename: "notes.docx", document: DOCUMENT };
+    const first = await createDocx(args, limits(root), window);
+    assert.equal(first.ok, true);
+    const second = await createDocx(args, limits(root), window);
+    assert.equal(second.ok, true);
+    if (!second.ok) return;
+    assert.equal(second.result.reused, true, "a repeat inside the window is served as a reuse");
+    const third = await createDocx(args, limits(root), window);
+    assert.equal(third.ok, false);
+    if (third.ok) return;
+    assert.equal(third.code, "rate-limited");
+    // The refused call wrote nothing and left the served file intact.
+    assert.equal(readFileSync(path.join(root, "notes.docx")).byteLength, first.ok ? first.result.byteLength : -1);
   }));
 
 test("never overwrites a file this tool did not write", () =>

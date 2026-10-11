@@ -763,6 +763,44 @@ test("an attachment's bytes can be read back by the one holding its id", async (
   }
 });
 
+test("a hostile attachment mime type is refused at the boundary", async () => {
+  const harness = await startHarness();
+  try {
+    const session = await openStoredSession(harness);
+    // The stored mime goes straight into a Content-Type header on read, and
+    // Node's setHeader throws on a control character: a CRLF accepted here
+    // would 503 every later GET of this attachment, not just this one. So
+    // the upload is the place it is refused — there is no safe read-time
+    // fallback once it is stored.
+    for (const mime of ["text/plain\r\nX-Injected: yes", "text/plain; charset=utf-8", "notatype"]) {
+      const query = new URLSearchParams({ name: "notes.txt", mime });
+      const uploaded = await send(
+        harness.url,
+        `/api/sessions/${session.storeId}/attachments?${query.toString()}`,
+        { method: "POST", body: Buffer.from("x") },
+      );
+      assert.equal(uploaded.status, 400, `${JSON.stringify(mime)} must be refused at upload`);
+    }
+    // The well-formed type still gets through, and reads back cleanly.
+    const query = new URLSearchParams({ name: "notes.txt", mime: "text/plain" });
+    const uploaded = await send(
+      harness.url,
+      `/api/sessions/${session.storeId}/attachments?${query.toString()}`,
+      { method: "POST", body: Buffer.from("x") },
+    );
+    assert.equal(uploaded.status, 200);
+    const manifest = uploaded.body as { attachmentId: string };
+    const read = await send(
+      harness.url,
+      `/api/sessions/${session.storeId}/attachments/${manifest.attachmentId}`,
+    );
+    assert.equal(read.status, 200);
+    assert.equal(read.contentType, "text/plain");
+  } finally {
+    await harness.close();
+  }
+});
+
 test("a hostile attachment name cannot break the download headers", async () => {
   const harness = await startHarness();
   try {

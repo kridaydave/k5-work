@@ -30,7 +30,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { createDocx } from "./create-docx.js";
+import { createDocx, FixedWindow } from "./create-docx.js";
 
 /**
  * The child's configuration, parsed from its environment.
@@ -68,6 +68,12 @@ export function createDocxToolServer(runtime: DocxToolRuntime): McpServer {
         "project root. It never overwrites a file it did not write.",
     },
   );
+  // One window for the life of this process. The gate's default is a window
+  // per call, which is only correct for a caller that calls once: this child
+  // serves every call the harness makes to it, so the counter has to outlive
+  // a single call or gate 4 never fires and a harness in a loop fills the
+  // disk. The process is the session scope — see FixedWindow.
+  const window = new FixedWindow(DOCX_TOOL_RATE_LIMIT, DOCX_TOOL_RATE_WINDOW_MS);
   server.registerTool(
     CREATE_DOCX_TOOL,
     {
@@ -81,13 +87,17 @@ export function createDocxToolServer(runtime: DocxToolRuntime): McpServer {
       outputSchema: CreateDocxResultSchema,
     },
     async (args: CreateDocxArgs) => {
-      const outcome = await createDocx(args, {
-        projectRoot: runtime.projectRoot,
-        posturePermitsWrites: posturePermitsWrites(runtime.posture),
-        postureVerified: runtime.posture.verified,
-        rateLimit: DOCX_TOOL_RATE_LIMIT,
-        rateWindowMs: DOCX_TOOL_RATE_WINDOW_MS,
-      });
+      const outcome = await createDocx(
+        args,
+        {
+          projectRoot: runtime.projectRoot,
+          posturePermitsWrites: posturePermitsWrites(runtime.posture),
+          postureVerified: runtime.posture.verified,
+          rateLimit: DOCX_TOOL_RATE_LIMIT,
+          rateWindowMs: DOCX_TOOL_RATE_WINDOW_MS,
+        },
+        window,
+      );
       if (!outcome.ok) {
         return {
           isError: true,

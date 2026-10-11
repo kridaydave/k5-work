@@ -151,10 +151,25 @@ function parseLimit(raw: string | null): number {
  * The upload's identity, which travels in the query because the body is the file
  * itself — not JSON, not multipart, and not base64, which would add a third again
  * to a 25 MB cap and buy nothing.
+ *
+ * `mime` is a bare `type/subtype` of RFC 2045 token characters, not a free
+ * string. The stored value goes straight into a `Content-Type` header on
+ * read, and Node's `setHeader` throws `ERR_INVALID_CHAR` on a control
+ * character: an upload carrying `\r\n` would poison every later GET of that
+ * attachment with a 503. Refusing it at the boundary is the only point that
+ * sees it before it is stored, and the same check at read time would be a
+ * second guess at a fact the schema already owns.
  */
 const UploadQuerySchema = z.object({
   name: z.string().min(1).max(200),
-  mime: z.string().min(1).max(120),
+  mime: z
+    .string()
+    .min(1)
+    .max(120)
+    .regex(
+      /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+\/[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/,
+      "the mime type must be a bare type/subtype of token characters",
+    ),
 });
 
 /**
