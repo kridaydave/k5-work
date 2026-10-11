@@ -232,6 +232,10 @@ describe("ooxml-core write-time validator (D-4)", () => {
           ),
         },
       ],
+      // A reader can only find the document through this, so a real spec has it.
+      packageRels: [
+        { type: OFFICE_DOC, target: "word/document.xml", mode: "internal" },
+      ],
     });
     assert.ok(result.ok, JSON.stringify(result.errors));
   });
@@ -555,7 +559,9 @@ describe("ooxml-core post-hoc validator (D-4)", () => {
           ],
           [],
         ),
-        "_rels/.rels": relationships([]),
+        "_rels/.rels": relationships([
+          { id: "rId1", type: IMAGE_REL, target: "word/data.bin" },
+        ]),
         "word/data.bin": "<not-xml>",
       }),
     );
