@@ -5,6 +5,7 @@ import {
   type ActiveSession,
   type ClientContext,
   type ContentBlock,
+  type McpServer,
   type SessionUpdate,
 } from "@agentclientprotocol/sdk";
 import type { AcpChild } from "./spawn.js";
@@ -73,6 +74,14 @@ export interface AcpSeatOptions {
   clientName?: string;
   openTimeoutMs?: number;
   turnTimeoutMs?: number;
+  /**
+   * MCP servers the harness should connect for this session. Handed verbatim
+   * to `session/new` and `session/resume`: a continuation is the same seat
+   * to the harness, so a tool offered at open must still be there when the
+   * session is adopted. Empty and absent both mean "none", which is the
+   * default because most seats offer nothing.
+   */
+  mcpServers?: McpServer[];
 }
 
 export interface AcpSeatInfo {
@@ -384,7 +393,16 @@ export class AcpSeat {
               return;
             }
 
-            const active = await ctx.buildSession(seat.options.cwd).start({
+            // A full request when the seat offers MCP servers, because
+            // `buildSession(cwd)` has no way to carry them: the tool a
+            // harness can use is part of what the session is, not an
+            // afterthought. The call is branched rather than passed a union,
+            // because an overloaded signature cannot take one.
+            const builder =
+              seat.options.mcpServers !== undefined && seat.options.mcpServers.length > 0
+                ? ctx.buildSession({ cwd: seat.options.cwd, mcpServers: seat.options.mcpServers })
+                : ctx.buildSession(seat.options.cwd);
+            const active = await builder.start({
               cancellationSignal: AbortSignal.timeout(seat.openTimeoutMs),
             });
             const created = active.newSessionResponse;
@@ -461,7 +479,11 @@ export class AcpSeat {
     try {
       response = (await context.request(
         "session/resume",
-        { sessionId, cwd: this.options.cwd, mcpServers: [] },
+        // The same MCP servers the session was opened with. An adopted
+        // session is a live one again, and a tool that vanished at the
+        // resume boundary is a tool the harness cannot use for the rest of
+        // the turn — the refusal would arrive as a mystery, mid-prompt.
+        { sessionId, cwd: this.options.cwd, mcpServers: this.options.mcpServers ?? [] },
         // Bounded, for the same reason a read is: an unanswered resume would hold
         // the child open and wedge the connection that asked.
         { cancellationSignal: AbortSignal.timeout(this.openTimeoutMs) },

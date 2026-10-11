@@ -16,11 +16,14 @@ import {
 import {
   PostureTooWeakError,
   PostureUnverifiableError,
+  reportPosture,
   verifyPosture,
   type ResolvedPosture,
 } from "./posture.js";
 import { describeFinding, findPluginSignals } from "./plugin-guard.js";
 import { AcpSeat, type AcpSeatInfo, type SeatStreamEvent } from "./acp-seat.js";
+import { docxToolSpec } from "../tools/docx-mcp-spec.js";
+import type { McpServer } from "@agentclientprotocol/sdk";
 import {
   SeatBusyError,
   SeatCapError,
@@ -228,11 +231,17 @@ export class SeatRunner {
 
     let child: AcpChild | null = null;
     try {
+      // The MCP spec is built from the posture that was just resolved, in
+      // report form: the child re-parses it from its environment, and the
+      // `verified` flag it carries is what lets the child say in its refusal
+      // whether the posture it enforced was observed or assumed.
+      const mcpServers = seatMcpServers(request.projectPath, profile, posture);
       child = await spawnAcpChild({ argv, cwd: request.projectPath, env });
       const acp = await AcpSeat.open(
         child,
         {
           cwd: request.projectPath,
+          mcpServers,
           ...(this.options.openDeadlineMs === undefined
             ? {}
             : { openTimeoutMs: this.options.openDeadlineMs }),
@@ -329,10 +338,15 @@ export class SeatRunner {
       });
       const child = await spawnAcpChild({ argv, cwd: input.projectPath, env });
       try {
+        // Same spec the live seat gets: a headless seat is about to adopt a
+        // session and run a prompt, and the tool must be there on
+        // `session/resume` just as it is on `session/new`.
+        const mcpServers = seatMcpServers(input.projectPath, profile, posture);
         const acp = await AcpSeat.openHeadless(
           child,
           {
             cwd: input.projectPath,
+            mcpServers,
             ...(this.options.openDeadlineMs === undefined
               ? {}
               : { openTimeoutMs: this.options.openDeadlineMs }),
@@ -397,6 +411,27 @@ export class SeatRunner {
     input.release?.();
     return seat;
   }
+}
+
+/**
+ * The MCP servers one seat offers its harness, from the seat's own facts.
+ *
+ * Empty when the posture grants no writes: the docx tool is closed, so
+ * offering it would only produce refusals. The spec builder decides that;
+ * this only adapts seat facts (project, profile, resolved posture) into the
+ * shape it takes.
+ */
+function seatMcpServers(
+  projectPath: string,
+  profile: AccessProfile,
+  posture: ResolvedPosture,
+): McpServer[] {
+  const spec = docxToolSpec({
+    projectRoot: projectPath,
+    profile: profile.label,
+    posture: reportPosture(posture),
+  });
+  return spec === null ? [] : [spec];
 }
 
 function classifyOpenFailure(err: unknown): SeatOpenError {
