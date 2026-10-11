@@ -4,6 +4,7 @@ import { SaxesParser } from "saxes";
 import { DocxDocumentSchema } from "@k5-work/shared";
 import { buildStylesXml } from "./parts.js";
 import { buildDocumentXml } from "./vocabulary.js";
+import { buildNumberingXml } from "./numbering.js";
 import { STYLE_IDS } from "./names.js";
 
 // What docDefaults sets for body text, in half-points. Named here so the
@@ -100,6 +101,13 @@ const PERMITTED_ORDER: Readonly<Record<string, ReadonlyArray<readonly string[]>>
   "w:style": [["w:name"], ["w:aliases"], ["w:basedOn"], ["w:next"], ["w:link"], ["w:qFormat"], ["w:locked"], ["w:pPr"], ["w:rPr"], ["w:tblPr"], ["w:trPr"], ["w:tcPr"], ["w:tblStylePr"]],
   "w:docDefaults": [["w:rPrDefault"], ["w:pPrDefault"]],
   "w:rPrDefault": [["w:rPr"]],
+  // Numbering. This is the sequence the research flags as the one no reader in
+  // this repo can check, so the table above is the only gate behind it.
+  "w:numbering": [["w:numPicBullet"], ["w:abstractNum"], ["w:num"]],
+  "w:abstractNum": [["w:nsid"], ["w:multiLevelType"], ["w:tmpl"], ["w:name"], ["w:styleLink"], ["w:numStyleLink"], ["w:lvl"]],
+  "w:lvl": [["w:start"], ["w:numFmt"], ["w:lvlRestart"], ["w:pStyle"], ["w:isLgl"], ["w:suff"], ["w:lvlText"], ["w:lvlPicBulletId"], ["w:legacy"], ["w:lvlJc"], ["w:pPr"], ["w:rPr"]],
+  "w:num": [["w:abstractNumId"], ["w:lvlOverride"]],
+  "w:numPr": [["w:ilvl"], ["w:numId"], ["w:numberingChange"], ["w:ins"]],
 };
 
 /**
@@ -108,7 +116,17 @@ const PERMITTED_ORDER: Readonly<Record<string, ReadonlyArray<readonly string[]>>
  * CT_Style's conditional formatting). Every other single-name group is a
  * single-occurrence child and two of them is a repair prompt.
  */
-const REPEATABLE_CHILDREN = new Set(["w:tr", "w:tc", "w:style", "w:tblStylePr"]);
+const REPEATABLE_CHILDREN = new Set([
+  "w:tr",
+  "w:tc",
+  "w:style",
+  "w:tblStylePr",
+  "w:lvl",
+  "w:abstractNum",
+  "w:num",
+  "w:numPicBullet",
+  "w:lvlOverride",
+]);
 
 function assertChildOrder(root: Node): void {
   walk(root, (node) => {
@@ -149,6 +167,16 @@ const RICH = {
     { type: "paragraph", runs: [{ text: "  indented\tcolumn\nsecond line  ", marks: ["code", "bold"] }] },
     { type: "pageBreak" },
     {
+      type: "list",
+      ordered: false,
+      items: [
+        { runs: [{ text: "alpha" }] },
+        { runs: [{ text: "beta" }], level: 2 },
+        { runs: [{ text: "gamma" }], level: 3 },
+      ],
+    },
+    { type: "list", ordered: true, items: [{ runs: [{ text: "one" }] }] },
+    {
       type: "table",
       columnWidths: [4675, 4675],
       headerRow: true,
@@ -165,10 +193,86 @@ function richXml(): string {
   return buildDocumentXml(DocxDocumentSchema.parse(RICH));
 }
 
+function richNumberingXml(): string {
+  const xml = buildNumberingXml(DocxDocumentSchema.parse(RICH).blocks);
+  assert.ok(xml !== null, "the rich fixture has lists");
+  return xml;
+}
+
 describe("docx vocabulary (D-6 unit 2)", () => {
   it("emits the elements in the order the content models permit", () => {
     assertChildOrder(parseXml(richXml()));
     assertChildOrder(parseXml(buildStylesXml()));
+    assertChildOrder(parseXml(richNumberingXml()));
+  });
+
+  it("points every list paragraph at a w:num that exists", () => {
+    // The same class of failure as an unresolved w:pStyle: a w:numId that
+    // names nothing renders as plain text with no bullet and no number, and
+    // nothing complains.
+    const numbering = all(richNumberingXml());
+    const numIds = new Set(
+      numbering.filter((node) => node.name === "w:num").map((node) => node.attrs["w:numId"]),
+    );
+    const abstractIds = new Set(
+      numbering
+        .filter((node) => node.name === "w:abstractNum")
+        .map((node) => node.attrs["w:abstractNumId"]),
+    );
+    const referenced = all(richXml())
+      .filter((node) => node.name === "w:numId")
+      .map((node) => node.attrs["w:val"]);
+    assert.ok(referenced.length > 0);
+    for (const id of referenced) {
+      assert.ok(id !== undefined && numIds.has(id), `w:numId ${String(id)} names no w:num`);
+    }
+    for (const node of numbering.filter((n) => n.name === "w:abstractNumId")) {
+      const value = node.attrs["w:val"];
+      assert.ok(
+        value !== undefined && abstractIds.has(value),
+        `w:abstractNumId ${String(value)} names no w:abstractNum`,
+      );
+    }
+  });
+
+  it("gives each list its own numId, so the second starts at one again", () => {
+    // Restart is a fresh numId, which is a fresh counter. No w:lvlOverride is
+    // needed, and asserting the ids differ is what proves the restart.
+    const document = DocxDocumentSchema.parse({
+      blocks: [
+        { type: "list", ordered: true, items: [{ runs: [{ text: "a" }] }] },
+        { type: "paragraph", runs: [{ text: "between" }] },
+        { type: "list", ordered: true, items: [{ runs: [{ text: "b" }] }] },
+      ],
+    });
+    const numbering = all(buildNumberingXml(document.blocks) ?? "");
+    const nums = numbering.filter((node) => node.name === "w:num");
+    assert.equal(nums.length, 2);
+    assert.notEqual(nums[0]?.attrs["w:numId"], nums[1]?.attrs["w:numId"]);
+
+    // Both share one abstract definition, and it starts every level at 1.
+    const abstractIds = nums.map((node) => node.children[0]?.attrs["w:val"]);
+    assert.deepEqual(abstractIds, ["1", "1"]);
+    const starts = numbering
+      .filter((node) => node.name === "w:start")
+      .map((node) => node.attrs["w:val"]);
+    assert.ok(starts.length > 0);
+    for (const value of starts) assert.equal(value, "1");
+
+    // And the paragraphs point at those two ids.
+    const ids = all(buildDocumentXml(document))
+      .filter((node) => node.name === "w:numId")
+      .map((node) => node.attrs["w:val"]);
+    assert.deepEqual(ids, ["1", "3"]);
+  });
+
+  it("writes no numbering part when the document has no list", () => {
+    assert.equal(buildNumberingXml([{ type: "pageBreak" }]), null);
+  });
+
+  it("maps the model's one-based level onto a zero-based w:ilvl", () => {
+    const nodes = all(richXml()).filter((node) => node.name === "w:ilvl");
+    assert.deepEqual(nodes.map((node) => node.attrs["w:val"]), ["0", "1", "2", "0"]);
   });
 
   it("gives the headings a size, not just bold", () => {
@@ -361,17 +465,26 @@ describe("docx vocabulary (D-6 unit 2)", () => {
     const names = new Set([
       ...all(documentXml).map((node) => node.name),
       ...all(stylesXml).map((node) => node.name),
+      ...all(richNumberingXml()).map((node) => node.name),
     ]);
     for (const banned of [
       "w:ins",
       "w:del",
       "w:commentRangeStart",
       "w:hyperlink",
-      "w:numPr",
       "w:latentStyles",
       "w:sectPrChange",
       "w:pPrChange",
       "w:rPrChange",
+      // Out of scope for v1: each is a feature this driver does not have.
+      "w:headerReference",
+      "w:footerReference",
+      "w:drawing",
+      "w:commentReference",
+      "w:hyperlink",
+      "w:bookmarkStart",
+      "w:tblCaption",
+      "w:tblDescription",
     ]) {
       assert.ok(!names.has(banned), `${banned} must never be emitted`);
     }

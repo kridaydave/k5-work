@@ -24,6 +24,14 @@ ZIP, so the caller never handles element order or relationship ids.
     },
     { "type": "pageBreak" },
     {
+      "type": "list",
+      "ordered": true,
+      "items": [
+        { "runs": [{ "text": "Europe" }] },
+        { "runs": [{ "text": "Asia" }], "level": 2 }
+      ]
+    },
+    {
       "type": "table",
       "columnWidths": [4675, 4675],
       "headerRow": true,
@@ -45,13 +53,19 @@ same JSON always produces the same bytes.
 
 ## Blocks
 
-`paragraph`, `heading`, `table`, `pageBreak`. There is deliberately no `list`
-yet. Numbering is a separate part with a strict child sequence and it ships in
-its own unit, so the model has no block the emitter cannot render.
+`paragraph`, `heading`, `table`, `list`, `pageBreak`. Image, link, quote and
+table of contents are deliberately absent: each is a new part with its own
+relationship and element-order rules, and the model has no block the emitter
+cannot honour.
 
 A `heading` takes a level of 1, 2 or 3, which map to the three heading styles
 the styles part declares. Paragraph style is `normal`, `title` or `quote`.
 Marks are `bold`, `italic`, `underline`, `strike` and `code`.
+
+A `list` is a real Word list, not a bullet character typed into the text. It is
+ordered or not, and each item nests by `level`, 1 through 9. Two lists of the
+same format in one document are two separate lists, so the second starts at one
+again.
 
 A cell holds runs, not blocks. Word requires a cell to end in a paragraph and
 the emitter supplies it.
@@ -71,13 +85,19 @@ the emitter supplies it.
 
 | Cap | Value |
 | --- | --- |
-| Blocks per document | 400 |
-| Runs per paragraph or heading | 40 |
+| Paragraphs, list items and table cells, whole document | 6,000 |
+| Blocks in one document | 400 |
+| Runs per paragraph, heading or list item | 40 |
 | Characters per run | 8,000 |
 | Cells per table | 6,000 |
 | Columns per table | 32 |
+| Items per list | 6,000 |
+| Nesting levels per list | 9 |
 
-These tighten the engine's own element budget of 100,000 elements per part. The
-worst case a document can reach is about 68,000 of them, and the engine is the
-backstop if that arithmetic is ever wrong. A refusal is the failure mode here,
-never a truncated document.
+The 6,000 is weighted: a paragraph, a list item and a table cell each count one,
+and a table contributes all of its cells. This tightens the engine's own budget
+of 100,000 elements per part, and the worst case a document can reach is about
+48,000 of them. Capping the block count alone would not: 400 blocks of
+full-size tables is 19 million elements, which the engine refuses at build time
+with an error naming a limit the model never mentioned. A refusal is the
+failure mode here, never a truncated document.

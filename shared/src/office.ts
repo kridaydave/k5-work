@@ -22,23 +22,42 @@ import { z } from "zod";
 // shared cannot import them, so the arithmetic below is stated here and the
 // driver asserts the two sides agree against the engine's exports.
 //
-// Worst case per text block: one w:p plus two elements per run (w:r and w:t),
-// so 1 + 2 * MAX_RUNS_PER_BLOCK. Worst case for a table: one w:tbl, a w:tblPr,
-// a w:tblGrid and its gridCol, then per row a w:tr and w:trPr, and per cell a
-// w:tc, w:tcPr, w:p, w:r and w:t. That is roughly 6 elements per cell, which
-// puts the cell cap at about 36,000 elements, and 400 full text blocks at
-// 32,400, for 68,400 of the engine's 100,000. The engine stays the backstop.
+// The binding one is the per-document cell budget, not the block count. A
+// block is not a unit of size: one paragraph is a handful of elements and one
+// table is thousands. Capping the block count alone let a document of 400
+// tables reach 19 million elements against the engine's 100,000, so every block
+// is weighted by what it actually emits and the totals are capped together.
+//
+// A weighted unit is one paragraph, one heading, one page break, one list item
+// or one table cell. The worst any of them reaches is about eight elements
+// (a cell is a w:tc, w:tcPr, w:tcW, w:p, w:pPr, w:r and w:t, plus a w:tr and
+// w:trPr shared across a row), so 6,000 units is about 48,000 elements. The
+// engine stays the backstop.
 
-/** Inline runs in one paragraph or heading. 40 runs is about 81 elements. */
+/** Inline runs in one paragraph, heading or list item. */
 export const MAX_RUNS_PER_BLOCK = 40;
-/** Blocks in one document. Caps total paragraph elements. */
+/** Top-level blocks in one document. A loose bound; the cell budget is real. */
 export const MAX_DOCUMENT_BLOCKS = 400;
-/** Cells in one table, spans included. Caps the table's element budget. */
+/**
+ * Weighted units in one whole document, where a table counts its cells and a
+ * list counts its items. This is the cap that keeps a document inside the
+ * engine's element budget.
+ */
+export const MAX_DOCUMENT_CELLS = 6_000;
+/** Cells in one table, spans included. Caps a single table's size. */
 export const MAX_TABLE_CELLS = 6_000;
 /** Columns in one table. Also bounds a single cell's colSpan. */
 export const MAX_TABLE_COLUMNS = 32;
 /** Characters in one run, which becomes one w:t. */
 export const MAX_RUN_CHARS = 8_000;
+/** Items in one list. */
+export const MAX_LIST_ITEMS = 6_000;
+/**
+ * Nesting levels in one list. Nine, because that is what Word writes and what
+ * a reader expects: a definition that declares fewer imports as plain
+ * paragraphs with no list at all.
+ */
+export const MAX_LIST_LEVELS = 9;
 
 // --- runs and marks ---
 
@@ -147,13 +166,58 @@ export const PageBreakBlockSchema = z
   .strict();
 export type PageBreakBlock = z.infer<typeof PageBreakBlockSchema>;
 
+/**
+ * A list item. It carries runs, not blocks, and nests by level rather than by
+ * containing another list, because w:numPr expresses depth through w:ilvl and
+ * a nested list would mean deciding what the level means anyway.
+ *
+ * Two lists of the same format are two separate w:num entries, so the second
+ * starts at one again. That is what "restart" means here: no w:lvlOverride is
+ * needed, because a fresh numId is a fresh counter.
+ */
+export const ListItemSchema = z
+  .object({
+    runs: z.array(RunSchema).max(MAX_RUNS_PER_BLOCK),
+    level: z.number().int().min(1).max(MAX_LIST_LEVELS).default(1),
+  })
+  .strict();
+export type ListItem = z.infer<typeof ListItemSchema>;
+
+export const ListBlockSchema = z
+  .object({
+    type: z.literal("list"),
+    /** false is a bullet list, true is a decimal numbered list. */
+    ordered: z.boolean().default(false),
+    items: z.array(ListItemSchema).min(1).max(MAX_LIST_ITEMS),
+  })
+  .strict();
+export type ListBlock = z.infer<typeof ListBlockSchema>;
+
 export const BlockSchema = z.discriminatedUnion("type", [
   ParagraphBlockSchema,
   HeadingBlockSchema,
   TableBlockSchema,
+  ListBlockSchema,
   PageBreakBlockSchema,
 ]);
 export type Block = z.infer<typeof BlockSchema>;
+
+/**
+ * How many weighted units a block spends against MAX_DOCUMENT_CELLS. A block
+ * is not a unit of size, so the budget has to count what each one emits.
+ */
+export function blockWeight(block: Block): number {
+  switch (block.type) {
+    case "paragraph":
+    case "heading":
+    case "pageBreak":
+      return 1;
+    case "table":
+      return block.rows.reduce((cells, row) => cells + row.length, 0);
+    case "list":
+      return block.items.length;
+  }
+}
 
 // --- document ---
 
@@ -207,5 +271,23 @@ export const DocxDocumentSchema = z
         }
       });
     });
+
+    // The whole-document budget, weighted by what each block emits. Without
+    // this, 400 blocks of full-size tables is a document the model happily
+    // accepts and the engine refuses at 100,000 elements.
+    const total = document.blocks.reduce((sum, block) => sum + blockWeight(block), 0);
+    if (total > MAX_DOCUMENT_CELLS) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.too_big,
+        maximum: MAX_DOCUMENT_CELLS,
+        type: "array",
+        inclusive: true,
+        path: ["blocks"],
+        message:
+          `this document emits ${String(total)} paragraphs and cells, over the ` +
+          `budget of ${String(MAX_DOCUMENT_CELLS)}. Shorten it rather than ` +
+          `splitting it: a document this size stops being a document`,
+      });
+    }
   });
 export type DocxDocument = z.infer<typeof DocxDocumentSchema>;

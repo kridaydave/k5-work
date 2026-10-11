@@ -13,6 +13,7 @@ export const XSI_NS = "http://www.w3.org/2001/XMLSchema-instance";
 
 export const MAIN_PART = "word/document.xml";
 export const STYLES_PART = "word/styles.xml";
+export const NUMBERING_PART = "word/numbering.xml";
 export const CORE_PART = "docProps/core.xml";
 
 // Content types are per part, not per extension, for all three of these. The
@@ -21,10 +22,13 @@ export const DOC_MAIN_CT =
   "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml";
 export const STYLES_CT =
   "application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml";
+export const NUMBERING_CT =
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml";
 export const CORE_CT = "application/vnd.openxmlformats-package.core-properties+xml";
 
 export const OFFICE_DOC_REL = `${RELS_NS}/officeDocument`;
 export const STYLES_REL = `${RELS_NS}/styles`;
+export const NUMBERING_REL = `${RELS_NS}/numbering`;
 export const CORE_PROPS_REL =
   "http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties";
 

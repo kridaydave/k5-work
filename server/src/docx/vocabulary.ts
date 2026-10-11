@@ -10,12 +10,14 @@ import type {
   Cell,
   DocxDocument,
   HeadingBlock,
+  ListBlock,
   Mark,
   ParagraphBlock,
   Run,
   TableBlock,
 } from "@k5-work/shared";
 import { doc, el, escText } from "../ooxml-core/xml.js";
+import { numIdForListBlock } from "./numbering.js";
 import {
   FOOTER_MARGIN,
   HEADER_MARGIN,
@@ -95,6 +97,31 @@ function buildHeading(block: HeadingBlock): string {
 /** A page break is a paragraph holding one run holding one w:br of type page. */
 function buildPageBreak(): string {
   return el("w:p", [], el("w:r", [], el("w:br", [["w:type", "page"]])));
+}
+
+/**
+ * Each item is its own paragraph carrying w:numPr, which names the w:num the
+ * numbering part declared for this list. CT_PPr puts pStyle first and numPr
+ * after it, and CT_NumPr puts ilvl before numId. The level is the model's
+ * one-based level minus one, since w:ilvl is zero-based.
+ */
+function buildList(block: ListBlock, numId: string): string {
+  return block.items
+    .map((item) => {
+      const properties = el(
+        "w:pPr",
+        [],
+        el("w:pStyle", [["w:val", STYLE_IDS.normal]]) +
+          el(
+            "w:numPr",
+            [],
+            el("w:ilvl", [["w:val", String(item.level - 1)]]) +
+              el("w:numId", [["w:val", numId]]),
+          ),
+      );
+      return el("w:p", [], properties + buildRuns(item.runs));
+    })
+    .join("");
 }
 
 function borderEdge(edge: string): string {
@@ -181,7 +208,7 @@ function buildTable(block: TableBlock): string {
   return el("w:tbl", [], properties + grid + rows);
 }
 
-function buildBlock(block: DocxDocument["blocks"][number]): string {
+function buildBlock(block: DocxDocument["blocks"][number], index: number): string {
   switch (block.type) {
     case "paragraph":
       return buildParagraph(block);
@@ -189,6 +216,8 @@ function buildBlock(block: DocxDocument["blocks"][number]): string {
       return buildHeading(block);
     case "table":
       return buildTable(block);
+    case "list":
+      return buildList(block, numIdForListBlock(index));
     case "pageBreak":
       return buildPageBreak();
   }
@@ -213,6 +242,7 @@ function sectionProperties(): string {
 }
 
 export function buildDocumentXml(document: DocxDocument): string {
-  const body = document.blocks.map(buildBlock).join("") + sectionProperties();
+  const body =
+    document.blocks.map(buildBlock).join("") + sectionProperties();
   return doc(el("w:document", [["xmlns:w", W_NS]], el("w:body", [], body)));
 }
