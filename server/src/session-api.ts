@@ -67,6 +67,26 @@ const MESSAGE_BY_CODE: Record<SessionStoreErrorCode, string> = {
   E_STORE_SNIPPET_UNREADABLE: "A matched line could not be read back",
 };
 
+/**
+ * RFC 6266 with the RFC 5987 extended form, because the name came off the wire
+ * at upload time and can hold quotes, backslashes and line breaks. Dropped into
+ * a header raw, a quote breaks the browser's parse and a line break either
+ * throws inside setHeader or, on a server that tolerates it, splits the
+ * response. The quoted form is ASCII-only by spec, so anything outside printable
+ * ASCII is replaced there and carried in the UTF-8 form instead.
+ */
+function contentDisposition(name: string): string {
+  const fallback =
+    name
+      .replace(/[^\x20-\x7e]+/g, "_")
+      .replace(/["\\]/g, "_")
+      .slice(0, 200) || "attachment";
+  // encodeURIComponent leaves an apostrophe alone, and RFC 5987 counts it as a
+  // delimiter, so it has to go.
+  const extended = encodeURIComponent(name).replace(/'/g, "%27");
+  return `attachment; filename="${fallback}"; filename*=UTF-8''${extended}`;
+}
+
 export function isSessionApiPath(pathname: string): boolean {
   return pathname === "/api/sessions" || pathname.startsWith("/api/sessions/");
 }
@@ -131,10 +151,25 @@ function parseLimit(raw: string | null): number {
  * The upload's identity, which travels in the query because the body is the file
  * itself — not JSON, not multipart, and not base64, which would add a third again
  * to a 25 MB cap and buy nothing.
+ *
+ * `mime` is a bare `type/subtype` of RFC 2045 token characters, not a free
+ * string. The stored value goes straight into a `Content-Type` header on
+ * read, and Node's `setHeader` throws `ERR_INVALID_CHAR` on a control
+ * character: an upload carrying `\r\n` would poison every later GET of that
+ * attachment with a 503. Refusing it at the boundary is the only point that
+ * sees it before it is stored, and the same check at read time would be a
+ * second guess at a fact the schema already owns.
  */
 const UploadQuerySchema = z.object({
   name: z.string().min(1).max(200),
-  mime: z.string().min(1).max(120),
+  mime: z
+    .string()
+    .min(1)
+    .max(120)
+    .regex(
+      /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+\/[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/,
+      "the mime type must be a bare type/subtype of token characters",
+    ),
 });
 
 /**
@@ -392,8 +427,24 @@ export function handleSessionApiRequest(
           sendJson(res, 400, { error: "Malformed attachment id" });
           return;
         }
+        if (req.method === "GET") {
+          // The bytes back to whoever holds the id. Always attachment and never
+          // inline: the mime type was supplied by the client at upload, so an
+          // inline response would let a stored text/html or image/svg+xml run
+          // in this origin. nosniff stops the browser second-guessing the type.
+          const manifest = await store.attachmentManifest(storeId, attachmentId);
+          const bytes = await store.readAttachment(storeId, attachmentId);
+          res.statusCode = 200;
+          res.setHeader("Content-Type", manifest.mimeType);
+          res.setHeader("Content-Length", String(bytes.byteLength));
+          res.setHeader("Content-Disposition", contentDisposition(manifest.name));
+          res.setHeader("Cache-Control", "no-store");
+          res.setHeader("X-Content-Type-Options", "nosniff");
+          res.end(bytes);
+          return;
+        }
         if (req.method !== "DELETE") {
-          res.setHeader("Allow", "DELETE");
+          res.setHeader("Allow", "GET, DELETE");
           sendJson(res, 405, { error: "Method not allowed" });
           return;
         }

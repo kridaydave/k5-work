@@ -6,7 +6,7 @@
 // listener, because that keeps the event loop alive and hangs any consumer.
 //
 // Usage: node fake-agent.js <scenario>
-import { writeFileSync } from "node:fs";
+import { writeFileSync, appendFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -320,8 +320,6 @@ export function handleMessage(
     params?: Json;
   };
   if (id === undefined) return { error: { code: -32600, message: "notification ignored" } };
-
-
   switch (method) {
     case "initialize":
       return { result: initializeResult(scenario) };
@@ -453,6 +451,24 @@ export function handleMessage(
 let pending: Json[] = [];
 let configOptions: Json[] = [];
 
+/**
+ * Records the `mcpServers` a session/new or session/resume actually carried,
+ * when `K5_FAKE_AGENT_RECORD` names a file.
+ *
+ * A test that asserts k5 offered the docx tool must see what the wire
+ * carried, not what k5 believes it built: the spec is assembled, serialized,
+ * handed to the harness's spawn, and only then does the harness put it in
+ * the request. Anything between those steps would be invisible to a
+ * unit-level assertion, so the recording happens on the receiving end and
+ * the file is the evidence.
+ */
+function recordMcpServers(method: string, params: Json | undefined): void {
+  const file = process.env.K5_FAKE_AGENT_RECORD;
+  if (file === undefined || file === "") return;
+  const line = JSON.stringify({ method, mcpServers: params?.mcpServers ?? null });
+  appendFileSync(file, `${line}\n`);
+}
+
 function run(scenario: Scenario): void {
   let counter = 0;
   const send = (payload: Json): void => {
@@ -498,6 +514,12 @@ function run(scenario: Scenario): void {
     }
     const id = message.id;
     if (id === undefined) return;
+    // Recorded before the handler answers: the mcpServers a session was
+    // created or resumed with are the fact under test, and the response
+    // carries none of them.
+    if (message.method === "session/new" || message.method === "session/resume") {
+      recordMcpServers(message.method, message.params as Json | undefined);
+    }
     // Only a real session creation consumes an id, so the numbering is stable
     // regardless of how many initialize/authenticate calls preceded it.
     if (message.method === "session/new") counter += 1;

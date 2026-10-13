@@ -4,9 +4,8 @@ import { strFromU8, unzipSync } from "fflate";
 import {
   DocxDocumentSchema,
   MAX_DOCUMENT_BLOCKS,
-  MAX_RUNS_PER_BLOCK,
+  MAX_DOCUMENT_CELLS,
   MAX_TABLE_CELLS,
-  MAX_TABLE_COLUMNS,
 } from "@k5-work/shared";
 import { validateSpec, validateZipBytes } from "../ooxml-core/validate.js";
 import { MAX_XML_ELEMENTS } from "../ooxml-core/index.js";
@@ -143,19 +142,99 @@ describe("docx driver (D-6 unit 2)", () => {
     // against each other. If either number moves, one of the assertions below
     // fails here rather than in a document the engine refuses at 100,000
     // elements with an error that names a limit nobody in the model mentioned.
-    const worstTextBlock = 1 + 2 * MAX_RUNS_PER_BLOCK;
-    const worstDocument = MAX_DOCUMENT_BLOCKS * worstTextBlock;
-    // w:tbl, w:tblPr, w:tblGrid and a gridCol per column, then per cell a w:tc,
-    // w:tcPr, w:p, w:r and w:t, and per row a w:tr and w:trPr.
-    const worstTable = 4 + MAX_TABLE_COLUMNS + MAX_TABLE_CELLS * 6 + (MAX_TABLE_CELLS / 2) * 2;
+    //
+    // A weighted unit is a paragraph, a heading, a page break, a list item or a
+    // table cell. The most any of them reaches is about eight elements: a cell
+    // is a w:tc, w:tcPr, w:tcW, w:p, w:pPr, w:r and w:t, plus a w:tr and w:trPr
+    // shared across a row. A list item is cheaper.
+    const worstPerUnit = 8;
+    const worst = MAX_DOCUMENT_CELLS * worstPerUnit;
 
     assert.ok(
-      worstDocument + worstTable < MAX_XML_ELEMENTS,
-      `worst case is ${String(worstDocument + worstTable)} elements, over the engine's ${String(MAX_XML_ELEMENTS)}`,
+      worst < MAX_XML_ELEMENTS,
+      `worst case is ${String(worst)} elements, over the engine's ${String(MAX_XML_ELEMENTS)}`,
     );
-    // And the shared block cap has to be expressible, or a document the model
+    // And the shared caps have to be expressible, or a document the model
     // accepts could never be written.
     assert.ok(MAX_TABLE_CELLS >= 6_000, "the 3,000-row two-column fixture must fit");
+    assert.ok(MAX_DOCUMENT_CELLS >= MAX_TABLE_CELLS, "one full table must fit in a document");
+    assert.ok(
+      MAX_DOCUMENT_BLOCKS * worstPerUnit < MAX_XML_ELEMENTS,
+      "even the loosest block count must stay inside the budget",
+    );
+  });
+
+  it("ships the numbering part only when a list needs it, pointed at from the document", () => {
+    const withoutList = entriesOf(buildDocx(SAMPLE));
+    assert.ok(!("word/numbering.xml" in withoutList), "no list, no numbering part");
+    assert.ok(!withoutList["word/_rels/document.xml.rels"].includes("/numbering"));
+
+    const withList = entriesOf(
+      buildDocx({
+        blocks: [
+          {
+            type: "list",
+            ordered: true,
+            items: [{ runs: [{ text: "one" }] }, { runs: [{ text: "two" }] }],
+          },
+        ],
+      }),
+    );
+    assert.ok("word/numbering.xml" in withList);
+    // A part relationship from the document, not a package one. At package
+    // level LibreOffice finds no numbering and imports every list paragraph as
+    // plain text, which still reads correctly and raises nothing.
+    assert.ok(withList["word/_rels/document.xml.rels"].includes("/numbering"));
+    assert.ok(!withList["_rels/.rels"].includes("/numbering"));
+    // Both engine gates, which include the reachability check on the new part.
+    const spec = buildPackageSpec(
+      DocxDocumentSchema.parse({
+        blocks: [{ type: "list", items: [{ runs: [{ text: "one" }] }] }],
+      }),
+    );
+    const bytes = buildDocx({
+      blocks: [{ type: "list", items: [{ runs: [{ text: "one" }] }] }],
+    });
+    assert.deepEqual(validateSpec(spec, { mainPart: MAIN_PART }), {
+      ok: true,
+      errors: [],
+      warnings: [],
+    });
+    assert.deepEqual(validateZipBytes(bytes, { mainPart: MAIN_PART }), {
+      ok: true,
+      errors: [],
+      warnings: [],
+    });
+  });
+
+  it("renders a list as a list, and restarts the second one", (t) => {
+    const command = findLibreOffice();
+    if (command === undefined) {
+      t.skip("LibreOffice executable not found");
+      return;
+    }
+    const read = readDocument(
+      command,
+      buildDocx({
+        blocks: [
+          { type: "list", ordered: true, items: [{ runs: [{ text: "alpha" }] }] },
+          { type: "paragraph", runs: [{ text: "between" }] },
+          { type: "list", ordered: true, items: [{ runs: [{ text: "beta" }] }] },
+          { type: "list", ordered: false, items: [{ runs: [{ text: "gamma" }] }] },
+        ],
+      }),
+    );
+    // A reader resolves the numbering rather than showing a literal glyph,
+    // which is the whole point of doing this instead of typing a bullet.
+    // Matched on "<text:list " so the list-style declarations do not count.
+    assert.ok(/<text:list[ >]/.test(read.flatOdf), "a real list");
+    // Two decimal lists that both start at one, plus one bullet list. The
+    // paragraph between them is what keeps the first two from merging.
+    assert.equal((read.flatOdf.match(/<text:list[ >]/g) ?? []).length, 3);
+    assert.equal((read.flatOdf.match(/<text:list-item/g) ?? []).length, 3);
+    assert.match(read.text, /alpha/);
+    assert.match(read.text, /beta/);
+    assert.match(read.text, /gamma/);
   });
 
   it("opens in LibreOffice as a document that renders as one", (t) => {

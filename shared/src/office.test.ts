@@ -5,11 +5,15 @@ import {
   MAX_DOCUMENT_BLOCKS,
   MAX_RUN_CHARS,
   MAX_RUNS_PER_BLOCK,
+  MAX_LIST_ITEMS,
+  MAX_LIST_LEVELS,
   MAX_TABLE_CELLS,
   MAX_TABLE_COLUMNS,
   ParagraphStyleSchema,
   MarkSchema,
   BlockSchema,
+  blockWeight,
+  type Block,
 } from "./office.js";
 
 const run = (text: string) => ({ text });
@@ -83,14 +87,16 @@ describe("office document model (D-6 unit 1)", () => {
     }
   });
 
-  it("refuses an unknown block type, including the list unit 3 will add", () => {
-    // Numbering is its own part with its own strict order, so accepting a
-    // list here would only defer the failure to the emitter.
+  it("refuses an unknown block type it does not have yet", () => {
+    // Numbering landed with the list block, so image and link have not: each is
+    // a new part with its own relationship and element-order rules, and
+    // accepting the block now would only defer the failure to the emitter.
     for (const block of [
-      { type: "list", items: ["a"] },
       { type: "image", src: "a.png" },
       { type: "image", src: "a.png", alt: "a" },
       { type: "link", href: "https://example.com", text: "x" },
+      { type: "quote", text: "x" },
+      { type: "toc" },
     ]) {
       assert.equal(
         firstIssue(doc([block])).length > 0,
@@ -215,6 +221,105 @@ describe("office document model (D-6 unit 1)", () => {
     assert.ok(
       DocxDocumentSchema.safeParse(doc(blocks.slice(0, -1))).success,
       `${String(MAX_DOCUMENT_BLOCKS)} blocks must be allowed`,
+    );
+  });
+
+  it("accepts a list with levels and refuses a level it does not declare", () => {
+    const list = (level: unknown) =>
+      doc([{ type: "list", ordered: false, items: [{ runs: [run("item")], level }] }]);
+
+    assert.ok(DocxDocumentSchema.safeParse(list(1)).success);
+    assert.ok(DocxDocumentSchema.safeParse(list(MAX_LIST_LEVELS)).success);
+    assert.ok(DocxDocumentSchema.safeParse(list(undefined)).success, "level defaults to 1");
+    for (const level of [0, MAX_LIST_LEVELS + 1, 1.5, "2", null]) {
+      assert.equal(
+        firstIssue(list(level)).length > 0,
+        true,
+        `level ${JSON.stringify(level)} must be refused`,
+      );
+    }
+  });
+
+  it("refuses a list with no items", () => {
+    assert.equal(firstIssue(doc([{ type: "list", items: [] }])).length > 0, true);
+  });
+
+  it("caps a whole document by what it emits, not by how many blocks it has", () => {
+    // The bug this exists for: capping the block count let 400 blocks of
+    // full-size tables through, which is 19 million elements against the
+    // engine's 100,000. A block is not a unit of size.
+    const fullTable = (): unknown => ({
+      type: "table",
+      columnWidths: [1, 1],
+      rows: Array.from({ length: MAX_TABLE_CELLS / 2 }, () => [
+        { runs: [run("a")] },
+        { runs: [run("b")] },
+      ]),
+    });
+
+    // One table at the per-table cap fills the per-document budget exactly.
+    assert.ok(
+      DocxDocumentSchema.safeParse(doc([fullTable()])).success,
+      "one maximum table must fit",
+    );
+    // Two of them do not, even though two blocks is nowhere near the cap.
+    assert.match(
+      firstIssue(doc([fullTable(), fullTable()])),
+      /over the budget/,
+    );
+    // The same for lists, where the items are the weight.
+    const longList = (): unknown => ({
+      type: "list",
+      items: Array.from({ length: MAX_LIST_ITEMS }, () => ({ runs: [run("x")] })),
+    });
+    assert.ok(DocxDocumentSchema.safeParse(doc([longList()])).success);
+    assert.match(firstIssue(doc([longList(), { type: "paragraph", runs: [] }])), /over the budget/);
+
+    // And a plain prose document is nowhere near it.
+    const prose = doc(
+      Array.from({ length: MAX_DOCUMENT_BLOCKS }, () => ({
+        type: "paragraph",
+        runs: [run("x")],
+      })),
+    );
+    assert.ok(
+      DocxDocumentSchema.safeParse(prose).success,
+      "400 paragraphs is a normal document and must be allowed",
+    );
+  });
+
+  it("caps the text a document carries, not just the elements it emits", () => {
+    // The element budget counts w:t elements, and one run is one element
+    // however long its text: 400 paragraphs of maximum-length runs are
+    // 12.8 million characters against 400 elements. Without a character
+    // budget that reaches the engine and the zip size caps behind it.
+    const longRun = (): unknown => run("x".repeat(MAX_RUN_CHARS));
+    const proseOf = (blocks: number): unknown =>
+      doc(Array.from({ length: blocks }, () => ({ type: "paragraph", runs: [longRun()] })));
+
+    // Inside the budget: 100 paragraphs of maximum runs is 800,000 chars.
+    assert.ok(DocxDocumentSchema.safeParse(proseOf(100)).success);
+    // Past it: 200 of them is 1.6 million, with the element count unchanged
+    // in kind — still just 200 paragraph elements.
+    assert.match(firstIssue(proseOf(200)), /characters of text/);
+  });
+
+  it("weights a block by what it emits", () => {
+    const weighted = (block: unknown) =>
+      blockWeight(DocxDocumentSchema.parse(doc([block])).blocks[0] as Block);
+    assert.equal(weighted({ type: "paragraph", runs: [] }), 1);
+    assert.equal(weighted({ type: "pageBreak" }), 1);
+    assert.equal(
+      weighted({ type: "list", items: [{ runs: [run("a")] }, { runs: [run("b")] }] }),
+      2,
+    );
+    assert.equal(
+      weighted({
+        type: "table",
+        columnWidths: [1, 1],
+        rows: [[{ runs: [run("a")] }, { runs: [run("b")] }]],
+      }),
+      2,
     );
   });
 

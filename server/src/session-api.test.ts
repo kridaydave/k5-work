@@ -5,6 +5,7 @@ import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { request } from "node:http";
+import type { IncomingMessage } from "node:http";
 import type { AddressInfo } from "node:net";
 import { MAX_ATTACHMENT_BYTES } from "@k5-work/shared";
 import { createApp, type K5App } from "./app.js";
@@ -90,7 +91,18 @@ function send(
   baseUrl: string,
   pathname: string,
   options: { method?: string; host?: string; body?: Buffer; headers?: Record<string, string> } = {},
-): Promise<{ status: number; body: unknown; allow: string | undefined; cacheControl: string | undefined }> {
+): Promise<{
+  status: number;
+  body: unknown;
+  /** The bytes exactly as they came back, for the attachment read route. */
+  bytes: Buffer;
+  allow: string | undefined;
+  cacheControl: string | undefined;
+  contentType: string | undefined;
+  contentDisposition: string | undefined;
+  contentLength: string | undefined;
+  nosniff: string | undefined;
+}> {
   const target = new URL(pathname, baseUrl);
   return new Promise((resolve, reject) => {
     const outgoing = request(
@@ -109,7 +121,8 @@ function send(
         const chunks: Buffer[] = [];
         response.on("data", (chunk: Buffer) => chunks.push(chunk));
         response.on("end", () => {
-          const text = Buffer.concat(chunks).toString("utf8");
+          const bytes = Buffer.concat(chunks);
+          const text = bytes.toString("utf8");
           let body: unknown = text;
           try {
             body = JSON.parse(text);
@@ -119,8 +132,13 @@ function send(
           resolve({
             status: response.statusCode ?? 0,
             body,
+            bytes,
             allow: response.headers.allow,
             cacheControl: response.headers["cache-control"],
+            contentType: response.headers["content-type"],
+            contentDisposition: header(response, "content-disposition"),
+            contentLength: header(response, "content-length"),
+            nosniff: header(response, "x-content-type-options"),
           });
         });
       },
@@ -175,6 +193,24 @@ function sendChunked(
     };
     pump();
   });
+}
+
+/** A stored session with a distinct harness session id, for the attachment routes. */
+async function openStoredSession(harness: Harness): Promise<{ storeId: string }> {
+  return harness.store.create({
+    harness: "opencode",
+    harnessSessionId: `ses_${Math.random().toString(36).slice(2, 10)}`,
+    projectId: "p",
+    projectName: null,
+    cwd: "/tmp/p",
+    title: "With a file",
+  });
+}
+
+/** Header values are string | string[] | undefined; the tests want one string. */
+function header(response: IncomingMessage, name: string): string | undefined {
+  const value = response.headers[name];
+  return Array.isArray(value) ? value[0] : value;
 }
 
 async function startHarness(): Promise<Harness> {
@@ -686,6 +722,154 @@ test("a session removed mid-flight does not come back through an upload", async 
   }
 });
 
+test("an attachment's bytes can be read back by the one holding its id", async () => {
+  const harness = await startHarness();
+  try {
+    const session = await openStoredSession(harness);
+    const bytes = Buffer.from([0x50, 0x4b, 0x03, 0x04, 0x00, 0xff, 0xfe]);
+    const query = new URLSearchParams({ name: "notes.txt", mime: "text/plain" });
+    const uploaded = await send(
+      harness.url,
+      `/api/sessions/${session.storeId}/attachments?${query.toString()}`,
+      { method: "POST", body: bytes },
+    );
+    assert.equal(uploaded.status, 200);
+    const manifest = uploaded.body as { attachmentId: string };
+    const target = `/api/sessions/${session.storeId}/attachments/${manifest.attachmentId}`;
+
+    const read = await send(harness.url, target);
+    assert.equal(read.status, 200);
+    assert.deepEqual(read.bytes, bytes, "the exact bytes, not a re-encoded copy");
+    assert.equal(read.contentType, "text/plain");
+    assert.equal(read.contentLength, String(bytes.byteLength));
+    assert.equal(read.cacheControl, "no-store");
+    assert.equal(read.nosniff, "nosniff");
+    assert.match(read.contentDisposition ?? "", /filename="notes\.txt"/);
+    assert.match(read.contentDisposition ?? "", /filename\*=UTF-8''notes\.txt/);
+
+    // Deleted is gone from both directions.
+    assert.equal((await send(harness.url, target, { method: "DELETE" })).status, 204);
+    const gone = await send(harness.url, target);
+    assert.equal(gone.status, 404);
+
+    // And an unsafe id is still a client error rather than a store fault.
+    const hostile = await send(
+      harness.url,
+      `/api/sessions/${session.storeId}/attachments/${encodeURIComponent("../../etc")}`,
+    );
+    assert.equal(hostile.status, 400);
+  } finally {
+    await harness.close();
+  }
+});
+
+test("a hostile attachment mime type is refused at the boundary", async () => {
+  const harness = await startHarness();
+  try {
+    const session = await openStoredSession(harness);
+    // The stored mime goes straight into a Content-Type header on read, and
+    // Node's setHeader throws on a control character: a CRLF accepted here
+    // would 503 every later GET of this attachment, not just this one. So
+    // the upload is the place it is refused — there is no safe read-time
+    // fallback once it is stored.
+    for (const mime of ["text/plain\r\nX-Injected: yes", "text/plain; charset=utf-8", "notatype"]) {
+      const query = new URLSearchParams({ name: "notes.txt", mime });
+      const uploaded = await send(
+        harness.url,
+        `/api/sessions/${session.storeId}/attachments?${query.toString()}`,
+        { method: "POST", body: Buffer.from("x") },
+      );
+      assert.equal(uploaded.status, 400, `${JSON.stringify(mime)} must be refused at upload`);
+    }
+    // The well-formed type still gets through, and reads back cleanly.
+    const query = new URLSearchParams({ name: "notes.txt", mime: "text/plain" });
+    const uploaded = await send(
+      harness.url,
+      `/api/sessions/${session.storeId}/attachments?${query.toString()}`,
+      { method: "POST", body: Buffer.from("x") },
+    );
+    assert.equal(uploaded.status, 200);
+    const manifest = uploaded.body as { attachmentId: string };
+    const read = await send(
+      harness.url,
+      `/api/sessions/${session.storeId}/attachments/${manifest.attachmentId}`,
+    );
+    assert.equal(read.status, 200);
+    assert.equal(read.contentType, "text/plain");
+  } finally {
+    await harness.close();
+  }
+});
+
+test("a hostile attachment name cannot break the download headers", async () => {
+  const harness = await startHarness();
+  try {
+    const session = await openStoredSession(harness);
+    // Every one of these is accepted by the upload query's schema, so the read
+    // route is the first place they have to be handled.
+    const hostile = 'ev"il\\name\r\nX-Injected: yes\r\n.txt';
+    const query = new URLSearchParams({ name: hostile, mime: "text/plain" });
+    const uploaded = await send(
+      harness.url,
+      `/api/sessions/${session.storeId}/attachments?${query.toString()}`,
+      { method: "POST", body: Buffer.from("x") },
+    );
+    assert.equal(uploaded.status, 200, "the name is stored as given, the header is not");
+    const manifest = uploaded.body as { attachmentId: string };
+
+    const read = await send(
+      harness.url,
+      `/api/sessions/${session.storeId}/attachments/${manifest.attachmentId}`,
+    );
+    assert.equal(read.status, 200);
+    // One header, and no raw CR or LF anywhere in it.
+    const disposition = read.contentDisposition ?? "";
+    assert.doesNotMatch(disposition, /[\r\n]/);
+    // The quoted form is the part a browser parses loosely, so it carries
+    // nothing that could end it early or confuse the parser.
+    const quoted = /\bfilename="([^"]*)"/.exec(disposition)?.[1] ?? "";
+    assert.doesNotMatch(quoted, /["\\\r\n]/);
+    assert.match(quoted, /_/, "the quote, backslash and line breaks are replaced");
+    // The real name survives in the extended form, fully percent-encoded, so it
+    // cannot break out of the parameter it sits in.
+    assert.match(disposition, /filename\*=UTF-8''ev%22il%5Cname%0D%0AX-Injected%3A%20yes/);
+
+    // Non-ASCII names survive in the extended form even though the quoted
+    // fallback is ASCII-only by spec.
+    const unicode = new URLSearchParams({ name: "résumé 日本語.txt", mime: "text/plain" });
+    const second = await send(
+      harness.url,
+      `/api/sessions/${session.storeId}/attachments?${unicode.toString()}`,
+      { method: "POST", body: Buffer.from("x") },
+    );
+    const secondManifest = second.body as { attachmentId: string };
+    const readBack = await send(
+      harness.url,
+      `/api/sessions/${session.storeId}/attachments/${secondManifest.attachmentId}`,
+    );
+    assert.equal(readBack.status, 200);
+    assert.match(
+      readBack.contentDisposition ?? "",
+      /filename\*=UTF-8''r%C3%A9sum%C3%A9%20%E6%97%A5%E6%9C%AC%E8%AA%9E\.txt/,
+    );
+    assert.doesNotMatch(readBack.contentDisposition ?? "", /[^\x00-\x7f]/);
+  } finally {
+    await harness.close();
+  }
+});
+
+test("the collection route still refuses a read", async () => {
+  const harness = await startHarness();
+  try {
+    const session = await openStoredSession(harness);
+    const read = await send(harness.url, `/api/sessions/${session.storeId}/attachments`);
+    assert.equal(read.status, 405);
+    assert.equal(read.allow, "POST", "a read here would have no id to name");
+  } finally {
+    await harness.close();
+  }
+});
+
 test("an attachment can be dropped again, so an upload is not a one-way door", async () => {
   const harness = await startHarness();
   try {
@@ -708,7 +892,7 @@ test("an attachment can be dropped again, so an upload is not a one-way door", a
 
     const wrongMethod = await send(harness.url, target, { method: "POST", body: Buffer.from("x") });
     assert.equal(wrongMethod.status, 405);
-    assert.equal(wrongMethod.allow, "DELETE");
+    assert.equal(wrongMethod.allow, "GET, DELETE");
 
     const hostile = await send(
       harness.url,
