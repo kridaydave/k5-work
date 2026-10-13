@@ -8,6 +8,7 @@ export * from "./contracts.js";
 export * from "./access.js";
 export * from "./reducer.js";
 export * from "./sessions.js";
+export * from "./office.js";
 
 export const HarnessSchema = z.enum(["opencode", "kilo", "cline"]);
 export type Harness = z.infer<typeof HarnessSchema>;
