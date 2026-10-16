@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:bun": "bun ../../node_modules/vite/bin/vite.js",
     "build": "vite build",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "preview": "vite preview",
