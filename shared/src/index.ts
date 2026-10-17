@@ -10,6 +10,8 @@ export * from "./reducer.js";
 export * from "./sessions.js";
 export * from "./office.js";
 export * from "./office-tool.js";
+export * from "./xlsx.js";
+export * from "./pptx.js";
 
 export const HarnessSchema = z.enum(["opencode", "kilo", "cline"]);
 export type Harness = z.infer<typeof HarnessSchema>;
