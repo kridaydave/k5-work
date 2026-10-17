@@ -53,7 +53,7 @@ jobs:
           node-version: 22
           cache: npm
 
-      # Only the docx round-trip test uses LibreOffice, and it soft-skips when
+      # The office round-trip tests use LibreOffice (docx via writer, xlsx via calc, pptx via impress), and they soft-skip when
       # the binary is missing, so installing it is what makes that gate real
       # rather than a green check over a skipped test. It runs in the background
       # while npm ci works; the step after the install waits for it.
@@ -62,7 +62,7 @@ jobs:
           (
             set +e
             sudo apt-get update
-            sudo apt-get install -y --no-install-recommends libreoffice-writer
+            sudo apt-get install -y --no-install-recommends libreoffice-writer libreoffice-calc libreoffice-impress
             echo "$?" > "$RUNNER_TEMP/apt-status"
           ) > "$RUNNER_TEMP/apt.log" 2>&1 < /dev/null &
 
