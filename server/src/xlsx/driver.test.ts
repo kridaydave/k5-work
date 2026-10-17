@@ -80,17 +80,21 @@ describe("xlsx driver", () => {
       fs.mkdirSync(profile, { recursive: true });
       const result = spawnSync(
         command,
-        ["--headless", "--nologo", "--nodefault", "--norestore", "--nolockcheck", "--nofirststartwizard", `-env:UserInstallation=${pathToFileURL(profile).href}`, "--convert-to", "csv", "--outdir", outdir, input],
+        ["--headless", "--nologo", "--nodefault", "--norestore", "--nolockcheck", "--nofirststartwizard", `-env:UserInstallation=${pathToFileURL(profile).href}`, "--convert-to", "fods", "--outdir", outdir, input],
         { encoding: "utf8", timeout: 60000, maxBuffer: 8 * 1024 * 1024 },
       );
       const output = `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
       assert.equal(result.status, 0, output);
       assert.equal(result.signal, null, output);
       assert.doesNotMatch(output, /repair|corrupt|could not be loaded/i);
-      assert.ok(fs.existsSync(path.join(outdir, "book.csv")), "no converted file");
-      const csv = fs.readFileSync(path.join(outdir, "book.csv"), "utf8");
-      assert.match(csv, /Quarter/);
-      assert.match(csv, /42/);
+      assert.ok(fs.existsSync(path.join(outdir, "book.fods")), "no converted file");
+      const fods = fs.readFileSync(path.join(outdir, "book.fods"), "utf8");
+      // Content a reader would show.
+      assert.match(fods, /Quarter/);
+      assert.match(fods, /42/);
+      // Formatting: it must come back as a sheet/table, not just text.
+      assert.ok(fods.includes("<table:table"), "the sheet is a table");
+      assert.ok(/table:name="Sheet1"/.test(fods), "the sheet kept its name");
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

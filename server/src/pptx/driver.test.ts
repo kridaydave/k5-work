@@ -72,8 +72,12 @@ describe("pptx driver", () => {
       assert.doesNotMatch(output, /could not be loaded|repair|corrupt/i);
       assert.ok(fs.existsSync(path.join(outdir, "presentation.fodp")));
       const fodp = fs.readFileSync(path.join(outdir, "presentation.fodp"), "utf8");
+      // Content a reader would show.
       assert.match(fodp, /Revenue/);
       assert.match(fodp, /Up 12 percent/);
+      // Formatting: it must come back as a presentation with a draw page.
+      assert.ok(fodp.includes("<office:presentation"), "the document is a presentation");
+      assert.ok(/<draw:page[ >]/.test(fodp), "contains a draw page");
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
