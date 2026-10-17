@@ -30,7 +30,7 @@ function textShape(id: number, name: string, x: number, y: number, cx: number, c
   return `<p:sp>
     <p:nvSpPr><p:cNvPr id="${String(id)}" name="${escText(name)}"/><p:cNvSpPr txBox="1"/><p:nvPr/></p:nvSpPr>
     <p:spPr><a:xfrm><a:off x="${String(x)}" y="${String(y)}"/><a:ext cx="${String(cx)}" cy="${String(cy)}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></p:spPr>
-    <p:txBody><a:bodyPr/><a:lstStyle/>${paragraphs}</p:txBody>
+    <p:txBody><a:bodyPr><a:normAutofit/></a:bodyPr><a:lstStyle/>${paragraphs}</p:txBody>
   </p:sp>`;
 }
 

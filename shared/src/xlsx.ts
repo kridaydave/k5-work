@@ -34,12 +34,12 @@ export const XlsxWorkbookSchema = z.object({
   author: z.string().min(1).max(200).optional(),
   sheets: z.array(XlsxSheetSchema).min(1).max(MAX_XLSX_SHEETS),
 }).strict().superRefine((workbook, ctx) => {
-  const names = workbook.sheets.map((s) => s.name);
+  const names = workbook.sheets.map((s) => s.name.toLowerCase());
   if (new Set(names).size !== names.length) {
-    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["sheets"], message: "sheet names must be unique" });
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["sheets"], message: "sheet names must be unique (case-insensitive)" });
   }
   for (const sheet of workbook.sheets) {
-    if (/[\\/?*[\]:]/.test(sheet.name)) {
+    if (/[\\/?*[\]:]/.test(sheet.name) || /^'|'$/.test(sheet.name)) {
       ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["sheets"], message: `sheet name "${sheet.name}" contains an invalid character` });
     }
   }

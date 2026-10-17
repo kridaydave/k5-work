@@ -2,6 +2,7 @@ import {
   CreatePptxArgsSchema,
   type CreatePptxResult,
 } from "@k5-work/shared";
+import crypto from "node:crypto";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { buildPptx } from "../pptx/driver.js";
@@ -131,17 +132,29 @@ export async function createPptx(
     };
   }
 
-  const temp = path.join(path.dirname(target), `.${parsed.data.filename}.${process.pid}.tmp`);
+  const temp = path.join(
+    path.dirname(target),
+    `.${parsed.data.filename}.${process.pid}.${crypto.randomUUID()}.tmp`,
+  );
   try {
-    await fsp.writeFile(temp, bytes);
-    await fsp.rename(temp, target);
+    await fsp.writeFile(temp, bytes, { flag: "wx" });
+    await fsp.link(temp, target);
   } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "EEXIST") {
+      return {
+        ok: false,
+        code: "file-exists",
+        message: `${parsed.data.filename} already exists; choose another name`,
+      };
+    }
     await fsp.rm(temp, { force: true }).catch(() => {});
     return {
       ok: false,
       code: "write-failed",
       message: `could not write ${parsed.data.filename}: ${err instanceof Error ? err.message : String(err)}`,
     };
+  } finally {
+    await fsp.rm(temp, { force: true }).catch(() => {});
   }
 
   return {

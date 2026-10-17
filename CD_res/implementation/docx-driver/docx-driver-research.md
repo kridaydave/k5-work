@@ -385,7 +385,7 @@ rule, which the first draft put in a footnote, is a hard rule for every new fixt
 The ordering changed after the adversarial pass. Engine work first, because every unit
 after it depends on gates that currently do not exist.
 
-**Unit 0 (engine, one PR).** Four fixes:
+**Unit 0 (engine, one PR) — IMPLEMENTED.** Four fixes (landed in engine-gates.test.ts and package.ts):
 
 1. Skip the ratio check for engine-built bytes and keep it for every other caller.
    Fixture: a 3,000-row empty-cell table that builds.
@@ -504,7 +504,7 @@ reachability, is a code read rather than a measurement, so no script carries it.
 
 ```js
 // /tmp/opencode/probe-bomb.mjs
-import { PackageBuilder } from "/home/kriday/Code/k5-work/server/dist/ooxml-core/package.js";
+import { PackageBuilder } from "server/dist/ooxml-core/package.js";
 
 const W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
 const MAIN =

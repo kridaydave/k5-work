@@ -133,7 +133,9 @@ function decodeFileSegment(raw: string): string | null {
   } catch {
     return null;
   }
-  if (decoded.includes("/") || decoded.includes("\\\\")) return null;
+  if (decoded.includes("/") || decoded.includes("\\")) return null;
+  if (decoded.startsWith(".")) return null;
+  if (!/\.(docx|xlsx|pptx)$/i.test(decoded)) return null;
   return isSafeNameSegment(decoded) ? decoded : null;
 }
 

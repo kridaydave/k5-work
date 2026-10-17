@@ -23,7 +23,10 @@ function colLetter(index: number): string {
 
 export function buildSharedStringsXml(strings: readonly string[]): string {
   const items = strings
-    .map((s) => el("si", [], el("t", [], escText(s))))
+    .map((s) => {
+      const attrs: [string, string][] = /^\s|\s$/.test(s) ? [["xml:space", "preserve"]] : [];
+      return el("si", [], el("t", attrs, escText(s)));
+    })
     .join("");
   return doc(
     el(
