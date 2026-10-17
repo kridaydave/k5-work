@@ -156,6 +156,64 @@ function projectFileRoute(pathname: string): string | null {
   return null;
 }
 
+function serveProjectFile(
+  req: IncomingMessage,
+  res: ServerResponse,
+  filename: string,
+  workspaceRoot: string,
+): void {
+  if (req.method !== "GET") {
+    res.setHeader("Allow", "GET");
+    sendJson(res, 405, { error: "Method not allowed" });
+    return;
+  }
+  const root = path.resolve(workspaceRoot);
+  const target = path.resolve(root, filename);
+  if (target !== path.join(root, filename)) {
+    sendJson(res, 400, { error: "Invalid filename" });
+    return;
+  }
+  let realRoot: string;
+  let realTarget: string;
+  try {
+    realRoot = fs.realpathSync(root);
+    realTarget = fs.realpathSync(target);
+  } catch {
+    sendJson(res, 404, { error: "File not found" });
+    return;
+  }
+  const relative = path.relative(realRoot, realTarget);
+  if (relative === "" || relative.startsWith("..") || path.isAbsolute(relative)) {
+    sendJson(res, 404, { error: "File not found" });
+    return;
+  }
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(realTarget);
+  } catch {
+    sendJson(res, 404, { error: "File not found" });
+    return;
+  }
+  if (!stat.isFile()) {
+    sendJson(res, 404, { error: "File not found" });
+    return;
+  }
+  let bytes: Buffer;
+  try {
+    bytes = fs.readFileSync(realTarget);
+  } catch {
+    sendJson(res, 500, { error: "Could not read file" });
+    return;
+  }
+  res.statusCode = 200;
+  res.setHeader("Content-Type", "application/octet-stream");
+  res.setHeader("Content-Length", String(bytes.byteLength));
+  res.setHeader("Content-Disposition", contentDisposition(filename));
+  res.setHeader("Cache-Control", "no-store");
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.end(bytes);
+}
+
 export function handleProjectApiRequest(
   req: IncomingMessage,
   res: ServerResponse,
@@ -234,56 +292,7 @@ export function handleProjectApiRequest(
 
   const requestedFile = projectFileRoute(pathname);
   if (requestedFile !== null) {
-    if (req.method !== "GET") {
-      res.setHeader("Allow", "GET");
-      sendJson(res, 405, { error: "Method not allowed" });
-      return;
-    }
-    const root = path.resolve(workspaceRoot);
-    const target = path.resolve(root, requestedFile);
-    if (target !== path.join(root, requestedFile)) {
-      sendJson(res, 400, { error: "Invalid filename" });
-      return;
-    }
-    let realRoot: string;
-    let realTarget: string;
-    try {
-      realRoot = fs.realpathSync(root);
-      realTarget = fs.realpathSync(target);
-    } catch {
-      sendJson(res, 404, { error: "File not found" });
-      return;
-    }
-    const relative = path.relative(realRoot, realTarget);
-    if (relative === "" || relative.startsWith("..") || path.isAbsolute(relative)) {
-      sendJson(res, 404, { error: "File not found" });
-      return;
-    }
-    let stat: fs.Stats;
-    try {
-      stat = fs.statSync(realTarget);
-    } catch {
-      sendJson(res, 404, { error: "File not found" });
-      return;
-    }
-    if (!stat.isFile()) {
-      sendJson(res, 404, { error: "File not found" });
-      return;
-    }
-    let bytes: Buffer;
-    try {
-      bytes = fs.readFileSync(realTarget);
-    } catch {
-      sendJson(res, 500, { error: "Could not read file" });
-      return;
-    }
-    res.statusCode = 200;
-    res.setHeader("Content-Type", "application/octet-stream");
-    res.setHeader("Content-Length", String(bytes.byteLength));
-    res.setHeader("Content-Disposition", contentDisposition(requestedFile));
-    res.setHeader("Cache-Control", "no-store");
-    res.setHeader("X-Content-Type-Options", "nosniff");
-    res.end(bytes);
+    serveProjectFile(req, res, requestedFile, workspaceRoot);
     return;
   }
 
