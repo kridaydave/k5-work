@@ -1,7 +1,20 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Readable } from "node:stream";
+import fs from "node:fs";
+import path from "node:path";
 import { ProjectOpenRequestSchema } from "@k5-work/shared";
+import { isSafeNameSegment } from "./store/safe-name.js";
 import { discoverLocalProjects, getProjectInfo } from "./projects.js";
+
+function contentDisposition(name: string): string {
+  const fallback =
+    name
+      .replace(/[^\x20-\x7e]+/g, "_")
+      .replace(/["\\]/g, "_")
+      .slice(0, 200) || "attachment";
+  const extended = encodeURIComponent(name).replace(/'/g, "%27");
+  return `attachment; filename="${fallback}"; filename*=UTF-8''${extended}`;
+}
 
 export const MAX_PROJECT_BODY_BYTES = 64 * 1024;
 
@@ -104,7 +117,43 @@ function projectPath(value: unknown): string | null {
 }
 
 function isProjectApiPath(pathname: string): boolean {
-  return pathname === "/api/projects" || pathname.startsWith("/api/projects/");
+  return (
+    pathname === "/api/projects" ||
+    pathname.startsWith("/api/projects/") ||
+    pathname.startsWith("/api/project/") ||
+    pathname.startsWith("/api/files/") ||
+    pathname.startsWith("/api/project-files/")
+  );
+}
+
+function decodeFileSegment(raw: string): string | null {
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(raw);
+  } catch {
+    return null;
+  }
+  if (decoded.includes("/") || decoded.includes("\\\\")) return null;
+  return isSafeNameSegment(decoded) ? decoded : null;
+}
+
+function projectFileRoute(pathname: string): string | null {
+  const prefixes = ["/api/projects/", "/api/project/", "/api/files/", "/api/project-files/"];
+  for (const prefix of prefixes) {
+    if (!pathname.startsWith(prefix)) continue;
+    const rest = pathname.slice(prefix.length);
+    if (rest === "") continue;
+    const parts = rest.split("/").filter((segment) => segment.length > 0);
+    let raw: string | undefined;
+    if (parts.length === 1) {
+      raw = parts[0];
+    } else if (parts.length === 2 && (parts[0] === "file" || parts[0] === "files")) {
+      raw = parts[1];
+    }
+    if (raw === undefined) return null;
+    return decodeFileSegment(raw);
+  }
+  return null;
 }
 
 export function handleProjectApiRequest(
@@ -180,6 +229,61 @@ export function handleProjectApiRequest(
     } catch (cause) {
       sendJson(res, 500, { error: cause instanceof Error ? cause.message : String(cause) });
     }
+    return;
+  }
+
+  const requestedFile = projectFileRoute(pathname);
+  if (requestedFile !== null) {
+    if (req.method !== "GET") {
+      res.setHeader("Allow", "GET");
+      sendJson(res, 405, { error: "Method not allowed" });
+      return;
+    }
+    const root = path.resolve(workspaceRoot);
+    const target = path.resolve(root, requestedFile);
+    if (target !== path.join(root, requestedFile)) {
+      sendJson(res, 400, { error: "Invalid filename" });
+      return;
+    }
+    let realRoot: string;
+    let realTarget: string;
+    try {
+      realRoot = fs.realpathSync(root);
+      realTarget = fs.realpathSync(target);
+    } catch {
+      sendJson(res, 404, { error: "File not found" });
+      return;
+    }
+    const relative = path.relative(realRoot, realTarget);
+    if (relative === "" || relative.startsWith("..") || path.isAbsolute(relative)) {
+      sendJson(res, 404, { error: "File not found" });
+      return;
+    }
+    let stat: fs.Stats;
+    try {
+      stat = fs.statSync(realTarget);
+    } catch {
+      sendJson(res, 404, { error: "File not found" });
+      return;
+    }
+    if (!stat.isFile()) {
+      sendJson(res, 404, { error: "File not found" });
+      return;
+    }
+    let bytes: Buffer;
+    try {
+      bytes = fs.readFileSync(realTarget);
+    } catch {
+      sendJson(res, 500, { error: "Could not read file" });
+      return;
+    }
+    res.statusCode = 200;
+    res.setHeader("Content-Type", "application/octet-stream");
+    res.setHeader("Content-Length", String(bytes.byteLength));
+    res.setHeader("Content-Disposition", contentDisposition(requestedFile));
+    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.end(bytes);
     return;
   }
 
