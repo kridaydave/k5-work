@@ -63,6 +63,7 @@ A change that works on the single path you tested and breaks another surface is 
 
 - Install dependencies from the repository root with `npm install`.
 - Start both server and client with `npm run dev`. Web runs on port 5173, server on port 8787.
+- `npm run dev:bun` is the same thing with the Vite dev server on Bun, which boots faster. Only the web dev server moves: the server, the tsc build and every test stay on Node, so this needs Bun installed and nothing else.
 - Always track spawned process IDs. Stop background tasks only by their captured PID.
 - ACP and MCP subprocesses run over local stdio. Stdio pipes must be cleanly reaped on shutdown. Never leave orphaned child harnesses running.
 

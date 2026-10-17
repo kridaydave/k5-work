@@ -23,6 +23,8 @@ import {
 import { describeFinding, findPluginSignals } from "./plugin-guard.js";
 import { AcpSeat, type AcpSeatInfo, type SeatStreamEvent } from "./acp-seat.js";
 import { docxToolSpec } from "../tools/docx-mcp-spec.js";
+import { xlsxToolSpec } from "../tools/xlsx-mcp-spec.js";
+import { pptxToolSpec } from "../tools/pptx-mcp-spec.js";
 import type { McpServer } from "@agentclientprotocol/sdk";
 import {
   SeatBusyError,
@@ -426,12 +428,13 @@ function seatMcpServers(
   profile: AccessProfile,
   posture: ResolvedPosture,
 ): McpServer[] {
-  const spec = docxToolSpec({
-    projectRoot: projectPath,
-    profile: profile.label,
-    posture: reportPosture(posture),
-  });
-  return spec === null ? [] : [spec];
+  const report = reportPosture(posture);
+  const specs = [
+    docxToolSpec({ projectRoot: projectPath, profile: profile.label, posture: report }),
+    xlsxToolSpec({ projectRoot: projectPath, profile: profile.label, posture: report }),
+    pptxToolSpec({ projectRoot: projectPath, profile: profile.label, posture: report }),
+  ];
+  return specs.filter((s): s is NonNullable<typeof s> => s !== null) as McpServer[];
 }
 
 function classifyOpenFailure(err: unknown): SeatOpenError {
