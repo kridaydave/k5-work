@@ -4,7 +4,7 @@
 #   scripts/launch.sh <run-id>
 #
 # Isolation is the whole point of this script. The ports sit next to the
-# documented dev defaults so a running `npm run dev` is never touched, and the
+# documented dev defaults so a running `bun run dev` is never touched, and the
 # session store is redirected with XDG_DATA_HOME so a verification run cannot
 # read or overwrite the transcripts in ~/.local/share/k5-work.
 set -euo pipefail
@@ -28,7 +28,7 @@ if [ -e "$RUN_DIR/server.pid" ] || [ -e "$RUN_DIR/web.pid" ]; then
 fi
 if [ ! -f "$ROOT/server/dist/index.js" ]; then
   echo "launch.sh: server/dist is missing. Build it first:" >&2
-  echo "  npm run build -w shared && npm run build -w server" >&2
+  echo "  bun run --filter @k5-work/shared build && bun run --filter server build" >&2
   exit 1
 fi
 if [ ! -f "$ROOT/server/dist/acp/fake-agent.js" ] && [ "$HARNESS" = "node $ROOT/server/dist/acp/fake-agent.js ok" ]; then
@@ -36,7 +36,7 @@ if [ ! -f "$ROOT/server/dist/acp/fake-agent.js" ] && [ "$HARNESS" = "node $ROOT/
   exit 1
 fi
 if [ ! -d "$ROOT/node_modules/vite" ]; then
-  echo "launch.sh: node_modules is missing. Run npm install at the repo root." >&2
+  echo "launch.sh: node_modules is missing. Run bun install at the repo root." >&2
   exit 1
 fi
 

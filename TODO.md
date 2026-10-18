@@ -28,7 +28,7 @@ Locked decisions: `docs/posture-and-trust-decisions.md`.
 - [x] Phase 0 — real ACP probe
   - argv-based `ACP_COMMAND` loader, Node→WHATWG bridge, captured-child teardown
   - `initialize` → `authenticate` → `session/new` against OpenCode 1.18.31
-  - Proof: `npm run probe -w server`; deterministic cases use `fake-agent.ts`;
+  - Proof: `bun run --filter server probe`; deterministic cases use `fake-agent.ts`;
     real-harness tests skip loudly, never mock a pass
 - [x] Phase 1 — runtime and dev routing
   - Node server owns `/api` and `/ws`; Vite is a dev proxy only
