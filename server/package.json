@@ -4,12 +4,12 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "predev": "npm --prefix ../shared run build && npm run build",
+    "predev": "bun run --cwd ../shared build && bun run build",
     "dev": "node --env-file-if-exists=../.env --watch dist/index.js",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "test": "npm run build && node --test --test-timeout 90000 \"dist/**/*.test.js\"",
-    "test:security": "npm run build && node --test --test-timeout 90000 dist/projects.test.js dist/project-api.test.js dist/session-api.test.js dist/store/session-store.test.js dist/ooxml-core/security.test.js dist/acp/spawn.test.js dist/acp/plugin-guard.test.js dist/ws/gateway.test.js dist/acp/session-service.test.js dist/env.test.js",
+    "test": "bun run build && node --test --test-timeout 90000 \"dist/**/*.test.js\"",
+    "test:security": "bun run build && node --test --test-timeout 90000 dist/projects.test.js dist/project-api.test.js dist/session-api.test.js dist/store/session-store.test.js dist/ooxml-core/security.test.js dist/acp/spawn.test.js dist/acp/plugin-guard.test.js dist/ws/gateway.test.js dist/acp/session-service.test.js dist/env.test.js",
     "test:office": "node --test dist/ooxml-core/docx.test.js",
     "probe": "node --env-file-if-exists=../.env dist/acp/probe.cli.js",
     "test:acp": "node --test --test-timeout 120000 dist/acp/spawn.test.js dist/acp/probe.test.js dist/acp/seat-pool.test.js dist/acp/updates.test.js dist/acp/posture.test.js dist/acp/posture-opencode.test.js dist/acp/plugin-guard.test.js"

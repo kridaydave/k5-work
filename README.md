@@ -13,8 +13,8 @@ Thin-slice MVP covering all four pillars:
 
 ```bash
 cp .env.example .env
-npm install
-npm run dev
+bun install
+bun run dev
 # web: http://localhost:5173
 # server health: http://127.0.0.1:8787/health
 ```
@@ -51,8 +51,8 @@ paid ones. Switching a model is applied to the seat via ACP
 ## Tests
 
 ```bash
-npm test                    # shared + server (node:test)
-npm run test -w apps/web    # browser layer (vitest + jsdom)
+bun run test                # shared + server (node:test)
+bun run --filter react-vite-tailwind test    # browser layer (vitest + jsdom)
 ```
 
 The real-harness tests skip with a printed reason when the binary or its
@@ -62,8 +62,8 @@ To verify the ACP seat against a real harness (starts one short-lived child,
 prints the negotiated protocol facts, then reaps it):
 
 ```bash
-npm run build -w server
-ACP_COMMAND="opencode acp" npm run probe -w server
+bun run --filter server build
+ACP_COMMAND="opencode acp" bun run --filter server probe
 ```
 
 It exits non-zero on a real failure and reports an explicit `SKIP` when the

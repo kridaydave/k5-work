@@ -42,7 +42,7 @@ We keep terminology consistent across prompts and code:
 ## The five ways to hurt yourself
 
 1. **Killing by pattern.** Never `pkill -f`, `pgrep | kill`, or kill a PID by matching names or worktree paths. Your own agent process has this path in its argv, and dev servers may share the host. Kill only a PID you captured at spawn, or the owner of your port from `ss -H -ltnp` after confirming `/proc/<pid>/cwd` matches your worktree.
-2. **Demanding processes without approval.** Never run unapproved repo-wide checks (`npm test` across all workspaces, full monorepo typechecks, or docker builds). k5-work is designed to run on everyday and lower-spec machines; unthrottled runs will freeze developer systems. Run the smallest, most targeted check for the exact code touched. For example, if you touch OpenCode's ACP plug, test only that plug's unit test and verify the composer integration, never the whole suite.
+2. **Demanding processes without approval.** Never run unapproved repo-wide checks (`bun run test` across all workspaces, full monorepo typechecks, or docker builds). k5-work is designed to run on everyday and lower-spec machines; unthrottled runs will freeze developer systems. Run the smallest, most targeted check for the exact code touched. For example, if you touch OpenCode's ACP plug, test only that plug's unit test and verify the composer integration, never the whole suite.
 3. **AGPL contamination.** SuperDoc is licensed under AGPLv3. It is fine as an external reference and optional docx driver behind the common interface, but never copy, vendor, or import AGPL code into `k5-ooxml-core` or internal packages. Our core packages must remain clean MIT code.
 4. **Baking in localhost origins.** Never hardcode `localhost` or static port strings in frontend code or Vite configs. Dev is single-origin with Vite proxying `/api` and `/ws`. Hardcoded URLs immediately break remote access and network tunneling.
 5. **Faking passes or benchmarks.** Never write tautological assertions, never mock execution just to claim a pass, and never let failing tests exit with code 0. If a dependency or tool is missing, explicitly skip or fail loudly.
@@ -61,15 +61,15 @@ A change that works on the single path you tested and breaks another surface is 
 
 ## Dev servers and workflow
 
-- Install dependencies from the repository root with `npm install`.
-- Start both server and client with `npm run dev`. Web runs on port 5173, server on port 8787.
-- `npm run dev:bun` is the same thing with the Vite dev server on Bun, which boots faster. Only the web dev server moves: the server, the tsc build and every test stay on Node, so this needs Bun installed and nothing else.
+- Install dependencies from the repository root with `bun install`.
+- Start both server and client with `bun run dev`. Web runs on port 5173, server on port 8787.
+- `bun run dev:bun` is the same thing with the Vite dev server on Bun, which boots faster. Only the web dev server moves: the server, the tsc build and every test stay on Node, so this needs Bun installed and nothing else.
 - Always track spawned process IDs. Stop background tasks only by their captured PID.
 - ACP and MCP subprocesses run over local stdio. Stdio pipes must be cleanly reaped on shutdown. Never leave orphaned child harnesses running.
 
 ## Verifying and test integrity
 
-- Provide the smallest proof that your change works. Run targeted tests with `npm test -w <workspace>` (for example, `npm test -w server`) or target a single test file.
+- Provide the smallest proof that your change works. Run targeted tests with `bun run --filter <workspace> test` (for example, `bun run --filter server test`) or target a single test file.
 - Do not run repository-wide test suites or full monorepo typechecks unless explicitly asked.
 - Zero tolerance for faked passes: tests must fail loudly with non-zero exit codes. If an external harness or binary is missing in the environment, mark the test as skipped, never fake a pass.
 - Write tests that verify real, observable behavior. Do not render static component trees just to assert callback wiring or prop names.
