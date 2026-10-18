@@ -11,8 +11,8 @@ There is no login and no remote mode. The whole surface is loopback, which is wh
 ## Baseline preconditions
 
 - Run every command from the repo root with `export SKILL="$PWD/.opencode/skills/verify-k5-work"` set. The commands below use `$SKILL` so they stay copy-pasteable.
-- Node 22.9 or newer, and `npm install` already run at the repo root.
-- `npm run build -w shared && npm run build -w server`. The verification harness is `server/dist/acp/fake-agent.js`, so a missing `server/dist` means nothing can be driven.
+- Node 22.9 or newer, and `bun install` already run at the repo root.
+- `bun run --filter @k5-work/shared build && bun run --filter server build`. The verification harness is `server/dist/acp/fake-agent.js`, so a missing `server/dist` means nothing can be driven.
 - Start the instance with `$SKILL/scripts/launch.sh <run-id>`. It binds 8788 and 5174, never the documented dev defaults, and it points `XDG_DATA_HOME` at a directory inside the run folder so a verification run cannot read or overwrite `~/.local/share/k5-work`.
 - Run `$SKILL/scripts/doctor.sh <run-id>` and require every check to pass. A failed doctor means a failed drive for reasons that have nothing to do with the change under test.
 - Never drive an instance you did not start. `$SKILL/scripts/doctor.sh` proves each pid's cwd belongs to this checkout, which is the only safe basis for killing it later.

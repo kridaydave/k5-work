@@ -16,14 +16,14 @@ Build once, then start one isolated instance per run. Every command below is wri
 ```bash
 export SKILL="$PWD/.opencode/skills/verify-k5-work"
 
-npm install                                                    # once per checkout
-npm run build -w shared && npm run build -w server            # once per checkout
+bun install                                                    # once per checkout
+bun run --filter @k5-work/shared build && bun run --filter server build            # once per checkout
 
 $SKILL/scripts/launch.sh <run-id>
 source .verify-k5/<run-id>/env.sh
 ```
 
-`launch.sh` binds 8788 and 5174, so a running `npm run dev` on 8787 and 5173 is never touched. It points `XDG_DATA_HOME` into `.verify-k5/<run-id>/data`, so the run cannot read or overwrite the operator's real history in `~/.local/share/k5-work`. It starts the harness child with `setsid`, so an interrupted agent shell does not leave a half-dead instance behind.
+`launch.sh` binds 8788 and 5174, so a running `bun run dev` on 8787 and 5173 is never touched. It points `XDG_DATA_HOME` into `.verify-k5/<run-id>/data`, so the run cannot read or overwrite the operator's real history in `~/.local/share/k5-work`. It starts the harness child with `setsid`, so an interrupted agent shell does not leave a half-dead instance behind.
 
 The default harness is `server/dist/acp/fake-agent.js ok`, the deterministic ACP agent the server's own tests use. It speaks the real protocol over real stdio and answers a prompt with a known thought chunk, a known tool call, and `first second third`. Use it unless the thing under test is how k5 behaves against a harness it does not control.
 

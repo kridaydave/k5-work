@@ -26,19 +26,18 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: oven-sh/setup-bun@v2
         with:
-          node-version: 22
-          cache: npm
-      - run: npm ci
+          bun-version: latest
+      - run: bun install
       # Proves the merge gate still asks about every job below, and that each
       # one would stop rather than hang. Breaks on an unlisted job.
       - name: Check workflow invariants
-        run: npm run check:ci
+        run: bun run check:ci
       - name: Build
-        run: npm run build
+        run: bun run build
       - name: Typecheck
-        run: npm run typecheck
+        run: bun run typecheck
 
   test:
     name: Tests
@@ -48,10 +47,9 @@ jobs:
       LIBREOFFICE_BIN: libreoffice
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: oven-sh/setup-bun@v2
         with:
-          node-version: 22
-          cache: npm
+          bun-version: latest
 
       # Only the docx round-trip test uses LibreOffice, and it soft-skips when
       # the binary is missing, so installing it is what makes that gate real
@@ -66,7 +64,7 @@ jobs:
             echo "$?" > "$RUNNER_TEMP/apt-status"
           ) > "$RUNNER_TEMP/apt.log" 2>&1 < /dev/null &
 
-      - run: npm ci
+      - run: bun install
 
       - name: Finish installing LibreOffice
         timeout-minutes: 5
@@ -81,7 +79,7 @@ jobs:
       # files through separate steps, but both were subsets of this run, so 11
       # files executed twice per run.
       - name: Unit and contract tests
-        run: npm test
+        run: bun run test
 
   smoke:
     name: Runtime smoke tests
@@ -89,13 +87,12 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: oven-sh/setup-bun@v2
         with:
-          node-version: 22
-          cache: npm
-      - run: npm ci
+          bun-version: latest
+      - run: bun install
       - name: Build
-        run: npm run build
+        run: bun run build
       - name: Dev command smoke test
         env:
           K5_SERVER_ORIGIN: http://127.0.0.1:8787
@@ -108,7 +105,7 @@ jobs:
           # ever calls listen and this step times out on a connection refused.
           # The empty file satisfies the watch; nothing reads a value from it.
           touch .env
-          setsid npm run dev > /tmp/k5-work-dev.log 2>&1 &
+          setsid bun run dev > /tmp/k5-work-dev.log 2>&1 &
           dev_pid=$!
           cleanup_dev() {
             kill -- -"$dev_pid" 2>/dev/null || true
